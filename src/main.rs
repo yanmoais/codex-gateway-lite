@@ -7468,12 +7468,33 @@ const PLAN_UI_SCRIPT: &str = r#"
     renderDock(snapshot || snapshotForThread(threadId));
   }
 
-  function scheduleApply() {
-    if (window.__codexGatewayLitePlanUiFrame) return;
+  const APPLY_THROTTLE_MS = 250;
+  let applyThrottleTimer = 0;
+  let lastApplyAt = 0;
+
+  function runApplyOnNextFrame() {
     window.__codexGatewayLitePlanUiFrame = requestAnimationFrame(() => {
       window.__codexGatewayLitePlanUiFrame = 0;
+      lastApplyAt = Date.now();
       apply();
     });
+  }
+
+  function scheduleApply() {
+    // 真实页面上一次流式回复会在几秒内触发成百上千次 DOM/文本变更（MutationObserver
+    // 监听了 childList/subtree/characterData），如果每次都同步跑一遍 apply()（内含
+    // getBoundingClientRect/getComputedStyle 全量扫描），会把 renderer 进程的 CPU 打满。
+    // 这里把连续触发合并到最多每 APPLY_THROTTLE_MS 执行一次。
+    if (window.__codexGatewayLitePlanUiFrame || applyThrottleTimer) return;
+    const elapsed = Date.now() - lastApplyAt;
+    if (elapsed >= APPLY_THROTTLE_MS) {
+      runApplyOnNextFrame();
+      return;
+    }
+    applyThrottleTimer = window.setTimeout(() => {
+      applyThrottleTimer = 0;
+      runApplyOnNextFrame();
+    }, APPLY_THROTTLE_MS - elapsed);
   }
 
   if (window.__codexGatewayLitePlanUiObserver) {
@@ -7536,6 +7557,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       hideDockForRightPanelTarget,
       rightPanelDismissalActive,
       renderDock,
+      scheduleApply,
     };
   }
   return true;
@@ -8556,6 +8578,79 @@ CREATE TABLE threads (
             serde_json::json!("no-native-anchor")
         );
         assert_eq!(result["hiddenAfterRestore"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn plan_ui_schedule_apply_throttles_high_frequency_mutation_bursts() {
+        // 真实页面流式回复期间，MutationObserver 会在几秒内触发成百上千次
+        // scheduleApply（childList/subtree/characterData 全部在监听范围内）。
+        // 必须把这类爆发合并成一次节流定时器，不能每次都同步跑一遍 apply()，
+        // 否则 renderer 进程 CPU 会被打满（真实现场表现为温度飙升）。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                let rafCalls = 0;
+                let pendingRafCb = null;
+                window.requestAnimationFrame = function (cb) {
+                    rafCalls += 1;
+                    pendingRafCb = cb;
+                    return rafCalls;
+                };
+                let timeoutCalls = 0;
+                let pendingTimeoutCb = null;
+                window.setTimeout = function (cb) {
+                    timeoutCalls += 1;
+                    pendingTimeoutCb = cb;
+                    return timeoutCalls;
+                };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+
+                hooks.scheduleApply();
+                const rafAfterFirst = rafCalls;
+                const timeoutAfterFirst = timeoutCalls;
+
+                // 模拟浏览器在下一帧真正跑了这次 rAF 回调：更新 lastApplyAt 并跑一次 apply()。
+                pendingRafCb();
+
+                // 紧接着（同一瞬间）模拟 MutationObserver 连续爆发 50 次。
+                for (let i = 0; i < 50; i += 1) {
+                    hooks.scheduleApply();
+                }
+                const rafAfterBurst = rafCalls;
+                const timeoutAfterBurst = timeoutCalls;
+
+                // 节流窗口结束后应当补跑一次，变更不会被吞掉。
+                pendingTimeoutCb();
+                const rafAfterThrottleFires = rafCalls;
+
+                return JSON.stringify({
+                    rafAfterFirst,
+                    timeoutAfterFirst,
+                    rafAfterBurst,
+                    timeoutAfterBurst,
+                    rafAfterThrottleFires
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["rafAfterFirst"], serde_json::json!(1));
+        assert_eq!(result["timeoutAfterFirst"], serde_json::json!(0));
+        assert_eq!(
+            result["rafAfterBurst"],
+            serde_json::json!(1),
+            "50 次连续触发不应该各自排队一次 rAF"
+        );
+        assert_eq!(
+            result["timeoutAfterBurst"],
+            serde_json::json!(1),
+            "50 次连续触发应该被合并成一次节流定时器"
+        );
+        assert_eq!(
+            result["rafAfterThrottleFires"],
+            serde_json::json!(2),
+            "节流窗口结束后应该补跑一次，不能把变更吞掉"
+        );
     }
 
     #[test]
