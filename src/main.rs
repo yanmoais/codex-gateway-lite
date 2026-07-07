@@ -158,7 +158,14 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(error) = run_cli().await {
+        eprintln!("codex-gateway-lite 失败：{error:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> anyhow::Result<()> {
     match parse_args()? {
         Command::Apply {
             config_path,
@@ -3637,9 +3644,11 @@ struct LiteHttpRequest {
 async fn start_protocol_proxy(config_path: PathBuf) -> anyhow::Result<ProtocolProxyRuntime> {
     let port = protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
     let bind_addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("绑定本地协议代理端口失败：{bind_addr}"))?;
+    let listener = TcpListener::bind(&bind_addr).await.with_context(|| {
+        format!(
+            "绑定本地协议代理端口失败：{bind_addr}；请先运行 stop-agent，或在 Windows 执行 netstat -ano | findstr :{port} 检查端口占用"
+        )
+    })?;
     let local_addr = listener
         .local_addr()
         .context("读取本地协议代理监听地址失败")?;
@@ -4065,7 +4074,14 @@ async fn run_agent(
     let Some(_agent_lock) = acquire_agent_instance_lock()? else {
         return Ok(());
     };
-    let config = read_lite_config(&config_path)?;
+    let config = read_lite_config(&config_path)
+        .with_context(|| format!("读取 Lite 配置失败：{}", config_path.display()))?;
+    if provider_uses_local_proxy(&config) {
+        println!(
+            "当前配置需要本地协议代理，准备监听 127.0.0.1:{}",
+            protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+        );
+    }
     let _protocol_proxy = if provider_uses_local_proxy(&config) {
         Some(
             start_protocol_proxy(config_path.clone())
@@ -4077,7 +4093,9 @@ async fn run_agent(
         None
     };
     let interval = Duration::from_millis(interval_ms.max(1000));
-    let app_dir = resolve_codex_app(app_path.as_deref())?;
+    let app_dir = resolve_codex_app(app_path.as_deref()).with_context(|| {
+        "识别 Codex App 路径失败；请运行 where-app，或通过 CODEX_GATEWAY_LITE_APP / --app 指定 Codex.exe"
+    })?;
     println!("Codex Gateway Lite agent 已启动");
     println!("  config: {}", config_path.display());
     println!("  app: {}", app_dir.display());

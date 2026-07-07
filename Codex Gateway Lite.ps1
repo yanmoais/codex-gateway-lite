@@ -317,14 +317,34 @@ function Ensure-CodexApp {
   Write-Ok "Codex App 安装完成"
 }
 
+function Run-AgentDiagnostics {
+  Write-Section "agent 失败诊断"
+  Write-Info "Codex App 自动识别："
+  try {
+    cargo run --quiet --manifest-path "Cargo.toml" -- where-app
+  } catch {
+    Write-Warn "where-app 执行失败：$($_.Exception.Message)"
+  }
+  Write-Info "57321 端口占用："
+  try {
+    $portLines = netstat -ano | findstr ":57321"
+    if ($portLines) {
+      $portLines | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    } else {
+      Write-Ok "57321 未发现监听占用"
+    }
+  } catch {
+    Write-Warn "netstat 检查失败：$($_.Exception.Message)"
+  }
+}
+
 function Run-Lite([string[]]$ArgsList) {
   cargo run --quiet --manifest-path "Cargo.toml" -- @ArgsList
   if ($LASTEXITCODE -ne 0) {
     Write-Warn "codex-gateway-lite 子命令退出码：$LASTEXITCODE"
     Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
     if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
-      Write-Info "如仍失败，请运行：cargo run --quiet --manifest-path Cargo.toml -- where-app"
-      Write-Info "如 57321 端口被占用，请运行：netstat -ano | findstr :57321"
+      Run-AgentDiagnostics
     }
     Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
   }
