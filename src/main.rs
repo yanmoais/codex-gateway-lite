@@ -5241,7 +5241,7 @@ fn terminate_other_agent_processes() -> usize {
         pids.dedup();
         for pid in &pids {
             let _ = ProcessCommand::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T"])
+                .args(["/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -5250,7 +5250,7 @@ fn terminate_other_agent_processes() -> usize {
             if !wait_for_processes_to_exit(&pids, Duration::from_secs(3)) {
                 for pid in pids.iter().filter(|pid| process_is_running(**pid)) {
                     let _ = ProcessCommand::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .args(["/PID", &pid.to_string(), "/F"])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
@@ -5303,13 +5303,47 @@ fn codex_gateway_agent_pids(ps_output: &str, current_pid: u32) -> Vec<u32> {
 }
 
 fn command_line_is_codex_gateway_agent(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    if !lower.contains("codex-gateway-lite") {
+    let tokens = command_line_tokens(command);
+    let Some(executable) = tokens.first() else {
+        return false;
+    };
+    if !is_codex_gateway_lite_executable_token(executable) {
         return false;
     }
-    lower
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\''))
-        .any(|token| token == "agent")
+    tokens.iter().skip(1).any(|token| token == "agent")
+}
+
+fn command_line_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_codex_gateway_lite_executable_token(token: &str) -> bool {
+    let normalized = token.trim_matches(['"', '\'']).replace('\\', "/");
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_ascii_lowercase();
+    file_name == "codex-gateway-lite" || file_name == "codex-gateway-lite.exe"
 }
 
 #[cfg(windows)]
@@ -8773,6 +8807,9 @@ model_catalog_json = "model-catalogs/gateway.json"
         ));
         assert!(!command_line_is_codex_gateway_agent(
             r#"C:\repo\target\debug\codex-gateway-lite.exe install-agent"#
+        ));
+        assert!(!command_line_is_codex_gateway_agent(
+            r#"cargo run --quiet --manifest-path C:\repo\codex-gateway-lite\Cargo.toml -- agent --config C:\tmp\config.json"#
         ));
         assert!(!command_line_is_codex_gateway_agent(
             r#"powershell -File "C:\repo\Codex Gateway Lite.ps1""#

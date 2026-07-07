@@ -591,6 +591,7 @@ fn quote_windows_argument(arg: &str) -> String {
     output
 }
 
+#[cfg(target_os = "macos")]
 fn find_macos_codex_app_default() -> Option<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications")];
     if let Some(home) = home_dir() {
@@ -771,6 +772,7 @@ fn plist_string_value(plist: &str, key: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn macos_app_candidates(root: &Path) -> Vec<PathBuf> {
     if root.extension() == Some(OsStr::new("app")) {
         return vec![root.to_path_buf()];
@@ -837,6 +839,7 @@ fn codex_package_parts(package_name: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         let path = PathBuf::from(home);

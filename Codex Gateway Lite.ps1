@@ -339,19 +339,23 @@ function Run-AgentDiagnostics {
 }
 
 function Run-Lite([string[]]$ArgsList) {
-  $oldEap = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
+  $runId = [Guid]::NewGuid().ToString("N")
+  $stdoutFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.out.log"
+  $stderrFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.err.log"
   try {
-    cargo run --quiet --manifest-path "Cargo.toml" -- @ArgsList 2>&1 | ForEach-Object {
-      if ($_ -is [System.Management.Automation.ErrorRecord]) {
-        Write-Host $_.ToString() -ForegroundColor Red
-      } else {
-        Write-Host $_
+    $cargoArgs = @("run", "--quiet", "--manifest-path", "Cargo.toml", "--") + $ArgsList
+    & cargo @cargoArgs > $stdoutFile 2> $stderrFile
+    $exitCode = $LASTEXITCODE
+    if (Test-Path $stdoutFile) {
+      Get-Content -Path $stdoutFile -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+    }
+    if (Test-Path $stderrFile) {
+      Get-Content -Path $stderrFile -Encoding UTF8 | ForEach-Object {
+        if ($_ -and $_.Trim().Length -gt 0) { Write-Host $_ -ForegroundColor Red }
       }
     }
-    $exitCode = $LASTEXITCODE
   } finally {
-    $ErrorActionPreference = $oldEap
+    Remove-Item -Force -ErrorAction SilentlyContinue $stdoutFile, $stderrFile
   }
   if ($exitCode -ne 0) {
     Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
@@ -362,7 +366,6 @@ function Run-Lite([string[]]$ArgsList) {
     Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
   }
 }
-
 function Stop-AgentOnExit {
   if (-not $script:AgentStarted) { return }
   Write-Host "`n脚本退出，停止 Codex Gateway Lite agent..." -ForegroundColor Yellow
