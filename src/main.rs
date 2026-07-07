@@ -4388,6 +4388,14 @@ async fn launch_codex(
     }
     #[cfg(windows)]
     {
+        if cdp_ready(debug_port).await.is_ok() {
+            println!("Codex App 已在 CDP 端口 {debug_port} 就绪");
+            return Ok(());
+        }
+        let terminated = terminate_windows_codex_app_processes();
+        if terminated > 0 {
+            println!("检测到 {terminated} 个未带调试端口的 Codex App 进程，已清理并重新拉起");
+        }
         if let Some(app_user_model_id) = codex_lite::packaged_app_user_model_id(app_dir) {
             let args = codex_lite::command_line_arguments(&codex_lite::build_codex_arguments(
                 debug_port,
@@ -4400,7 +4408,12 @@ async fn launch_codex(
                 debug_port,
                 process_id
             );
-            return Ok(());
+            if wait_for_cdp_ready(debug_port, Duration::from_millis(500), 40).await {
+                return Ok(());
+            }
+            bail!(
+                "Codex App 已通过 Store/MSIX 激活，但 CDP 端口 {debug_port} 未就绪；请确认没有旧 Codex 窗口残留后重试"
+            );
         }
         let command = codex_lite::build_codex_command(app_dir, debug_port, &[]);
         let executable = command
@@ -4417,6 +4430,9 @@ async fn launch_codex(
             app_dir.display(),
             debug_port
         );
+        if !wait_for_cdp_ready(debug_port, Duration::from_millis(500), 40).await {
+            bail!("Codex App 已启动，但 CDP 端口 {debug_port} 未就绪")
+        }
         Ok(())
     }
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -4524,7 +4540,6 @@ fn path_eq_loose(left: &Path, right: &Path) -> bool {
     left == right || absolute_path(left) == absolute_path(right)
 }
 
-#[cfg(target_os = "macos")]
 async fn wait_for_cdp_ready(debug_port: u16, interval: Duration, attempts: u32) -> bool {
     for _ in 0..attempts {
         if cdp_ready(debug_port).await.is_ok() {
@@ -4533,6 +4548,108 @@ async fn wait_for_cdp_ready(debug_port: u16, interval: Duration, attempts: u32) 
         tokio::time::sleep(interval).await;
     }
     false
+}
+
+#[cfg(windows)]
+fn terminate_windows_codex_app_processes() -> usize {
+    let pids = windows_codex_app_process_pids();
+    for pid in &pids {
+        let _ = ProcessCommand::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    if !pids.is_empty() {
+        let _ = wait_for_processes_to_exit(&pids, Duration::from_secs(5));
+    }
+    pids.len()
+}
+
+#[cfg(windows)]
+fn windows_codex_app_process_pids() -> Vec<u32> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process |
+  Where-Object {
+    ($_.Name -ieq 'Codex.exe') -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like '*\WindowsApps\OpenAI.Codex_*') -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like '*\WindowsApps\OpenAI.CodexBeta_*')
+  } |
+  Select-Object ProcessId,CommandLine,ExecutablePath,Name |
+  ConvertTo-Json -Compress
+"#;
+    let output = ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    codex_app_pids_from_windows_process_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(windows, test))]
+fn codex_app_pids_from_windows_process_json(json_text: &str) -> Vec<u32> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return Vec::new();
+    };
+    let items = match &value {
+        Value::Array(values) => values.iter().collect::<Vec<_>>(),
+        Value::Object(_) => vec![&value],
+        _ => Vec::new(),
+    };
+    let mut pids = Vec::new();
+    for item in items {
+        let Some(pid) = json_field_u32(item, &["ProcessId", "processId", "PID", "pid"]) else {
+            continue;
+        };
+        let name = json_field_string(item, &["Name", "name"]).unwrap_or_default();
+        let executable =
+            json_field_string(item, &["ExecutablePath", "executablePath"]).unwrap_or_default();
+        let command =
+            json_field_string(item, &["CommandLine", "commandLine", "Command", "command"])
+                .unwrap_or_default();
+        if windows_process_looks_like_codex_app(name, executable, command) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(any(windows, test))]
+fn windows_process_looks_like_codex_app(name: &str, executable: &str, command: &str) -> bool {
+    name.eq_ignore_ascii_case("Codex.exe")
+        || executable
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains("/windowsapps/openai.codex_")
+        || executable
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains("/windowsapps/openai.codexbeta_")
+        || command
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains("/windowsapps/openai.codex_")
+        || command
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains("/windowsapps/openai.codexbeta_")
 }
 
 #[cfg(target_os = "macos")]
@@ -7279,7 +7396,7 @@ mod tests {
     // 让 PLAN_UI_SCRIPT 这个 IIFE 能在没有真实浏览器的情况下跑到底所需要的最小 DOM/BOM
     // mock。只覆盖脚本安装阶段实际会调用到的那几个 API，够用即可，不追求完整实现。
     #[test]
-    fn codex_launch_arguments_match_codexplusplus_cdp_contract() {
+    fn codex_launch_arguments_include_required_cdp_origin() {
         let args = codex_lite::build_codex_arguments(9229, &[]);
         assert_eq!(
             args,
@@ -8869,6 +8986,34 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert_eq!(
             codex_gateway_agent_pids_from_windows_process_json(lower_case_fields, 0),
             vec![205]
+        );
+    }
+
+    #[test]
+    fn windows_codex_app_process_json_matches_store_codex_only() {
+        let processes = r#"[
+  {
+    "ProcessId": 310,
+    "Name": "Codex.exe",
+    "ExecutablePath": "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.623.13972.0_x64__2p2nqsd0c76g0\\app\\Codex.exe",
+    "CommandLine": "\"C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.623.13972.0_x64__2p2nqsd0c76g0\\app\\Codex.exe\""
+  },
+  {
+    "ProcessId": 311,
+    "Name": "codex-gateway-lite.exe",
+    "ExecutablePath": "D:\\repo\\target\\debug\\codex-gateway-lite.exe",
+    "CommandLine": "codex-gateway-lite.exe agent"
+  },
+  {
+    "ProcessId": 312,
+    "Name": "Code.exe",
+    "ExecutablePath": "C:\\Users\\demo\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+    "CommandLine": "Code.exe"
+  }
+]"#;
+        assert_eq!(
+            codex_app_pids_from_windows_process_json(processes),
+            vec![310]
         );
     }
 

@@ -339,11 +339,24 @@ function Run-AgentDiagnostics {
 }
 
 function Run-Lite([string[]]$ArgsList) {
+  $cargoArgs = @("run", "--quiet", "--manifest-path", "Cargo.toml", "--") + $ArgsList
+  if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
+    Write-Info "agent 将保持前台运行；关闭此窗口或按 Ctrl+C 会停止 agent。"
+    & cargo @cargoArgs
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+      Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
+      Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
+      Run-AgentDiagnostics
+      Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
+    }
+    return
+  }
+
   $runId = [Guid]::NewGuid().ToString("N")
   $stdoutFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.out.log"
   $stderrFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.err.log"
   try {
-    $cargoArgs = @("run", "--quiet", "--manifest-path", "Cargo.toml", "--") + $ArgsList
     & cargo @cargoArgs > $stdoutFile 2> $stderrFile
     $exitCode = $LASTEXITCODE
     if (Test-Path $stdoutFile) {
