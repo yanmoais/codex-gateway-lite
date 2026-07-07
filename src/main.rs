@@ -5970,7 +5970,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 37;
+  const SCRIPT_VERSION = 38;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -6482,10 +6482,11 @@ const PLAN_UI_SCRIPT: &str = r#"
     if (!snapshot || typeof snapshot !== "object") return null;
     const rows = rowsForSnapshot(snapshot);
     if (!rows.length) return null;
+    const normalized = normalizedSnapshotForRows(snapshot, rows);
     return {
       threadId: String(snapshot.threadId || ""),
-      progress: String(snapshot.progress || ""),
-      detail: String(snapshot.detail || ""),
+      progress: String(normalized.progress || ""),
+      detail: String(normalized.detail || ""),
       items: rows.map((row) => row.text),
       rows: rows.map((row) => ({
         text: String(row.text || ""),
@@ -6565,7 +6566,14 @@ const PLAN_UI_SCRIPT: &str = r#"
         snapshots[id] = { ...best.snapshot, threadId: id, source: best.snapshot.source || best.source };
       }
     }
-    return snapshots[id] || null;
+    const finalSnapshot = snapshots[id] || null;
+    const finalRows = rowsForSnapshot(finalSnapshot);
+    if (finalSnapshot && finalRows.length) {
+      const normalized = normalizedSnapshotForRows(finalSnapshot, finalRows);
+      snapshots[id] = normalized;
+      return normalized;
+    }
+    return finalSnapshot;
   }
 
   function snapshotAliasIdsForThread(threadId) {
@@ -6588,12 +6596,14 @@ const PLAN_UI_SCRIPT: &str = r#"
   function rememberThreadSnapshot(snapshot) {
     const threadId = String(snapshot?.threadId || currentThreadId());
     if (!threadId || !snapshot) return;
+    const rows = rowsForSnapshot(snapshot);
+    const normalized = normalizedSnapshotForRows(snapshot, rows);
     const snapshots = state.snapshotsByThread && typeof state.snapshotsByThread === "object"
       ? state.snapshotsByThread
       : {};
-    snapshots[threadId] = { ...snapshot, threadId };
+    snapshots[threadId] = { ...normalized, threadId };
     snapshotAliasIdsForThread(threadId).forEach((aliasId) => {
-      snapshots[aliasId] = { ...snapshot, threadId: aliasId, source: snapshot.source || "alias" };
+      snapshots[aliasId] = { ...normalized, threadId: aliasId, source: snapshot.source || "alias" };
     });
     const entries = Object.entries(snapshots)
       .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0));
@@ -6918,6 +6928,27 @@ const PLAN_UI_SCRIPT: &str = r#"
     return `第 ${Math.max(1, doneCount || 1)} / ${rows.length} 步`;
   }
 
+  function normalizedProgressForRows(snapshot, rows) {
+    const rowProgress = progressFromRows(rows);
+    if (!rowProgress) return String(snapshot?.progress || "");
+    const existingProgress = String(snapshot?.progress || "");
+    const existingNumbers = progressNumbers(existingProgress);
+    if (existingNumbers && existingNumbers.total !== rows.length) return existingProgress;
+    const hasRowSignal = rows.some((row) => row.status === "done" || row.status === "running");
+    return hasRowSignal ? rowProgress : String(snapshot?.progress || rowProgress);
+  }
+
+  function normalizedSnapshotForRows(snapshot, rows = rowsForSnapshot(snapshot)) {
+    if (!snapshot || typeof snapshot !== "object") return snapshot;
+    if (!Array.isArray(rows) || !rows.length) return snapshot;
+    return {
+      ...snapshot,
+      progress: normalizedProgressForRows(snapshot, rows),
+      items: rows.map((row) => row.text),
+      rows,
+    };
+  }
+
   function reactFiberForElement(el) {
     if (!el) return null;
     const key = Object.getOwnPropertyNames(el).find((name) => name.startsWith("__reactFiber$"));
@@ -6998,7 +7029,7 @@ const PLAN_UI_SCRIPT: &str = r#"
         sourceConversationId: turnInfo?.conversationId || "",
         sourceTurnId: turnInfo?.turnId || "",
         sourceTodoId: String(latest.item?.id || ""),
-        progress: base.progress || previous?.progress || "任务清单",
+        progress: normalizedProgressForRows({ progress: base.progress || previous?.progress || "" }, settledRows) || "任务清单",
         items: settledRows.map((row) => row.text),
         rows: settledRows,
         pendingRefresh: false,
@@ -7013,7 +7044,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       sourceConversationId: turnInfo?.conversationId || "",
       sourceTurnId: turnInfo?.turnId || "",
       sourceTodoId: String(latest.item?.id || ""),
-      progress: base.progress || progressFromRows(rows) || "任务清单",
+      progress: normalizedProgressForRows(base, rows) || "任务清单",
       items: rows.map((row) => row.text),
       rows,
       pendingRefresh: false,
@@ -7084,7 +7115,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     return {
       ...base,
       threadId,
-      progress: base.progress || snapshot.progress || "任务清单",
+      progress: normalizedProgressForRows(base.progress ? { progress: base.progress } : snapshot, nextRows) || "任务清单",
       detail: snapshot.detail || base.detail || "",
       sourceConversationId: base.sourceConversationId || snapshot.sourceConversationId || "",
       sourceTurnId: base.sourceTurnId || snapshot.sourceTurnId || "",
@@ -7388,8 +7419,9 @@ const PLAN_UI_SCRIPT: &str = r#"
       return;
     }
     const rows = rowsForSnapshot(snapshot);
-    const signature = renderSignature(snapshot, rows);
-    const sourceTurnId = snapshot?.sourceTurnId || "";
+    const normalizedSnapshot = normalizedSnapshotForRows(snapshot, rows);
+    const signature = renderSignature(normalizedSnapshot, rows);
+    const sourceTurnId = normalizedSnapshot?.sourceTurnId || "";
     dock.hidden = false;
     delete dock.dataset.cglPlanHiddenBy;
     if (dock.dataset.cglPlanSignature === signature) return;
@@ -7401,7 +7433,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     dock.dataset.cglPlanSourceTurnId = sourceTurnId;
     state.lastRenderSignature = signature;
     dock.innerHTML = `
-      ${renderMeta(snapshot, rows)}
+      ${renderMeta(normalizedSnapshot, rows)}
       ${
         rows.length
           ? `<div class="cgl-plan-list">${rows.map((row) => `
@@ -7493,6 +7525,8 @@ const PLAN_UI_SCRIPT: &str = r#"
       uniqueRows,
       snapshotContextMatches,
       progressFromRows,
+      normalizedProgressForRows,
+      normalizedSnapshotForRows,
       rowsForSnapshot,
       turnInfoFromProps,
       currentThreadId,
@@ -7945,6 +7979,38 @@ CREATE TABLE threads (
                 serde_json::json!("done"),
             ],
             "清空后所有行都应该结算为 done，而不是卡在 running"
+        );
+    }
+
+    #[test]
+    fn plan_ui_normalizes_progress_when_all_rows_are_done() {
+        // 复刻 BOSS 截图：卡片头部还停在旧的“第 1 / 3 步”，但下面三行都已经
+        // 是完成态。此时应该以 rows 为准，把头部修正为“第 3 / 3 步”。
+        let result = call_plan_ui_hook(
+            "normalizedSnapshotForRows",
+            &[r#"{
+                "threadId": "thread-done",
+                "progress": "第 1 / 3 步",
+                "rows": [
+                    { "text": "对照 Codex++ 会话定位实现", "status": "done" },
+                    { "text": "补强本项目跨环境会话数据定位", "status": "done" },
+                    { "text": "验证并推送修复", "status": "done" }
+                ]
+            }"#],
+        );
+        assert_eq!(result["progress"], serde_json::json!("第 3 / 3 步"));
+        assert_eq!(
+            result["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["status"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                serde_json::json!("done"),
+                serde_json::json!("done"),
+                serde_json::json!("done"),
+            ]
         );
     }
 
@@ -8966,7 +9032,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 37"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 38"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
