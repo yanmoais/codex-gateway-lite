@@ -1793,6 +1793,10 @@ fn upsert_local_thread_catalog(
     let tx = conn.transaction()?;
     let mut inserted = 0;
     let mut updated = 0;
+    let watermark = entries
+        .iter()
+        .map(|entry| entry.source_updated_at)
+        .fold(0.0_f64, f64::max);
     for entry in entries {
         let existing = tx
             .query_row(
@@ -1867,20 +1871,39 @@ ON CONFLICT(host_id, thread_id) DO UPDATE SET
             ],
         )?;
     }
-    if inserted > 0 || updated > 0 {
-        let watermark = entries
-            .iter()
-            .map(|entry| entry.source_updated_at)
-            .fold(0.0_f64, f64::max);
+    let sync_state = tx
+        .query_row(
+            "SELECT watermark_updated_at, initial_build_complete, observation_sequence FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<f64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let sync_state_changed = match sync_state {
+        None => true,
+        Some((existing_watermark, complete, observation_sequence)) => {
+            complete == 0
+                || existing_watermark
+                    .map(|value| (value - watermark).abs() > 0.001)
+                    .unwrap_or(true)
+                || observation_sequence < next_sequence
+        }
+    };
+    if inserted > 0 || updated > 0 || sync_state_changed {
         tx.execute(
             "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1",
             [],
         )?;
-        tx.execute(
-            "INSERT INTO local_thread_catalog_sync_state (host_id, watermark_updated_at, initial_build_complete, observation_sequence) VALUES ('local', ?1, 1, ?2) ON CONFLICT(host_id) DO UPDATE SET watermark_updated_at = excluded.watermark_updated_at, initial_build_complete = 1, observation_sequence = excluded.observation_sequence",
-            params![watermark, next_sequence],
-        )?;
     }
+    tx.execute(
+        "INSERT INTO local_thread_catalog_sync_state (host_id, watermark_updated_at, initial_build_complete, observation_sequence) VALUES ('local', ?1, 1, ?2) ON CONFLICT(host_id) DO UPDATE SET watermark_updated_at = excluded.watermark_updated_at, initial_build_complete = 1, observation_sequence = MAX(local_thread_catalog_sync_state.observation_sequence, excluded.observation_sequence)",
+        params![watermark, next_sequence],
+    )?;
     tx.commit()?;
     Ok((inserted, updated))
 }
@@ -2907,7 +2930,7 @@ fn unique_model_ids(values: Vec<String>) -> Vec<String> {
 
 const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
 (() => {
-  const SCRIPT_VERSION = 7;
+  const SCRIPT_VERSION = 8;
   const REQUEST_GUARD = "__codex_gateway_lite_model_list_only__";
   const SEND_REQUEST_PATCH_MARK = `codex-gateway-lite-send-request-v${SCRIPT_VERSION}`;
   const catalog = __LITE_MODEL_CATALOG__;
@@ -3315,6 +3338,18 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
     });
   }
 
+  function isModelListRequestMethod(method) {
+    return method === "model/list" || method === "list-models-for-host";
+  }
+
+  function patchOutboundModelRequestMessage(message) {
+    const request = message?.request;
+    if (message?.type !== "mcp-request" || !isModelListRequestMethod(request?.method)) return false;
+    request.params = { ...(request.params || {}), includeHidden: true };
+    if (request.id != null) state.requestIds.add(String(request.id));
+    return true;
+  }
+
   function patchMcpModelResponseData(data) {
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;
@@ -3325,7 +3360,26 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
     return patchModelContainer(data, true) || patchModelContainer(message, true) || patchModelContainer(message?.result, true) || patchModelContainer(message?.result?.data, true);
   }
 
+  function patchElectronBridgeModelMessages() {
+    const bridge = window.electronBridge;
+    if (!bridge || typeof bridge.sendMessageFromView !== "function") return false;
+    if (bridge.__codexGatewayLiteModelSendMessagePatch === SEND_REQUEST_PATCH_MARK) return true;
+    const original = bridge.__codexGatewayLiteModelOriginalSendMessageFromView || bridge.sendMessageFromView.bind(bridge);
+    bridge.__codexGatewayLiteModelOriginalSendMessageFromView = original;
+    bridge.sendMessageFromView = function codexGatewayLitePatchedSendMessageFromView(message) {
+      try {
+        patchOutboundModelRequestMessage(message);
+      } catch (error) {
+        recordFailure(error);
+      }
+      return original(message);
+    };
+    bridge.__codexGatewayLiteModelSendMessagePatch = SEND_REQUEST_PATCH_MARK;
+    return true;
+  }
+
   function patchAppServerModelMessages() {
+    patchElectronBridgeModelMessages();
     if (state.dispatchPatched) return;
     state.dispatchPatched = true;
     state.originals = state.originals || {};
@@ -3333,12 +3387,9 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
     window.dispatchEvent = function codexGatewayLitePatchedDispatchEvent(event) {
       try {
         const detail = event?.detail;
-        const request = detail?.request;
-        if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {
-          request.params = { ...(request.params || {}), includeHidden: true };
-          if (request.id != null) state.requestIds.add(String(request.id));
-        }
+        patchOutboundModelRequestMessage(detail);
         if (event?.type === "message") patchMcpModelResponseData(event.data);
+        if (event?.type === "codex-message-to-view" || event?.type === "codex-message-from-view") patchMcpModelResponseData(detail);
       } catch (error) {
         recordFailure(error);
       }
@@ -3589,6 +3640,7 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
     let changed = false;
     try {
       patchStatsigModelWhitelist();
+      patchElectronBridgeModelMessages();
       if (state.appServerPatchInstalled && !appServerPatchedClientsHealthy()) {
         // 之前追踪的 app-server request client 全部失效了（例如底层模块内部
         // 重新创建了 client 实例），继续认为“已安装”只会让新的 client 漏 patch。
@@ -4125,6 +4177,7 @@ async fn run_agent(
     let mut cdp_was_ready = false;
     let mut cdp_has_connected = false;
     let mut auto_launch_paused_after_close = false;
+    let mut inject_immediately_after_connect = false;
 
     if let Err(error) = launch_codex(&app_dir, debug_port, codex_home.as_deref()).await {
         eprintln!("启动 Codex App 失败：{error:#}");
@@ -4140,6 +4193,7 @@ async fn run_agent(
                         println!("Codex CDP 已连接");
                     }
                     auto_launch_paused_after_close = false;
+                    inject_immediately_after_connect = true;
                     // Codex App 重启后 renderer 是全新的 JS 上下文，之前注入的模型白名单
                     // 和任务清单 UI 全部失效；把计时器往回拨，确保下面的判断立刻触发一次
                     // 重新注入，而不是继续沿用重连前的滑动窗口去等到 10s/1s 才补注入。
@@ -4170,6 +4224,26 @@ async fn run_agent(
                         launch_codex(&app_dir, debug_port, codex_home.as_deref()).await
                     {
                         eprintln!("重新启动 Codex App 失败：{launch_error:#}");
+                    }
+                }
+            }
+        }
+
+        if cdp_was_ready && inject_immediately_after_connect {
+            inject_immediately_after_connect = false;
+            match wait_and_inject_lite_model_whitelist(debug_port, codex_home.as_deref()).await {
+                Ok(()) => last_bridge_injection = Instant::now(),
+                Err(error) => {
+                    eprintln!("Lite 模型白名单首次注入失败：{error:#}");
+                    cdp_was_ready = false;
+                }
+            }
+            if plan_ui && cdp_was_ready {
+                match wait_and_inject_plan_ui(debug_port, codex_home.as_deref()).await {
+                    Ok(()) => last_plan_injection = Instant::now(),
+                    Err(error) => {
+                        eprintln!("任务清单 UI 首次注入失败：{error:#}");
+                        cdp_was_ready = false;
                     }
                 }
             }
@@ -8556,6 +8630,35 @@ CREATE TABLE threads (
             )
             .expect("counts archived thread");
         assert_eq!(archived, 0);
+        let initial_complete = catalog_db
+            .query_row(
+                "SELECT initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads sync state");
+        assert_eq!(initial_complete, 1);
+
+        catalog_db
+            .execute(
+                "UPDATE local_thread_catalog_sync_state SET initial_build_complete = 0 WHERE host_id = 'local'",
+                [],
+            )
+            .expect("marks sync incomplete");
+        drop(catalog_db);
+        let second_report = sync_local_thread_catalog(&home).expect("second sync succeeds");
+        assert_eq!(second_report.catalog_inserted, 0);
+        assert_eq!(second_report.catalog_updated, 0);
+        let catalog_db =
+            Connection::open(home.join("sqlite").join("codex-dev.db")).expect("reopens catalog db");
+        let repaired_complete = catalog_db
+            .query_row(
+                "SELECT initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads repaired sync state");
+        assert_eq!(repaired_complete, 1);
     }
 
     #[test]
@@ -8630,9 +8733,11 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("codexAppAssetUrlByText"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("assetReferencesFromText"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("list-models-for-host"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("sendMessageFromView"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("patchOutboundModelRequestMessage"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("appServerPatchUnavailable = false"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("appServerPatchUnavailable = true"));
-        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("const SCRIPT_VERSION = 7"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("const SCRIPT_VERSION = 8"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("state.observer?.disconnect?.()"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("window.clearTimeout(state.refreshTimer)"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("restoreAppServerModelRequestPatches(state)"));
