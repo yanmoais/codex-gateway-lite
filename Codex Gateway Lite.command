@@ -7,6 +7,7 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 DEBUG_PORT="${CODEX_GATEWAY_LITE_DEBUG_PORT:-9229}"
 APP_PATH="${CODEX_GATEWAY_LITE_APP:-}"
 AGENT_STARTED=0
+LITE_BIN="${CODEX_GATEWAY_LITE_BIN:-$SCRIPT_DIR/target/release/codex-gateway-lite}"
 RUSTUP_OFFICIAL_BASE="https://static.rust-lang.org"
 RUSTUP_USTC_BASE="https://mirrors.ustc.edu.cn/rust-static"
 CRATES_INDEX_URL="https://index.crates.io/config.json"
@@ -44,7 +45,11 @@ cleanup_agent_on_exit() {
   trap - EXIT INT TERM HUP
   if [[ "${AGENT_STARTED:-0}" == "1" ]]; then
     print "\n${YELLOW}${BOLD}脚本退出，停止 Codex Gateway Lite agent...${RESET}"
-    (cd "$SCRIPT_DIR" && cargo run --quiet --manifest-path Cargo.toml -- stop-agent) >/dev/null 2>&1 || true
+    if [[ -x "$LITE_BIN" ]]; then
+      "$LITE_BIN" stop-agent >/dev/null 2>&1 || true
+    else
+      (cd "$SCRIPT_DIR" && cargo run --quiet --manifest-path Cargo.toml -- stop-agent) >/dev/null 2>&1 || true
+    fi
   fi
   exit "$status"
 }
@@ -219,8 +224,26 @@ ensure_codex_app() {
   codex_app_exists || fail "Codex App 安装后仍不可用，请手动安装：$CODEX_DOWNLOAD_PAGE"
 }
 
+lite_binary_stale() {
+  [[ ! -x "$LITE_BIN" ]] && return 0
+  [[ "$SCRIPT_DIR/Cargo.toml" -nt "$LITE_BIN" ]] && return 0
+  [[ "$SCRIPT_DIR/Cargo.lock" -nt "$LITE_BIN" ]] && return 0
+  local newer_source
+  newer_source="$(find "$SCRIPT_DIR/src" -type f -name '*.rs' -newer "$LITE_BIN" -print -quit 2>/dev/null || true)"
+  [[ -n "$newer_source" ]]
+}
+
+ensure_lite_binary() {
+  if lite_binary_stale; then
+    info "构建 release 二进制（后续源码未变化会直接复用）"
+    cargo build --quiet --release --manifest-path Cargo.toml
+    ok "release 二进制已就绪：$LITE_BIN"
+  fi
+}
+
 run_lite() {
-  cargo run --quiet --manifest-path Cargo.toml -- "$@"
+  ensure_lite_binary
+  "$LITE_BIN" "$@"
 }
 
 main() {

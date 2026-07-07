@@ -9,6 +9,7 @@ $ConfigFile = Join-Path $ConfigDir "config.json"
 $DebugPort = if ($env:CODEX_GATEWAY_LITE_DEBUG_PORT) { $env:CODEX_GATEWAY_LITE_DEBUG_PORT } else { "9229" }
 $AppPath = $env:CODEX_GATEWAY_LITE_APP
 $script:AgentStarted = $false
+$LiteBin = if ($env:CODEX_GATEWAY_LITE_BIN) { $env:CODEX_GATEWAY_LITE_BIN } else { Join-Path $RepoRoot "target\release\codex-gateway-lite.exe" }
 $RustupOfficialBase = "https://static.rust-lang.org"
 $RustupUstcBase = "https://mirrors.ustc.edu.cn/rust-static"
 $CratesIndexUrl = "https://index.crates.io/config.json"
@@ -321,7 +322,8 @@ function Run-AgentDiagnostics {
   Write-Section "agent 失败诊断"
   Write-Info "Codex App 自动识别："
   try {
-    cargo run --quiet --manifest-path "Cargo.toml" -- where-app
+    Ensure-LiteBinary
+    & $LiteBin where-app
   } catch {
     Write-Warn "where-app 执行失败：$($_.Exception.Message)"
   }
@@ -338,15 +340,38 @@ function Run-AgentDiagnostics {
   }
 }
 
+function Test-LiteBinaryStale {
+  if (-not (Test-Path $LiteBin)) { return $true }
+  $bin = Get-Item $LiteBin
+  foreach ($path in @((Join-Path $RepoRoot "Cargo.toml"), (Join-Path $RepoRoot "Cargo.lock"))) {
+    if ((Test-Path $path) -and ((Get-Item $path).LastWriteTimeUtc -gt $bin.LastWriteTimeUtc)) {
+      return $true
+    }
+  }
+  $newerSource = Get-ChildItem -Path (Join-Path $RepoRoot "src") -Recurse -Filter "*.rs" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTimeUtc -gt $bin.LastWriteTimeUtc } |
+    Select-Object -First 1
+  return [bool]$newerSource
+}
+
+function Ensure-LiteBinary {
+  if (Test-LiteBinaryStale) {
+    Write-Info "构建 release 二进制（后续源码未变化会直接复用）"
+    cargo build --quiet --release --manifest-path "Cargo.toml"
+    if ($LASTEXITCODE -ne 0) { Fail "release 二进制构建失败" }
+    Write-Ok "release 二进制已就绪：$LiteBin"
+  }
+}
+
 function Run-Lite([string[]]$ArgsList) {
-  $cargoArgs = @("run", "--quiet", "--manifest-path", "Cargo.toml", "--") + $ArgsList
+  Ensure-LiteBinary
   if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
     Write-Info "agent 将保持前台运行；关闭此窗口或按 Ctrl+C 会停止 agent。"
-    & cargo @cargoArgs
+    & $LiteBin @ArgsList
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
       Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
-      Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
+      Write-Info "可手动复现：`"$LiteBin`" $($ArgsList -join ' ')"
       Run-AgentDiagnostics
       Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
     }
@@ -357,7 +382,7 @@ function Run-Lite([string[]]$ArgsList) {
   $stdoutFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.out.log"
   $stderrFile = Join-Path $env:TEMP "codex-gateway-lite-$runId.err.log"
   try {
-    & cargo @cargoArgs > $stdoutFile 2> $stderrFile
+    & $LiteBin @ArgsList > $stdoutFile 2> $stderrFile
     $exitCode = $LASTEXITCODE
     if (Test-Path $stdoutFile) {
       Get-Content -Path $stdoutFile -Encoding UTF8 | ForEach-Object { Write-Host $_ }
@@ -372,7 +397,7 @@ function Run-Lite([string[]]$ArgsList) {
   }
   if ($exitCode -ne 0) {
     Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
-    Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
+    Write-Info "可手动复现：`"$LiteBin`" $($ArgsList -join ' ')"
     if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
       Run-AgentDiagnostics
     }
@@ -383,7 +408,11 @@ function Stop-AgentOnExit {
   if (-not $script:AgentStarted) { return }
   Write-Host "`n脚本退出，停止 Codex Gateway Lite agent..." -ForegroundColor Yellow
   try {
-    cargo run --quiet --manifest-path "Cargo.toml" -- stop-agent | Out-Null
+    if (Test-Path $LiteBin) {
+      & $LiteBin stop-agent | Out-Null
+    } else {
+      cargo run --quiet --manifest-path "Cargo.toml" -- stop-agent | Out-Null
+    }
   } catch {
   }
 }

@@ -22,6 +22,7 @@ mod codex_lite;
 mod protocol_proxy;
 
 const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
+const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2122,16 +2123,17 @@ async fn wait_and_inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> 
 }
 
 async fn inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
-    inject_plan_ui_inner(debug_port, true, codex_home).await
+    inject_plan_ui_inner(debug_port, true, true, codex_home).await
 }
 
 async fn inject_plan_ui_quiet(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
-    inject_plan_ui_inner(debug_port, false, codex_home).await
+    inject_plan_ui_inner(debug_port, false, false, codex_home).await
 }
 
 async fn inject_plan_ui_inner(
     debug_port: u16,
     verbose: bool,
+    seed_history: bool,
     codex_home: Option<&Path>,
 ) -> anyhow::Result<()> {
     let targets = codex_lite::list_targets(debug_port)
@@ -2147,20 +2149,22 @@ async fn inject_plan_ui_inner(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Codex CDP target 没有 websocket URL"))?;
     codex_lite::evaluate_script(websocket, PLAN_UI_SCRIPT).await?;
-    let home = resolve_codex_home(codex_home);
-    match plan_ui_history_seed_script(&home) {
-        Ok(Some(script)) => {
-            if let Err(error) = codex_lite::evaluate_script(websocket, &script).await {
-                if verbose {
-                    eprintln!("任务清单历史快照注入失败，继续使用当前页面快照：{error:#}");
+    if seed_history {
+        let home = resolve_codex_home(codex_home);
+        match plan_ui_history_seed_script(&home) {
+            Ok(Some(script)) => {
+                if let Err(error) = codex_lite::evaluate_script(websocket, &script).await {
+                    if verbose {
+                        eprintln!("任务清单历史快照注入失败，继续使用当前页面快照：{error:#}");
+                    }
                 }
             }
+            Ok(None) => {}
+            Err(error) if verbose => {
+                eprintln!("读取任务清单历史快照失败，继续使用当前页面快照：{error:#}")
+            }
+            Err(_) => {}
         }
-        Ok(None) => {}
-        Err(error) if verbose => {
-            eprintln!("读取任务清单历史快照失败，继续使用当前页面快照：{error:#}")
-        }
-        Err(_) => {}
     }
     match sample_plan_ui_snapshot(websocket).await {
         Ok(true) => {}
@@ -4391,7 +4395,9 @@ async fn run_agent(
 
         if plan_ui
             && cdp_was_ready
-            && (config_changed || last_plan_injection.elapsed() >= Duration::from_millis(1000))
+            && (config_changed
+                || last_plan_injection.elapsed()
+                    >= Duration::from_secs(PLAN_UI_REINJECT_INTERVAL_SECS))
         {
             last_plan_injection = Instant::now();
             if let Err(error) = inject_plan_ui_quiet(debug_port, codex_home.as_deref()).await {
@@ -4628,17 +4634,40 @@ fn spawn_codex_app_macos(
     if !executable.exists() {
         bail!("Codex App 可执行文件不存在：{}", executable.display());
     }
-    ProcessCommand::new(&executable)
-        .env("CODEX_HOME", codex_home)
-        .arg(format!("--remote-debugging-port={debug_port}"))
-        .arg(format!(
-            "--remote-allow-origins=http://127.0.0.1:{debug_port}"
-        ))
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
+    let remote_debug_arg = format!("--remote-debugging-port={debug_port}");
+    let remote_origin_arg = format!("--remote-allow-origins=http://127.0.0.1:{debug_port}");
+    let user_data_arg = format!("--user-data-dir={}", user_data_dir.display());
+
+    if macos_codex_home_requires_env(codex_home) {
+        ProcessCommand::new(&executable)
+            .env("CODEX_HOME", codex_home)
+            .arg(&remote_debug_arg)
+            .arg(&remote_origin_arg)
+            .arg(&user_data_arg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("启动 Codex App 失败：{}", executable.display()))?;
+        return Ok(());
+    }
+
+    ProcessCommand::new("open")
+        .arg("-n")
+        .arg("-a")
+        .arg(app_dir)
+        .arg("--args")
+        .arg(&remote_debug_arg)
+        .arg(&remote_origin_arg)
+        .arg(&user_data_arg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("启动 Codex App 失败：{}", executable.display()))?;
+        .with_context(|| {
+            format!(
+                "通过 LaunchServices 启动 Codex App 失败：{}",
+                app_dir.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -4697,6 +4726,11 @@ fn codex_profile_name_from_home_component(component: &str) -> String {
     } else {
         name
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_codex_home_requires_env(codex_home: &Path) -> bool {
+    !path_eq_loose(codex_home, &default_user_codex_home_dir())
 }
 
 #[cfg(target_os = "macos")]
@@ -4901,7 +4935,8 @@ fn codex_app_command_matches_profile(
     command.contains("/Contents/MacOS/Codex")
         && command.contains(&format!("--remote-debugging-port={debug_port}"))
         && command.contains(&format!("--user-data-dir={}", user_data_dir.display()))
-        && command.contains(&format!("CODEX_HOME={}", codex_home.display()))
+        && (!macos_codex_home_requires_env(codex_home)
+            || command.contains(&format!("CODEX_HOME={}", codex_home.display())))
 }
 
 #[cfg(target_os = "macos")]
@@ -5971,7 +6006,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 38;
+  const SCRIPT_VERSION = 39;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -5998,6 +6033,12 @@ const PLAN_UI_SCRIPT: &str = r#"
     rightPanelDismissedPanelSignature: previousState?.rightPanelDismissedPanelSignature || "",
   };
   window.__codexGatewayLitePlanUiState = state;
+  if (previousState?.version === SCRIPT_VERSION
+      && window.__codexGatewayLitePlanUiObserver
+      && typeof window.__codexGatewayLitePlanUiApply === "function") {
+    try { window.__codexGatewayLitePlanUiApply(); } catch {}
+    return;
+  }
 
   function installStyle() {
     let style = document.getElementById(STYLE_ID);
@@ -7468,7 +7509,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     renderDock(snapshot || snapshotForThread(threadId));
   }
 
-  const APPLY_THROTTLE_MS = 250;
+  const APPLY_THROTTLE_MS = 750;
   let applyThrottleTimer = 0;
   let lastApplyAt = 0;
 
@@ -7481,8 +7522,8 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function scheduleApply() {
-    // 真实页面上一次流式回复会在几秒内触发成百上千次 DOM/文本变更（MutationObserver
-    // 监听了 childList/subtree/characterData），如果每次都同步跑一遍 apply()（内含
+    // 真实页面上一次流式回复会在几秒内触发成百上千次 DOM 变更（MutationObserver
+    // 监听了 childList/subtree/attributes），如果每次都同步跑一遍 apply()（内含
     // getBoundingClientRect/getComputedStyle 全量扫描），会把 renderer 进程的 CPU 打满。
     // 这里把连续触发合并到最多每 APPLY_THROTTLE_MS 执行一次。
     if (window.__codexGatewayLitePlanUiFrame || applyThrottleTimer) return;
@@ -7515,12 +7556,12 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
   apply();
   const observer = new MutationObserver(scheduleApply);
-  observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["style", "class", "data-state", "hidden", "role", "aria-modal"] });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class", "data-state", "hidden", "role", "aria-modal"] });
   window.__codexGatewayLitePlanUiObserver = observer;
   window.__codexGatewayLitePlanUiResize = scheduleApply;
   window.__codexGatewayLitePlanUiScroll = scheduleApply;
   window.__codexGatewayLitePlanUiRightPanelDismiss = handleRightPanelDismissEvent;
-  window.__codexGatewayLitePlanUiTimer = window.setInterval(scheduleApply, 1000);
+  window.__codexGatewayLitePlanUiTimer = window.setInterval(scheduleApply, 5000);
   window.addEventListener("resize", scheduleApply, { passive: true });
   window.addEventListener("scroll", scheduleApply, { passive: true, capture: true });
   window.addEventListener("pointerdown", handleRightPanelDismissEvent, { passive: true, capture: true });
@@ -8583,7 +8624,7 @@ CREATE TABLE threads (
     #[test]
     fn plan_ui_schedule_apply_throttles_high_frequency_mutation_bursts() {
         // 真实页面流式回复期间，MutationObserver 会在几秒内触发成百上千次
-        // scheduleApply（childList/subtree/characterData 全部在监听范围内）。
+        // scheduleApply（childList/subtree/attributes 全部在监听范围内）。
         // 必须把这类爆发合并成一次节流定时器，不能每次都同步跑一遍 apply()，
         // 否则 renderer 进程 CPU 会被打满（真实现场表现为温度飙升）。
         let mut ctx = plan_ui_test_context();
@@ -9215,7 +9256,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 38"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 39"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -9306,7 +9347,9 @@ model_catalog_json = "model-catalogs/gateway.json"
         );
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
-        assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 1000)"));
+        assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
+        assert!(!PLAN_UI_SCRIPT.contains("characterData: true"));
+        assert!(PLAN_UI_REINJECT_INTERVAL_SECS >= 30);
         assert!(PLAN_UI_SCRIPT.contains("^(打开位置|打开图片|审查)$"));
         assert!(PLAN_TOOLTIP_SAMPLE_READ_SCRIPT.contains("^(打开位置|打开图片|审查)$"));
         assert!(!PLAN_UI_SCRIPT.contains("if (/打开位置|打开图片|审查/.test(item))"));
@@ -9431,9 +9474,9 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Stop-AgentOnExit"));
         assert!(windows_script.contains("$script:AgentStarted = $true"));
         assert!(windows_script.contains("} finally {"));
+        assert!(windows_script.contains("$LiteBin stop-agent"));
         assert!(
-            windows_script
-                .contains("cargo run --quiet --manifest-path \"Cargo.toml\" -- stop-agent")
+            windows_script.contains("cargo build --quiet --release --manifest-path \"Cargo.toml\"")
         );
     }
 
@@ -9637,6 +9680,26 @@ not-a-pid garbage line without valid pid
             9229,
             codex_home,
             user_data_dir
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_codex_profile_does_not_require_codex_home_env() {
+        let codex_home = default_user_codex_home_dir();
+        let user_data_dir =
+            macos_codex_user_data_dir(&codex_home).expect("default user data dir resolves");
+        let command = format!(
+            "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9229 --user-data-dir={}",
+            user_data_dir.display()
+        );
+
+        assert!(!macos_codex_home_requires_env(&codex_home));
+        assert!(codex_app_command_matches_profile(
+            &command,
+            9229,
+            &codex_home,
+            &user_data_dir
         ));
     }
 
