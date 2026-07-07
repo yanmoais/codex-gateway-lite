@@ -319,7 +319,15 @@ function Ensure-CodexApp {
 
 function Run-Lite([string[]]$ArgsList) {
   cargo run --quiet --manifest-path "Cargo.toml" -- @ArgsList
-  if ($LASTEXITCODE -ne 0) { Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')" }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn "codex-gateway-lite 子命令退出码：$LASTEXITCODE"
+    Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
+    if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
+      Write-Info "如仍失败，请运行：cargo run --quiet --manifest-path Cargo.toml -- where-app"
+      Write-Info "如 57321 端口被占用，请运行：netstat -ano | findstr :57321"
+    }
+    Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
+  }
 }
 
 function Stop-AgentOnExit {

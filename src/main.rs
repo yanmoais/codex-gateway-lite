@@ -1064,10 +1064,9 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
     };
     println!("正在从供应商拉取模型列表...");
     let model_ids = fetch_provider_model_ids(&provider).await?;
-    let default_model = model_ids
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("供应商 /models 没有返回任何模型"))?;
+    if model_ids.is_empty() {
+        bail!("供应商 /models 没有返回任何模型");
+    }
     let models = models_from_ids(&model_ids);
     let common_config = match extract_common_config_from_home(&default_user_codex_home_dir()) {
         Ok(common_config) => {
@@ -1081,11 +1080,9 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
             String::new()
         }
     };
-    println!(
-        "已拉取 {} 个模型，默认模型：{}",
-        models.len(),
-        default_model
-    );
+    println!("已拉取 {} 个模型。", models.len());
+    let default_model = choose_default_model(&model_ids)?;
+    println!("默认模型：{}", default_model);
 
     let config = LiteConfig {
         provider,
@@ -1100,6 +1097,32 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
     write_lite_config(path, &config)?;
     println!("配置已写入：{}", path.display());
     Ok(())
+}
+
+fn choose_default_model(model_ids: &[String]) -> anyhow::Result<String> {
+    println!("默认模型列表：");
+    for (index, model_id) in model_ids.iter().enumerate() {
+        println!("  {}. {}", index + 1, model_id);
+    }
+    loop {
+        let choice = prompt_default("请输入默认模型编号", "1")?;
+        if let Some(model) = model_from_numbered_choice(model_ids, &choice) {
+            return Ok(model);
+        }
+        println!("输入无效，请输入 1~{} 之间的数字。", model_ids.len());
+    }
+}
+
+fn model_from_numbered_choice(model_ids: &[String], choice: &str) -> Option<String> {
+    let choice = choice.trim();
+    if choice.is_empty() {
+        return model_ids.first().cloned();
+    }
+    let index = choice.parse::<usize>().ok()?;
+    if index == 0 || index > model_ids.len() {
+        return None;
+    }
+    model_ids.get(index - 1).cloned()
 }
 
 fn print_context_budget_notice(config: &LiteConfig) {
@@ -4346,6 +4369,33 @@ async fn launch_codex(
     }
     #[cfg(windows)]
     {
+        let command = codex_lite::build_codex_command(app_dir, debug_port, &[]);
+        let executable = command
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Codex 启动命令为空"))?;
+        if Path::new(executable).exists() {
+            match std::process::Command::new(executable)
+                .args(&command[1..])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(_) => {
+                    println!(
+                        "已启动 Codex App：{}，CDP 端口：{}",
+                        app_dir.display(),
+                        debug_port
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!(
+                        "直接启动 Codex.exe 失败：{}；尝试 Store/MSIX 启动方式",
+                        error
+                    );
+                }
+            }
+        }
         if let Some(app_user_model_id) = codex_lite::packaged_app_user_model_id(app_dir) {
             let args = format!("--remote-debugging-port={debug_port}");
             codex_lite::activate_packaged_app(&app_user_model_id, &args).await?;
@@ -4356,22 +4406,7 @@ async fn launch_codex(
             );
             return Ok(());
         }
-        let command = codex_lite::build_codex_command(app_dir, debug_port, &[]);
-        let executable = command
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("Codex 启动命令为空"))?;
-        std::process::Command::new(executable)
-            .args(&command[1..])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("启动 Codex 失败：{executable}"))?;
-        println!(
-            "已启动 Codex App：{}，CDP 端口：{}",
-            app_dir.display(),
-            debug_port
-        );
-        Ok(())
+        bail!("未找到可执行的 Codex.exe：{executable}")
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -5183,7 +5218,13 @@ fn terminate_other_agent_processes() -> usize {
     #[cfg(windows)]
     {
         let current_pid = std::process::id();
-        let pids = windows_codex_gateway_agent_pids(current_pid);
+        let mut pids = windows_codex_gateway_agent_pids(current_pid);
+        pids.extend(windows_codex_gateway_listener_pids(
+            protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            current_pid,
+        ));
+        pids.sort_unstable();
+        pids.dedup();
         for pid in &pids {
             let _ = ProcessCommand::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T"])
@@ -5273,6 +5314,39 @@ Get-CimInstance Win32_Process |
             "Bypass",
             "-Command",
             script,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    codex_gateway_agent_pids_from_windows_process_json(&text, current_pid)
+}
+
+#[cfg(windows)]
+fn windows_codex_gateway_listener_pids(port: u16, current_pid: u32) -> Vec<u32> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$pids = @(Get-NetTCPConnection -LocalPort {port} -State Listen | Select-Object -ExpandProperty OwningProcess -Unique)
+if ($pids.Count -gt 0) {{
+  Get-CimInstance Win32_Process |
+    Where-Object {{ $pids -contains [int]$_.ProcessId -and $_.CommandLine -and $_.CommandLine -like '*codex-gateway-lite*' }} |
+    Select-Object ProcessId,CommandLine |
+    ConvertTo-Json -Compress
+}}
+"#
+    );
+    let output = ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
         ])
         .output();
     let Ok(output) = output else {
@@ -7156,6 +7230,30 @@ mod tests {
 
     // 让 PLAN_UI_SCRIPT 这个 IIFE 能在没有真实浏览器的情况下跑到底所需要的最小 DOM/BOM
     // mock。只覆盖脚本安装阶段实际会调用到的那几个 API，够用即可，不追求完整实现。
+    #[test]
+    fn numbered_model_choice_selects_expected_model() {
+        let models = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
+        assert_eq!(
+            model_from_numbered_choice(&models, "1").as_deref(),
+            Some("model-a")
+        );
+        assert_eq!(
+            model_from_numbered_choice(&models, " 3 ").as_deref(),
+            Some("model-c")
+        );
+        assert_eq!(
+            model_from_numbered_choice(&models, "").as_deref(),
+            Some("model-a")
+        );
+        assert!(model_from_numbered_choice(&models, "0").is_none());
+        assert!(model_from_numbered_choice(&models, "4").is_none());
+        assert!(model_from_numbered_choice(&models, "model-b").is_none());
+    }
+
     const PLAN_UI_MOCK_DOM_SCRIPT: &str = r#"
     class __MockElement {
       constructor(tagName) {
