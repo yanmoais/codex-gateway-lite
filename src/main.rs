@@ -670,6 +670,7 @@ struct ApplyReport {
 struct ThreadCatalogSyncReport {
     sources_seen: usize,
     threads_seen: usize,
+    catalog_targets: usize,
     catalog_inserted: usize,
     catalog_updated: usize,
 }
@@ -1449,8 +1450,12 @@ fn print_apply_report(report: &ApplyReport) {
     }
     if let Some(sync) = report.thread_catalog_sync {
         println!(
-            "  thread_catalog_sync: sources={}, threads={}, inserted={}, updated={}",
-            sync.sources_seen, sync.threads_seen, sync.catalog_inserted, sync.catalog_updated
+            "  thread_catalog_sync: sources={}, threads={}, dbs={}, inserted={}, updated={}",
+            sync.sources_seen,
+            sync.threads_seen,
+            sync.catalog_targets,
+            sync.catalog_inserted,
+            sync.catalog_updated
         );
     }
     if let Some(path) = &report.backup_path {
@@ -1508,6 +1513,7 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
         sources_seen: thread_state_db_paths(home).len()
             + usize::from(home.join("session_index.jsonl").exists()),
         threads_seen: 0,
+        catalog_targets: 0,
         catalog_inserted: 0,
         catalog_updated: 0,
     };
@@ -1553,19 +1559,29 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
         return Ok(report);
     }
 
-    let db_path = home.join("sqlite").join("codex-dev.db");
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建 Codex sqlite 目录失败：{}", parent.display()))?;
+    for db_path in local_thread_catalog_db_paths(home) {
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建 Codex sqlite 目录失败：{}", parent.display()))?;
+        }
+        let mut conn = Connection::open(&db_path)
+            .with_context(|| format!("打开 Codex catalog 数据库失败：{}", db_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        ensure_local_thread_catalog_schema(&conn)?;
+        let (inserted, updated) = upsert_local_thread_catalog(&mut conn, &selected)?;
+        report.catalog_targets += 1;
+        report.catalog_inserted = report.catalog_inserted.max(inserted);
+        report.catalog_updated = report.catalog_updated.max(updated);
     }
-    let mut conn = Connection::open(&db_path)
-        .with_context(|| format!("打开 Codex catalog 数据库失败：{}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(2))?;
-    ensure_local_thread_catalog_schema(&conn)?;
-    let (inserted, updated) = upsert_local_thread_catalog(&mut conn, &selected)?;
-    report.catalog_inserted = inserted;
-    report.catalog_updated = updated;
     Ok(report)
+}
+
+fn local_thread_catalog_db_paths(home: &Path) -> Vec<PathBuf> {
+    let sqlite_dir = home.join("sqlite");
+    let mut paths = vec![sqlite_dir.join("codex.db"), sqlite_dir.join("codex-dev.db")];
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn collect_thread_entries_from_state_dbs(
@@ -1751,7 +1767,12 @@ CREATE TABLE IF NOT EXISTS local_thread_catalog (
   PRIMARY KEY (host_id, thread_id)
 );
 CREATE INDEX IF NOT EXISTS local_thread_catalog_updated_idx
-  ON local_thread_catalog(host_id, source_updated_at DESC);
+  ON local_thread_catalog(
+    host_id,
+    source_updated_at DESC,
+    source_created_at DESC,
+    thread_id
+  ) WHERE missing_candidate = 0;
 CREATE TABLE IF NOT EXISTS local_thread_catalog_metadata (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -8604,10 +8625,11 @@ CREATE TABLE threads (
 
         let report = sync_local_thread_catalog(&home).expect("sync succeeds");
         assert_eq!(report.threads_seen, 2);
+        assert_eq!(report.catalog_targets, 2);
         assert_eq!(report.catalog_inserted, 2);
 
         let catalog_db =
-            Connection::open(home.join("sqlite").join("codex-dev.db")).expect("opens catalog db");
+            Connection::open(home.join("sqlite").join("codex.db")).expect("opens catalog db");
         let rows = catalog_db
             .query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |row| {
                 row.get::<_, i64>(0)
@@ -8650,7 +8672,7 @@ CREATE TABLE threads (
         assert_eq!(second_report.catalog_inserted, 0);
         assert_eq!(second_report.catalog_updated, 0);
         let catalog_db =
-            Connection::open(home.join("sqlite").join("codex-dev.db")).expect("reopens catalog db");
+            Connection::open(home.join("sqlite").join("codex.db")).expect("reopens catalog db");
         let repaired_complete = catalog_db
             .query_row(
                 "SELECT initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
@@ -8659,6 +8681,16 @@ CREATE TABLE threads (
             )
             .expect("reads repaired sync state");
         assert_eq!(repaired_complete, 1);
+        for db_name in ["codex.db", "codex-dev.db"] {
+            let catalog_db = Connection::open(home.join("sqlite").join(db_name))
+                .expect("opens mirrored catalog db");
+            let rows = catalog_db
+                .query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("counts mirrored catalog rows");
+            assert_eq!(rows, 2, "{db_name} should mirror the sidebar catalog");
+        }
     }
 
     #[test]
