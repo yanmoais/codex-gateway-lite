@@ -4292,6 +4292,8 @@ async fn launch_codex(
     if !app_dir.exists() {
         bail!("Codex App 不存在：{}", app_dir.display());
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = codex_home;
     #[cfg(target_os = "macos")]
     {
         let home = resolve_codex_home(codex_home);
@@ -4612,6 +4614,7 @@ fn codex_app_main_processes_from_ps_output(ps_output: &str, marker: &str) -> Vec
 
 // 只匹配主可执行文件本身（Contents/MacOS/<name>），不误伤 renderer/GPU/utility 等
 // 由主进程管理的子进程——它们会随主进程一起退出，不需要单独处理。纯函数，方便单测。
+#[cfg(any(target_os = "macos", test))]
 fn stale_codex_app_pids(ps_output: &str, marker: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     for line in ps_output.lines() {
@@ -5222,6 +5225,7 @@ fn wait_for_processes_to_exit(pids: &[u32], timeout: Duration) -> bool {
     }
 }
 
+#[cfg(any(unix, test))]
 fn codex_gateway_agent_pids(ps_output: &str, current_pid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     for line in ps_output.lines() {
