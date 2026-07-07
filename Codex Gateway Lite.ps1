@@ -339,9 +339,22 @@ function Run-AgentDiagnostics {
 }
 
 function Run-Lite([string[]]$ArgsList) {
-  cargo run --quiet --manifest-path "Cargo.toml" -- @ArgsList
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warn "codex-gateway-lite 子命令退出码：$LASTEXITCODE"
+  $oldEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    cargo run --quiet --manifest-path "Cargo.toml" -- @ArgsList 2>&1 | ForEach-Object {
+      if ($_ -is [System.Management.Automation.ErrorRecord]) {
+        Write-Host $_.ToString() -ForegroundColor Red
+      } else {
+        Write-Host $_
+      }
+    }
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $oldEap
+  }
+  if ($exitCode -ne 0) {
+    Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
     Write-Info "可手动复现：cargo run --quiet --manifest-path Cargo.toml -- $($ArgsList -join ' ')"
     if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
       Run-AgentDiagnostics

@@ -4067,6 +4067,7 @@ async fn run_agent(
     plan_ui: bool,
     interval_ms: u64,
 ) -> anyhow::Result<()> {
+    println!("准备启动 Codex Gateway Lite agent...");
     let replaced_agent_count = terminate_other_agent_processes();
     if replaced_agent_count > 0 {
         let _ = remove_agent_lock_file();

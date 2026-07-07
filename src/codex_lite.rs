@@ -438,10 +438,18 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         return normalize_codex_app_path(app_dir);
     }
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         return find_macos_codex_app_default();
     }
-    find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir)
+    #[cfg(windows)]
+    {
+        return find_standalone_codex_app_dir().or_else(find_latest_codex_app_dir_default);
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir)
+    }
 }
 
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
@@ -532,6 +540,7 @@ fn find_macos_codex_app_default() -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
 fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -608,9 +617,13 @@ fn find_latest_codex_app_dir_from_roots(roots: &[PathBuf]) -> Option<PathBuf> {
         })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn find_standalone_codex_app_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var_os("LOCALAPPDATA")?;
     let candidates = [
+        PathBuf::from(&local_appdata)
+            .join("Microsoft")
+            .join("WindowsApps"),
         PathBuf::from(&local_appdata)
             .join("OpenAI")
             .join("Codex")
@@ -664,6 +677,7 @@ fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
 fn build_codex_executable(app_dir: &Path) -> PathBuf {
     if app_dir.extension() == Some(OsStr::new("app")) {
         return app_dir.join("Contents").join("MacOS").join("Codex");
