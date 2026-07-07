@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1579,6 +1580,18 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
 fn local_thread_catalog_db_paths(home: &Path) -> Vec<PathBuf> {
     let sqlite_dir = home.join("sqlite");
     let mut paths = vec![sqlite_dir.join("codex.db"), sqlite_dir.join("codex-dev.db")];
+    if let Ok(entries) = fs::read_dir(&sqlite_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_file()
+                && is_sqlite_candidate(&path)
+                && (sqlite_has_table(&path, "local_thread_catalog")
+                    || sqlite_has_table(&path, "local_thread_catalog_sync_state"))
+            {
+                paths.push(path);
+            }
+        }
+    }
     paths.sort();
     paths.dedup();
     paths
@@ -1681,27 +1694,50 @@ fn collect_thread_entries_from_state_dbs(
 }
 
 fn thread_state_db_paths(home: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![
-        home.join("state_5.sqlite"),
-        home.join("sqlite").join("state_5.sqlite"),
-    ];
-    let sqlite_dir = home.join("sqlite");
-    if let Ok(entries) = fs::read_dir(sqlite_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
-            {
-                paths.push(path);
-            }
-        }
+    let mut paths = codex_sqlite_dir_session_dbs(home);
+    let legacy = home.join("state_5.sqlite");
+    if !paths.iter().any(|path| path == &legacy) {
+        paths.push(legacy);
     }
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn codex_sqlite_dir_session_dbs(home: &Path) -> Vec<PathBuf> {
+    let sqlite_dir = home.join("sqlite");
+    let Ok(entries) = fs::read_dir(sqlite_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| is_sqlite_candidate(path))
+        .filter(|path| has_session_table(path))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        (
+            path.file_name()
+                .map(|name| name != OsStr::new("codex-dev.db"))
+                .unwrap_or(true),
+            path.file_name().map(|name| name.to_os_string()),
+        )
+    });
+    candidates
+}
+
+fn is_sqlite_candidate(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(OsStr::to_str),
+        Some("db") | Some("sqlite") | Some("sqlite3")
+    )
+}
+
+fn has_session_table(path: &Path) -> bool {
+    ["threads", "automation_runs", "inbox_items"]
+        .iter()
+        .any(|table| sqlite_has_table(path, table))
 }
 
 fn read_session_index_entries(home: &Path) -> anyhow::Result<Vec<SessionIndexEntry>> {
@@ -1785,6 +1821,24 @@ CREATE TABLE IF NOT EXISTS local_thread_catalog_sync_state (
 );
 "#,
     )?;
+    ensure_sqlite_column(
+        conn,
+        "local_thread_catalog_sync_state",
+        "watermark_updated_at",
+        "REAL",
+    )?;
+    ensure_sqlite_column(
+        conn,
+        "local_thread_catalog_sync_state",
+        "initial_build_complete",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_sqlite_column(
+        conn,
+        "local_thread_catalog_sync_state",
+        "observation_sequence",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute(
         "INSERT OR IGNORE INTO local_thread_catalog_hosts (host_id, host_kind) VALUES ('local', 'local')",
         [],
@@ -1797,6 +1851,20 @@ CREATE TABLE IF NOT EXISTS local_thread_catalog_sync_state (
         "INSERT OR IGNORE INTO local_thread_catalog_sync_state (host_id, watermark_updated_at, initial_build_complete, observation_sequence) VALUES ('local', NULL, 0, 0)",
         [],
     )?;
+    Ok(())
+}
+
+fn ensure_sqlite_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> anyhow::Result<()> {
+    if !sqlite_table_columns(conn, table)?.contains(column) {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
     Ok(())
 }
 
@@ -8691,6 +8759,98 @@ CREATE TABLE threads (
                 .expect("counts mirrored catalog rows");
             assert_eq!(rows, 2, "{db_name} should mirror the sidebar catalog");
         }
+    }
+
+    #[test]
+    fn sync_local_thread_catalog_discovers_current_and_legacy_session_dbs() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("codex-gateway-lite-catalog-scan-test-{unique}"));
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).expect("creates sqlite dir");
+
+        create_thread_source_db(
+            &sqlite_dir.join("custom.sqlite3"),
+            "thread-new",
+            "Custom Current",
+            300,
+            "/tmp/current",
+        );
+        create_thread_source_db(
+            &sqlite_dir.join("codex-dev.db"),
+            "thread-dup",
+            "Stale Dev Copy",
+            100,
+            "/tmp/stale",
+        );
+        create_thread_source_db(
+            &home.join("state_5.sqlite"),
+            "thread-dup",
+            "Fresh Legacy Copy",
+            400,
+            "/tmp/fresh",
+        );
+
+        let target_db = sqlite_dir.join("custom-app.sqlite3");
+        let target = Connection::open(&target_db).expect("opens custom app db");
+        target
+            .execute(
+                "CREATE TABLE local_thread_catalog_sync_state (host_id TEXT PRIMARY KEY)",
+                [],
+            )
+            .expect("creates custom target marker");
+        drop(target);
+
+        let report = sync_local_thread_catalog(&home).expect("sync succeeds");
+        assert_eq!(report.threads_seen, 2);
+        assert_eq!(report.catalog_targets, 3);
+
+        for db_name in ["codex.db", "codex-dev.db", "custom-app.sqlite3"] {
+            let catalog_db =
+                Connection::open(sqlite_dir.join(db_name)).expect("opens catalog target db");
+            let rows = catalog_db
+                .query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("counts catalog rows");
+            assert_eq!(rows, 2, "{db_name} should receive mirrored catalog rows");
+            let title = catalog_db
+                .query_row(
+                    "SELECT display_title FROM local_thread_catalog WHERE thread_id = 'thread-dup'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("reads deduped title");
+            assert_eq!(title, "Fresh Legacy Copy");
+        }
+    }
+
+    fn create_thread_source_db(path: &Path, id: &str, title: &str, updated_at: i64, cwd: &str) {
+        let db = Connection::open(path).expect("opens source db");
+        db.execute_batch(
+            r#"
+CREATE TABLE threads (
+  id TEXT PRIMARY KEY,
+  title TEXT,
+  created_at INTEGER,
+  updated_at INTEGER,
+  cwd TEXT,
+  source TEXT,
+  model_provider TEXT,
+  git_branch TEXT,
+  archived INTEGER
+);
+"#,
+        )
+        .expect("creates source threads table");
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, 'vscode', 'gateway', NULL, 0)",
+            params![id, title, updated_at - 10, updated_at, cwd],
+        )
+        .expect("inserts source thread");
     }
 
     #[test]
