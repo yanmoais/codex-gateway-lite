@@ -27,6 +27,18 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
 
+      - name: Parse Windows bootstrap script
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '.\Codex Gateway Lite.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List *
+            exit 1
+          }
+
       - name: Cargo fmt
         run: cargo fmt -- --check
 
