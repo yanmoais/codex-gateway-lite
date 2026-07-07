@@ -4388,44 +4388,36 @@ async fn launch_codex(
     }
     #[cfg(windows)]
     {
+        if let Some(app_user_model_id) = codex_lite::packaged_app_user_model_id(app_dir) {
+            let args = codex_lite::command_line_arguments(&codex_lite::build_codex_arguments(
+                debug_port,
+                &[],
+            ));
+            let process_id = codex_lite::activate_packaged_app(&app_user_model_id, &args).await?;
+            println!(
+                "已通过 Store/MSIX 激活 Codex App：{}，CDP 端口：{}，pid：{}",
+                app_dir.display(),
+                debug_port,
+                process_id
+            );
+            return Ok(());
+        }
         let command = codex_lite::build_codex_command(app_dir, debug_port, &[]);
         let executable = command
             .first()
             .ok_or_else(|| anyhow::anyhow!("Codex 启动命令为空"))?;
-        if Path::new(executable).exists() {
-            match std::process::Command::new(executable)
-                .args(&command[1..])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    println!(
-                        "已启动 Codex App：{}，CDP 端口：{}",
-                        app_dir.display(),
-                        debug_port
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    eprintln!(
-                        "直接启动 Codex.exe 失败：{}；尝试 Store/MSIX 启动方式",
-                        error
-                    );
-                }
-            }
-        }
-        if let Some(app_user_model_id) = codex_lite::packaged_app_user_model_id(app_dir) {
-            let args = format!("--remote-debugging-port={debug_port}");
-            codex_lite::activate_packaged_app(&app_user_model_id, &args).await?;
-            println!(
-                "已启动 Codex App：{}，CDP 端口：{}",
-                app_dir.display(),
-                debug_port
-            );
-            return Ok(());
-        }
-        bail!("未找到可执行的 Codex.exe：{executable}")
+        std::process::Command::new(executable)
+            .args(&command[1..])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("启动 Codex 失败：{executable}"))?;
+        println!(
+            "已启动 Codex App：{}，CDP 端口：{}",
+            app_dir.display(),
+            debug_port
+        );
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -4459,6 +4451,9 @@ fn spawn_codex_app_macos(
     ProcessCommand::new(&executable)
         .env("CODEX_HOME", codex_home)
         .arg(format!("--remote-debugging-port={debug_port}"))
+        .arg(format!(
+            "--remote-allow-origins=http://127.0.0.1:{debug_port}"
+        ))
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -7249,6 +7244,33 @@ mod tests {
 
     // 让 PLAN_UI_SCRIPT 这个 IIFE 能在没有真实浏览器的情况下跑到底所需要的最小 DOM/BOM
     // mock。只覆盖脚本安装阶段实际会调用到的那几个 API，够用即可，不追求完整实现。
+    #[test]
+    fn codex_launch_arguments_match_codexplusplus_cdp_contract() {
+        let args = codex_lite::build_codex_arguments(9229, &[]);
+        assert_eq!(
+            args,
+            vec![
+                "--remote-debugging-port=9229".to_string(),
+                "--remote-allow-origins=http://127.0.0.1:9229".to_string(),
+            ]
+        );
+        assert_eq!(
+            codex_lite::command_line_arguments(&args),
+            "--remote-debugging-port=9229 --remote-allow-origins=http://127.0.0.1:9229"
+        );
+    }
+
+    #[test]
+    fn windows_packaged_app_user_model_id_matches_store_package() {
+        let app_dir = PathBuf::from(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
+        );
+        assert_eq!(
+            codex_lite::packaged_app_user_model_id(&app_dir).as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0!App")
+        );
+    }
+
     #[test]
     fn numbered_model_choice_selects_expected_model() {
         let models = vec![

@@ -27,3 +27,6 @@ toml_edit = "0.22"
 
 [dev-dependencies]
 boa_engine = "0.21.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_System_Com", "Win32_UI_Shell"] }

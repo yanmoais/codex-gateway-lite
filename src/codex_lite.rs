@@ -444,7 +444,7 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        return find_standalone_codex_app_dir().or_else(find_latest_codex_app_dir_default);
+        return find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir);
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -468,7 +468,7 @@ pub fn codex_app_version(app_dir: &Path) -> Option<String> {
     codex_package_version(package_dir)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
     let package_name = package_name_from_app_dir(app_dir)?;
     let (identity_name, _, publisher_id) = codex_package_parts(&package_name)?;
@@ -478,6 +478,21 @@ pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
     Some(format!("{identity_name}_{publisher_id}!App"))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
+pub fn build_codex_arguments(debug_port: u16, extra_args: &[String]) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={debug_port}"),
+        format!("--remote-allow-origins=http://127.0.0.1:{debug_port}"),
+    ];
+    args.extend(
+        extra_args
+            .iter()
+            .filter(|arg| !arg.trim().is_empty())
+            .cloned(),
+    );
+    args
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn build_codex_command(app_dir: &Path, debug_port: u16, extra_args: &[String]) -> Vec<String> {
     let mut command = vec![
@@ -485,44 +500,95 @@ pub fn build_codex_command(app_dir: &Path, debug_port: u16, extra_args: &[String
             .to_string_lossy()
             .to_string(),
     ];
-    command.push(format!("--remote-debugging-port={debug_port}"));
-    command.extend(
-        extra_args
-            .iter()
-            .filter(|arg| !arg.trim().is_empty())
-            .cloned(),
-    );
+    command.extend(build_codex_arguments(debug_port, extra_args));
     command
 }
-
 #[cfg(windows)]
 pub async fn activate_packaged_app(
     app_user_model_id: &str,
     arguments: &str,
 ) -> anyhow::Result<u32> {
-    let status = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                "Start-Process -FilePath {} -ArgumentList {}",
-                powershell_quote(&format!("shell:AppsFolder\\{app_user_model_id}")),
-                powershell_quote(arguments)
-            ),
-        ])
-        .status()
-        .context("启动 packaged Codex App 失败")?;
-    if !status.success() {
-        bail!("packaged Codex App 启动失败：{status}");
-    }
-    Ok(0)
+    let app_user_model_id = app_user_model_id.to_string();
+    let arguments = arguments.to_string();
+    tokio::task::spawn_blocking(move || {
+        activate_packaged_app_blocking(&app_user_model_id, &arguments)
+    })
+    .await
+    .context("packaged Codex App activation task failed")?
 }
 
 #[cfg(windows)]
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
+    use windows::core::HSTRING;
+
+    unsafe {
+        let coinit = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let should_uninitialize = coinit.is_ok();
+        coinit.ok().or_else(|error| {
+            const RPC_E_CHANGED_MODE: i32 = -2147417850;
+            if error.code().0 == RPC_E_CHANGED_MODE {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+
+        let result: windows::core::Result<u32> = (|| {
+            let manager: IApplicationActivationManager =
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+            let process_id = manager.ActivateApplication(
+                &HSTRING::from(app_user_model_id),
+                &HSTRING::from(arguments),
+                windows::Win32::UI::Shell::ACTIVATEOPTIONS(0),
+            )?;
+            Ok(process_id)
+        })();
+
+        if should_uninitialize {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(any(windows, test))]
+pub fn command_line_arguments(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_windows_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(windows, test))]
+fn quote_windows_argument(arg: &str) -> String {
+    if !arg.is_empty() && !arg.bytes().any(|byte| matches!(byte, b' ' | b'\t' | b'"')) {
+        return arg.to_string();
+    }
+    let mut output = String::from("\"");
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                output.push_str(&"\\".repeat(backslashes * 2 + 1));
+                output.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                output.push_str(&"\\".repeat(backslashes));
+                output.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    output.push_str(&"\\".repeat(backslashes * 2));
+    output.push('"');
+    output
 }
 
 fn find_macos_codex_app_default() -> Option<PathBuf> {
@@ -622,9 +688,6 @@ fn find_standalone_codex_app_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var_os("LOCALAPPDATA")?;
     let candidates = [
         PathBuf::from(&local_appdata)
-            .join("Microsoft")
-            .join("WindowsApps"),
-        PathBuf::from(&local_appdata)
             .join("OpenAI")
             .join("Codex")
             .join("bin"),
@@ -718,7 +781,7 @@ fn macos_app_candidates(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn package_name_from_app_dir(app_dir: &Path) -> Option<String> {
     let path = app_dir.to_string_lossy().replace('\\', "/");
     let mut parts = path.split('/').filter(|part| !part.is_empty());
