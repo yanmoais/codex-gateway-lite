@@ -1,5 +1,6 @@
 ﻿$ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch {}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Resolve-Path $ScriptDir
@@ -67,7 +68,55 @@ function Get-RustHostTriple {
 function Download-File([string]$Url, [string]$Destination, [string]$Label) {
   Write-Info "下载 $Label"
   Write-Info $Url
-  Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $Destination
+  $dir = Split-Path -Parent $Destination
+  if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  $partial = "$Destination.download"
+  Remove-Item -Force -ErrorAction SilentlyContinue $Destination, $partial
+  try {
+    Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $partial -TimeoutSec 180
+    if (-not (Test-Path $partial)) { throw "download produced no file" }
+    Move-Item -Force $partial $Destination
+  } catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $Destination, $partial
+    throw
+  }
+}
+
+function Test-WindowsExe([string]$Path, [int64]$MinBytes) {
+  if (-not (Test-Path $Path)) { return $false }
+  $item = Get-Item $Path -ErrorAction SilentlyContinue
+  if (($null -eq $item) -or ($item.Length -lt $MinBytes)) { return $false }
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $b0 = $fs.ReadByte()
+    $b1 = $fs.ReadByte()
+    return (($b0 -eq 0x4D) -and ($b1 -eq 0x5A))
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $fs) { $fs.Close() }
+  }
+}
+
+function Install-RustupFromBase([string]$Base, [string]$Triple) {
+  $url = "$Base/rustup/dist/$Triple/rustup-init.exe"
+  $tempRoot = Join-Path $env:TEMP "codex-gateway-lite"
+  New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+  $installer = Join-Path $tempRoot "rustup-init-$Triple-$([Guid]::NewGuid().ToString('N')).exe"
+  try {
+    Download-File $url $installer "Rustup ($Triple)"
+    if (-not (Test-WindowsExe $installer 1048576)) {
+      $size = if (Test-Path $installer) { (Get-Item $installer).Length } else { 0 }
+      throw "downloaded rustup-init.exe is not a valid Windows executable; size=$size"
+    }
+    $env:RUSTUP_DIST_SERVER = $Base
+    $env:RUSTUP_UPDATE_ROOT = "$Base/rustup"
+    $proc = Start-Process -FilePath $installer -ArgumentList @("-y", "--default-toolchain", "stable", "--profile", "minimal") -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { throw "rustup-init.exe exited with code $($proc.ExitCode)" }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $installer, "$installer.download"
+  }
 }
 
 function Ensure-Git {
@@ -124,17 +173,34 @@ function Ensure-Rust {
     return
   }
   $triple = Get-RustHostTriple
-  $base = $RustupOfficialBase
-  if (Use-ChinaMirror) {
-    $base = $RustupUstcBase
-    Write-Warn "官方 Rust 源连通性较差或已强制启用国内镜像，使用 USTC Rustup 镜像。"
+  $useMirror = Use-ChinaMirror
+  if ($useMirror) {
+    Write-Warn "官方 Rust 源连通性较差或已强制启用国内镜像，优先使用 USTC Rustup 镜像。"
+    $bases = @($RustupUstcBase, $RustupOfficialBase)
+  } else {
+    $bases = @($RustupOfficialBase, $RustupUstcBase)
   }
-  $url = "$base/rustup/dist/$triple/rustup-init.exe"
-  $installer = Join-Path $env:TEMP "rustup-init-$triple.exe"
-  Download-File $url $installer "Rustup ($triple)"
-  $env:RUSTUP_DIST_SERVER = $base
-  $env:RUSTUP_UPDATE_ROOT = "$base/rustup"
-  & $installer -y --default-toolchain stable --profile minimal
+
+  $installed = $false
+  $lastError = $null
+  $seen = @{}
+  foreach ($base in $bases) {
+    if ($seen.ContainsKey($base)) { continue }
+    $seen[$base] = $true
+    try {
+      Install-RustupFromBase $base $triple
+      $installed = $true
+      break
+    } catch {
+      $lastError = $_.Exception.Message
+      Write-Warn "Rustup 安装源失败：$base"
+      Write-Warn $lastError
+    }
+  }
+  if (-not $installed) {
+    Fail "Rust 自动安装失败。请删除 %TEMP%\codex-gateway-lite 后重试，或手动安装 Rust：https://rustup.rs/。最后错误：$lastError"
+  }
+
   $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
   $env:Path = "$cargoBin;$env:Path"
   $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
