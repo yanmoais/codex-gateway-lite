@@ -1,0 +1,16 @@
+{
+  "provider": {
+    "id": "gateway",
+    "name": "Gateway",
+    "baseUrl": "https://api.example.com/v1",
+    "apiKeyEnv": "CODEX_GATEWAY_API_KEY",
+    "mode": "mixed_api",
+    "protocol": "responses",
+    "contextBudget": ""
+  },
+  "model": "",
+  "models": [],
+  "contextWindow": "1M",
+  "autoCompactTokenLimit": "",
+  "commonConfig": ""
+}

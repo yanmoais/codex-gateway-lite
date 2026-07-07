@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Local private handoff / runtime config
+.codex-local-handoff.md
+.codex-gateway-lite/
+config.json
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE/editor noise
+.vscode/
+.idea/

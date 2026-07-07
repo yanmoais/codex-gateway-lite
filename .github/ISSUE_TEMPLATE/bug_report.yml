@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible Codex Gateway Lite bug
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please remove API keys, auth files, private base URLs, personal paths, and conversation content before posting logs.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: macOS / Windows version
+      placeholder: Windows 11 24H2 / macOS 15.x
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Codex Gateway Lite version or commit
+      placeholder: 0.1.0 / commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: What did you run and what happened?
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove secrets before posting.
+      render: text

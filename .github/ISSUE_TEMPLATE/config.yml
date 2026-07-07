@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security policy
+    url: https://github.com/yanmoais/codex-gateway-lite/security/policy
+    about: Please report vulnerabilities privately. Do not post secrets in public issues.

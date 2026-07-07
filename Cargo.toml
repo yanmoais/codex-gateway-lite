@@ -1,0 +1,29 @@
+[package]
+name = "codex-gateway-lite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Lightweight Codex Desktop gateway bootstrapper with model catalog, CDP injection, and protocol proxy support."
+readme = "README.md"
+repository = "https://github.com/yanmoais/codex-gateway-lite"
+keywords = ["codex", "gateway", "cli", "rust"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "system-proxy"], default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml_edit = "0.22"
+
+[dev-dependencies]
+boa_engine = "0.21.1"
