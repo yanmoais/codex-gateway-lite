@@ -7305,20 +7305,9 @@ const PLAN_UI_SCRIPT: &str = r#"
     return { rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
   }
 
-  function defaultRightRailDockInfo() {
-    const width = Math.max(220, Math.min(360, Math.round(window.innerWidth * 0.18)));
-    return {
-      rect: {
-        right: window.innerWidth - 12,
-        width,
-        bottom: 90,
-      },
-      contentBottom: 90,
-    };
-  }
-
   function placeDock(dock) {
-    const anchor = environmentPanelInfo() || rightRailFallbackPanelInfo() || defaultRightRailDockInfo();
+    const anchor = environmentPanelInfo() || rightRailFallbackPanelInfo();
+    if (!anchor) return false;
     const rect = anchor.rect;
     const right = Math.max(12, Math.round(window.innerWidth - rect.right + 12));
     const width = Math.max(220, Math.min(360, Math.round(rect.width - 12)));
@@ -7414,6 +7403,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     }
     if (!placeDock(dock)) {
       dock.hidden = true;
+      dock.dataset.cglPlanHiddenBy = "no-native-anchor";
       state.lastRenderSignature = "";
       dock.dataset.cglPlanSignature = "";
       dock.dataset.cglPlanSourceTurnId = "";
@@ -8385,6 +8375,22 @@ CREATE TABLE threads (
         let result = eval_json(
             &mut ctx,
             r#"(() => {
+                const envPanel = {
+                    nodeType: 1,
+                    id: "",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 240, left: 1600, right: 1928, top: 90, bottom: 330 };
+                    },
+                    textContent: "环境信息 变更 +11 -18 本地 main 提交或推送"
+                };
+                document.querySelectorAll = function (selector) {
+                    return String(selector).includes("aside") ? [envPanel] : [];
+                };
+                document.elementFromPoint = function () { return envPanel; };
                 const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
                 const hooks = window.__codexGatewayLitePlanUiTestHooks;
                 const snapshot = {
@@ -8449,9 +8455,24 @@ CREATE TABLE threads (
                     },
                     textContent: "README.md Codex Gateway Lite 依赖与一键引导"
                 };
-                document.querySelectorAll = function (selector) {
-                    return String(selector).includes("webview") ? [panel] : [];
+                const envPanel = {
+                    nodeType: 1,
+                    id: "",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 240, left: 1600, right: 1928, top: 90, bottom: 330 };
+                    },
+                    textContent: "环境信息 变更 +11 -18 本地 main 提交或推送"
                 };
+                document.querySelectorAll = function (selector) {
+                    if (String(selector).includes("webview")) return [panel];
+                    if (String(selector).includes("aside")) return [envPanel];
+                    return [];
+                };
+                document.elementFromPoint = function () { return envPanel; };
                 const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
                 const hooks = window.__codexGatewayLitePlanUiTestHooks;
                 const snapshot = {
@@ -8474,6 +8495,67 @@ CREATE TABLE threads (
         assert_eq!(result["hidden"], serde_json::json!(false));
         assert_eq!(result["hiddenBy"], serde_json::json!(""));
         assert_ne!(result["signature"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn plan_ui_hides_dock_when_native_environment_panel_disappears() {
+        // 原生“环境信息”卡片被弹窗/侧边菜单顶掉后（比如切到 移交至工作树 弹窗，
+        // 或者点开 审查/终端/浏览器 侧栏切换菜单），dock 不能落到一个瞎猜的默认位置，
+        // 必须跟随原生卡片一起隐藏；卡片恢复后 dock 也要能重新贴回去。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                const envPanel = {
+                    nodeType: 1,
+                    id: "",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 240, left: 1600, right: 1928, top: 90, bottom: 330 };
+                    },
+                    textContent: "环境信息 变更 +11 -18 本地 main 提交或推送"
+                };
+                let hasEnvPanel = true;
+                document.querySelectorAll = function (selector) {
+                    return hasEnvPanel && String(selector).includes("aside") ? [envPanel] : [];
+                };
+                document.elementFromPoint = function () { return envPanel; };
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                const snapshot = {
+                    threadId: "visible:unknown",
+                    progress: "第 1 / 1 步",
+                    rows: [{ text: "验证面板跟随环境信息卡片", status: "running", iconHtml: "" }],
+                    at: Date.now()
+                };
+                hooks.renderDock(snapshot);
+                const hiddenWithPanel = dock.hidden;
+                hasEnvPanel = false;
+                hooks.renderDock(snapshot);
+                const hiddenWithoutPanel = dock.hidden;
+                const hiddenByWithoutPanel = dock.dataset.cglPlanHiddenBy || "";
+                hasEnvPanel = true;
+                hooks.renderDock(snapshot);
+                const hiddenAfterRestore = dock.hidden;
+                return JSON.stringify({
+                    hiddenWithPanel,
+                    hiddenWithoutPanel,
+                    hiddenByWithoutPanel,
+                    hiddenAfterRestore
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["hiddenWithPanel"], serde_json::json!(false));
+        assert_eq!(result["hiddenWithoutPanel"], serde_json::json!(true));
+        assert_eq!(
+            result["hiddenByWithoutPanel"],
+            serde_json::json!("no-native-anchor")
+        );
+        assert_eq!(result["hiddenAfterRestore"], serde_json::json!(false));
     }
 
     #[test]
@@ -9160,10 +9242,12 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("function rightRailFallbackPanelInfo()"));
         assert!(PLAN_UI_SCRIPT.contains("hasOutputSourcePair"));
         assert!(PLAN_UI_SCRIPT.contains("candidate.hasOutputSourcePair ? rect.bottom : rect.top"));
-        assert!(PLAN_UI_SCRIPT.contains("function defaultRightRailDockInfo()"));
-        assert!(PLAN_UI_SCRIPT.contains(
-            "environmentPanelInfo() || rightRailFallbackPanelInfo() || defaultRightRailDockInfo()"
-        ));
+        assert!(!PLAN_UI_SCRIPT.contains("function defaultRightRailDockInfo()"));
+        assert!(
+            PLAN_UI_SCRIPT
+                .contains("const anchor = environmentPanelInfo() || rightRailFallbackPanelInfo();")
+        );
+        assert!(PLAN_UI_SCRIPT.contains("if (!anchor) return false;"));
         assert!(PLAN_UI_SCRIPT.contains("Math.max(72, window.innerHeight - 96)"));
         assert!(PLAN_UI_SCRIPT.contains("Math.round(rect.width - 12)"));
         assert!(!PLAN_UI_SCRIPT.contains("Math.round(rect.width - 24)"));
