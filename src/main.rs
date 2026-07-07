@@ -1585,7 +1585,8 @@ fn local_thread_catalog_db_paths(home: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_file()
                 && is_sqlite_candidate(&path)
-                && (sqlite_has_table(&path, "local_thread_catalog")
+                && (has_session_table(&path)
+                    || sqlite_has_table(&path, "local_thread_catalog")
                     || sqlite_has_table(&path, "local_thread_catalog_sync_state"))
             {
                 paths.push(path);
@@ -8759,7 +8760,7 @@ CREATE TABLE threads (
 
         let report = sync_local_thread_catalog(&home).expect("sync succeeds");
         assert_eq!(report.threads_seen, 2);
-        assert_eq!(report.catalog_targets, 2);
+        assert_eq!(report.catalog_targets, 3);
         assert_eq!(report.catalog_inserted, 2);
 
         let catalog_db =
@@ -8815,7 +8816,7 @@ CREATE TABLE threads (
             )
             .expect("reads repaired sync state");
         assert_eq!(repaired_complete, 1);
-        for db_name in ["codex.db", "codex-dev.db"] {
+        for db_name in ["codex.db", "codex-dev.db", "state_5.sqlite"] {
             let catalog_db = Connection::open(home.join("sqlite").join(db_name))
                 .expect("opens mirrored catalog db");
             let rows = catalog_db
@@ -8872,9 +8873,14 @@ CREATE TABLE threads (
 
         let report = sync_local_thread_catalog(&home).expect("sync succeeds");
         assert_eq!(report.threads_seen, 2);
-        assert_eq!(report.catalog_targets, 3);
+        assert_eq!(report.catalog_targets, 4);
 
-        for db_name in ["codex.db", "codex-dev.db", "custom-app.sqlite3"] {
+        for db_name in [
+            "codex.db",
+            "codex-dev.db",
+            "custom.sqlite3",
+            "custom-app.sqlite3",
+        ] {
             let catalog_db =
                 Connection::open(sqlite_dir.join(db_name)).expect("opens catalog target db");
             let rows = catalog_db
