@@ -4577,11 +4577,36 @@ async fn handle_streaming_responses_proxy(
         }
     };
 
+    let can_passthrough_responses_stream = upstream.is_stream
+        && upstream.is_success()
+        && upstream.wire_api == protocol_proxy::UpstreamWireApi::Responses;
     let can_stream = upstream.is_stream
         && upstream.is_success()
         && upstream.wire_api == protocol_proxy::UpstreamWireApi::ChatCompletions;
 
-    if can_stream {
+    if can_passthrough_responses_stream {
+        let content_type = if upstream.content_type.trim().is_empty() {
+            "text/event-stream; charset=utf-8".to_string()
+        } else {
+            upstream.content_type.clone()
+        };
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n"
+        );
+        stream.write_all(header.as_bytes()).await?;
+        let mut response = upstream.response;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => write_http_chunk(&mut stream, &chunk).await?,
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("Responses 上游流中断: {error}");
+                    break;
+                }
+            }
+        }
+        stream.write_all(b"0\r\n\r\n").await?;
+    } else if can_stream {
         let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n";
         stream.write_all(header.as_bytes()).await?;
 
@@ -10682,6 +10707,16 @@ model_catalog_json = "model-catalogs/gateway.json"
 
         let other = anyhow::anyhow!("读取本地协议代理请求失败");
         assert!(!protocol_proxy_request_closed_before_headers(&other));
+    }
+
+    #[test]
+    fn responses_proxy_passthroughs_responses_sse_without_chat_fallback() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("can_passthrough_responses_stream"));
+        assert!(source.contains("upstream.wire_api == protocol_proxy::UpstreamWireApi::Responses"));
+        let proxy_source = include_str!("protocol_proxy.rs");
+        assert!(!proxy_source.contains("should_retry_responses_as_chat"));
+        assert!(!proxy_source.contains("回退到 Chat Completions"));
     }
 
     #[test]

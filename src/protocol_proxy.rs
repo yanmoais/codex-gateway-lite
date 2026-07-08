@@ -589,6 +589,7 @@ pub async fn open_responses_proxy_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
+
     Ok(UpstreamProxyResponse {
         status_code,
         is_stream: is_stream || content_type.contains("text/event-stream"),
@@ -803,6 +804,12 @@ pub async fn handle_responses_upstream(
     if !(200..300).contains(&status_code) {
         let error =
             responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body);
+        let message = error
+            .get("error")
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown error");
+        eprintln!("上游返回 HTTP {status_code}: {message}");
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
