@@ -4558,7 +4558,21 @@ async fn handle_streaming_responses_proxy(
         .map(|(_, value)| value.as_str());
 
     let request_json: Value =
-        serde_json::from_str(&request.body).context("解析 Responses 请求 JSON 失败")?;
+        match serde_json::from_str(&request.body).context("解析 Responses 请求 JSON 失败") {
+            Ok(value) => value,
+            Err(error) => {
+                let response = protocol_proxy_error_response(&error);
+                stream
+                    .write_all(&lite_http_response_bytes(
+                        &response.status,
+                        &response.content_type,
+                        &response.body,
+                    ))
+                    .await?;
+                stream.shutdown().await.ok();
+                return Ok(());
+            }
+        };
 
     let upstream = match protocol_proxy::open_responses_proxy_request(
         &request.body,
@@ -10827,6 +10841,13 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Add-CargoBinToPath"));
         assert!(windows_script.contains("Add-CargoBinToPath\n  if ((Test-Command cargo)"));
         assert!(windows_script.contains("function Ensure-CargoBinUserPath"));
+        assert!(windows_script.contains("function Publish-UserEnvironmentChange"));
+        assert!(windows_script.contains("SetEnvironmentVariable(\"NO_PROXY\", $merged, \"User\")"));
+        assert!(windows_script.contains("SetEnvironmentVariable(\"no_proxy\", $merged, \"User\")"));
+        assert!(
+            windows_script
+                .contains("本地代理绕过已设置：localhost / 127.0.0.1 / ::1（当前进程 + 用户环境）")
+        );
         assert!(windows_script.contains("function Test-CargoDepsFresh"));
         assert!(windows_script.contains("target\\.codex-gateway-lite\\cargo-fetch.stamp"));
         assert!(windows_script.contains("Rust 依赖已就绪（跳过 cargo fetch）"));

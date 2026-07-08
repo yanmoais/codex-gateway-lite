@@ -73,13 +73,66 @@ function Merge-BypassList([string]$Existing, [string[]]$Required) {
   return ($items -join ',')
 }
 
+function Publish-UserEnvironmentChange {
+  try {
+    if (-not ("CodexGatewayLiteNativeMethods" -as [type])) {
+      Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class CodexGatewayLiteNativeMethods {
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+  public static extern IntPtr SendMessageTimeout(
+    IntPtr hWnd,
+    uint Msg,
+    UIntPtr wParam,
+    string lParam,
+    uint fuFlags,
+    uint uTimeout,
+    out UIntPtr lpdwResult);
+}
+"@
+    }
+    $result = [UIntPtr]::Zero
+    [CodexGatewayLiteNativeMethods]::SendMessageTimeout(
+      [IntPtr]0xffff,
+      0x001A,
+      [UIntPtr]::Zero,
+      "Environment",
+      0x0002,
+      5000,
+      [ref]$result
+    ) | Out-Null
+  } catch {
+    Write-Warn "用户环境变量已写入，但广播环境变更失败；如 Codex App 仍旧走代理，请重新登录 Windows 后再试。"
+  }
+}
+
 function Ensure-LocalProxyBypass {
   $required = @('localhost', '127.0.0.1', '::1')
-  $existing = if ($env:NO_PROXY) { $env:NO_PROXY } elseif ($env:no_proxy) { $env:no_proxy } else { '' }
+  $existingValues = @(
+    $env:NO_PROXY,
+    $env:no_proxy,
+    [Environment]::GetEnvironmentVariable("NO_PROXY", "User"),
+    [Environment]::GetEnvironmentVariable("no_proxy", "User")
+  ) | Where-Object { $_ -and $_.Trim().Length -gt 0 }
+  $existing = ($existingValues -join ',')
   $merged = Merge-BypassList $existing $required
   $env:NO_PROXY = $merged
   $env:no_proxy = $merged
-  Write-Info "本地代理绕过已设置：localhost / 127.0.0.1 / ::1"
+  $changed = $false
+  if ([Environment]::GetEnvironmentVariable("NO_PROXY", "User") -ne $merged) {
+    [Environment]::SetEnvironmentVariable("NO_PROXY", $merged, "User")
+    $changed = $true
+  }
+  if ([Environment]::GetEnvironmentVariable("no_proxy", "User") -ne $merged) {
+    [Environment]::SetEnvironmentVariable("no_proxy", $merged, "User")
+    $changed = $true
+  }
+  if ($changed) {
+    Publish-UserEnvironmentChange
+  }
+  Write-Info "本地代理绕过已设置：localhost / 127.0.0.1 / ::1（当前进程 + 用户环境）"
 }
 
 function Test-Url([string]$Url) {
