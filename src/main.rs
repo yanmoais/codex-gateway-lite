@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use codex_lite::RelayProfile;
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -23,6 +23,7 @@ mod protocol_proxy;
 
 const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
 const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
+const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -691,7 +692,7 @@ fn apply_config(
         .join("model-catalogs")
         .join(format!("{}.json", sanitize_catalog_filename(&profile.id)));
     let session_file_count = count_session_files(&home).ok();
-    let thread_catalog_sync = match sync_local_thread_catalog(&home) {
+    let thread_catalog_sync = match sync_local_thread_catalog_for_provider(&home, Some(&profile.id)) {
         Ok(report) => Some(report),
         Err(error) => {
             eprintln!("同步 Codex 历史会话索引失败，继续启动：{error:#}");
@@ -1511,7 +1512,15 @@ struct ThreadCatalogEntry {
     archived: bool,
 }
 
+#[cfg(test)]
 fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncReport> {
+    sync_local_thread_catalog_for_provider(home, None)
+}
+
+fn sync_local_thread_catalog_for_provider(
+    home: &Path,
+    active_model_provider: Option<&str>,
+) -> anyhow::Result<ThreadCatalogSyncReport> {
     let state_entries = collect_thread_entries_from_state_dbs(home)?;
     let index_entries = read_session_index_entries(home)?;
     let mut report = ThreadCatalogSyncReport {
@@ -1563,6 +1572,12 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
     if selected.is_empty() {
         return Ok(report);
     }
+    let active_model_provider = active_model_provider
+        .and_then(non_empty_string)
+        .or_else(|| codex_home_model_provider(home));
+    if let Some(provider) = active_model_provider.as_deref() {
+        normalize_rollout_session_meta_providers(home, &selected, provider)?;
+    }
 
     for db_path in local_thread_catalog_db_paths(home) {
         if let Some(parent) = db_path.parent() {
@@ -1578,7 +1593,9 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
         report.catalog_inserted = report.catalog_inserted.max(inserted);
         report.catalog_updated = report.catalog_updated.max(updated);
     }
-    if let Some((inserted, updated)) = sync_native_threads_table(home, &selected)? {
+    if let Some((inserted, updated)) =
+        sync_native_threads_table(home, &selected, active_model_provider.as_deref())?
+    {
         report.catalog_targets += 1;
         report.catalog_inserted = report.catalog_inserted.max(inserted);
         report.catalog_updated = report.catalog_updated.max(updated);
@@ -2017,6 +2034,7 @@ ON CONFLICT(host_id, thread_id) DO UPDATE SET
 fn sync_native_threads_table(
     home: &Path,
     entries: &[ThreadCatalogEntry],
+    active_model_provider: Option<&str>,
 ) -> anyhow::Result<Option<(usize, usize)>> {
     let db_path = home.join("state_5.sqlite");
     if !db_path.exists() || !sqlite_has_table(&db_path, "threads") {
@@ -2071,7 +2089,7 @@ fn sync_native_threads_table(
             &mut names,
             &mut values,
             "created_at",
-            text_sql_value(&timestamp_to_rfc3339(source_created_at)),
+            integer_sql_value(timestamp_to_seconds(source_created_at)),
         );
         push_native_thread_value(
             &columns,
@@ -2085,7 +2103,7 @@ fn sync_native_threads_table(
             &mut names,
             &mut values,
             "updated_at",
-            text_sql_value(&timestamp_to_rfc3339(source_updated_at)),
+            integer_sql_value(timestamp_to_seconds(source_updated_at)),
         );
         push_native_thread_value(
             &columns,
@@ -2099,7 +2117,7 @@ fn sync_native_threads_table(
             &mut names,
             &mut values,
             "recency_at",
-            text_sql_value(&timestamp_to_rfc3339(source_updated_at)),
+            integer_sql_value(timestamp_to_seconds(source_updated_at)),
         );
         push_native_thread_value(
             &columns,
@@ -2179,7 +2197,10 @@ fn sync_native_threads_table(
             &mut names,
             &mut values,
             "model_provider",
-            text_sql_value(&native_model_provider(&entry.model_provider)),
+            text_sql_value(&native_model_provider(
+                entry.model_provider.as_str(),
+                active_model_provider,
+            )),
         );
         push_native_thread_value(
             &columns,
@@ -2273,6 +2294,16 @@ fn timestamp_to_millis(value: f64) -> i64 {
     }
 }
 
+fn timestamp_to_seconds(value: f64) -> i64 {
+    if value <= 0.0 {
+        0
+    } else if value > 10_000_000_000.0 {
+        (value / 1000.0).floor() as i64
+    } else {
+        value.floor() as i64
+    }
+}
+
 fn positive_timestamp(value: f64) -> Option<f64> {
     value
         .is_finite()
@@ -2287,14 +2318,115 @@ fn current_unix_timestamp_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn timestamp_to_rfc3339(value: f64) -> String {
-    let millis = timestamp_to_millis(value);
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .to_rfc3339()
+fn normalize_rollout_session_meta_providers(
+    home: &Path,
+    entries: &[ThreadCatalogEntry],
+    active_model_provider: &str,
+) -> anyhow::Result<usize> {
+    let Some(active_model_provider) = non_empty_string(active_model_provider) else {
+        return Ok(0);
+    };
+    let mut changed = 0;
+    let mut seen = HashSet::new();
+    for entry in entries.iter().filter(|entry| !entry.archived) {
+        let Some(raw_path) = entry.rollout_path.as_deref().and_then(non_empty_string) else {
+            continue;
+        };
+        if !seen.insert(raw_path.clone()) {
+            continue;
+        }
+        let path = PathBuf::from(strip_windows_extended_prefix(&raw_path));
+        if !rollout_path_belongs_to_home_sessions(home, &path) {
+            continue;
+        }
+        if normalize_rollout_session_meta_provider(&path, &active_model_provider)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
-fn native_model_provider(value: &str) -> String {
+fn normalize_rollout_session_meta_provider(path: &Path, active_model_provider: &str) -> anyhow::Result<bool> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex rollout 失败：{}", path.display()));
+        }
+    };
+    let (first_line, rest) = match text.split_once('\n') {
+        Some((first, rest)) => (first.trim_end_matches('\r'), Some(rest)),
+        None => (text.trim_end_matches('\r'), None),
+    };
+    if first_line.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut value: Value = match serde_json::from_str(first_line) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(false);
+    }
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+    if payload
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == active_model_provider)
+    {
+        return Ok(false);
+    }
+    payload.insert(
+        "model_provider".to_string(),
+        Value::String(active_model_provider.to_string()),
+    );
+    let mut rewritten = serde_json::to_string(&value)?;
+    rewritten.push('\n');
+    if let Some(rest) = rest {
+        rewritten.push_str(rest);
+    }
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("jsonl")
+    ));
+    fs::write(&temp_path, rewritten)
+        .with_context(|| format!("写入临时 rollout 失败：{}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .with_context(|| format!("替换 Codex rollout 失败：{}", path.display()))?;
+    Ok(true)
+}
+
+fn rollout_path_belongs_to_home_sessions(home: &Path, path: &Path) -> bool {
+    let Ok(home) = home.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    path.starts_with(home.join("sessions"))
+}
+
+fn strip_windows_extended_prefix(value: &str) -> String {
+    value
+        .strip_prefix(r"\\?\")
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn codex_home_model_provider(home: &Path) -> Option<String> {
+    let config_text = fs::read_to_string(home.join("config.toml")).ok()?;
+    root_config_string_value(&config_text, "model_provider").and_then(|value| non_empty_string(&value))
+}
+
+fn native_model_provider(value: &str, active_model_provider: Option<&str>) -> String {
+    if let Some(active) = active_model_provider.and_then(non_empty_string) {
+        return active;
+    }
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("custom") {
         "openai".to_string()
@@ -2415,7 +2547,7 @@ async fn soft_reload_codex(debug_port: u16) -> anyhow::Result<()> {
 async fn wait_and_inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
     let mut last_error = None;
     for _ in 0..40 {
-        match inject_plan_ui(debug_port, codex_home).await {
+        match inject_plan_ui_inner(debug_port, true, false, codex_home).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -2424,14 +2556,6 @@ async fn wait_and_inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> 
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("任务清单 UI 注入失败")))
-}
-
-async fn inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
-    inject_plan_ui_inner(debug_port, true, true, codex_home).await
-}
-
-async fn inject_plan_ui_quiet(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
-    inject_plan_ui_inner(debug_port, false, false, codex_home).await
 }
 
 async fn inject_plan_ui_inner(
@@ -2479,6 +2603,65 @@ async fn inject_plan_ui_inner(
     if verbose {
         println!("已注入任务清单 UI 定位修正");
     }
+    Ok(())
+}
+
+async fn seed_active_plan_ui_history_snapshot_if_needed(
+    debug_port: u16,
+    codex_home: Option<&Path>,
+    recent_attempts: &mut HashMap<String, Instant>,
+) -> anyhow::Result<()> {
+    let targets = codex_lite::list_targets(debug_port)
+        .await
+        .with_context(|| {
+            format!(
+                "无法连接 Codex CDP 端口 {debug_port}；Codex 需要带 --remote-debugging-port 启动"
+            )
+        })?;
+    let target = pick_lite_main_codex_page_target(&targets)?;
+    let websocket = target
+        .web_socket_debugger_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Codex CDP target 没有 websocket URL"))?;
+    let result = codex_lite::evaluate_script(websocket, PLAN_UI_ACTIVE_THREAD_NEEDS_SEED_SCRIPT)
+        .await
+        .context("检查当前任务清单历史快照状态失败")?;
+    let Some(value) = cdp_value(&result) else {
+        return Ok(());
+    };
+    if !value
+        .get("needsSeed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let Some(thread_id) = value
+        .get("threadId")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+    else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if recent_attempts
+        .get(&thread_id)
+        .is_some_and(|previous| previous.elapsed() < Duration::from_secs(PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS))
+    {
+        return Ok(());
+    }
+    recent_attempts.insert(thread_id.clone(), now);
+    let home = resolve_codex_home(codex_home);
+    let Some(snapshot) = collect_plan_ui_history_snapshot_for_thread(&home, &thread_id)? else {
+        return Ok(());
+    };
+    let Some(script) = plan_ui_history_seed_script_for_snapshots(&[snapshot])? else {
+        return Ok(());
+    };
+    codex_lite::evaluate_script(websocket, &script)
+        .await
+        .context("按需注入当前任务清单历史快照失败")?;
+    recent_attempts.remove(&thread_id);
     Ok(())
 }
 
@@ -2546,6 +2729,12 @@ struct PlanUiSnapshotSeedRow {
 
 fn plan_ui_history_seed_script(home: &Path) -> anyhow::Result<Option<String>> {
     let snapshots = collect_plan_ui_history_snapshots(home, PLAN_UI_HISTORY_SEED_LIMIT)?;
+    plan_ui_history_seed_script_for_snapshots(&snapshots)
+}
+
+fn plan_ui_history_seed_script_for_snapshots(
+    snapshots: &[PlanUiSnapshotSeed],
+) -> anyhow::Result<Option<String>> {
     if snapshots.is_empty() {
         return Ok(None);
     }
@@ -2629,6 +2818,100 @@ fn collect_plan_ui_history_snapshots(
         }
     }
     Ok(snapshots)
+}
+
+fn collect_plan_ui_history_snapshot_for_thread(
+    home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Option<PlanUiSnapshotSeed>> {
+    let normalized = normalize_seed_thread_id(thread_id);
+    let raw = raw_seed_conversation_id(thread_id);
+    let mut candidates = Vec::new();
+    candidates.push(normalized.clone());
+    if raw != normalized {
+        candidates.push(raw.clone());
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut best: Option<ThreadRolloutEntry> = None;
+    for db_path in thread_state_db_paths(home) {
+        if !db_path.exists() || !sqlite_has_table(&db_path, "threads") {
+            continue;
+        }
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("读取 Codex thread 数据库失败：{}", db_path.display()))?;
+        let columns = sqlite_table_columns(&conn, "threads")?;
+        if !columns.contains("id") {
+            continue;
+        }
+        let selected = [
+            "id",
+            "rollout_path",
+            "updated_at",
+            "updated_at_ms",
+            "archived",
+        ]
+        .into_iter()
+        .map(|name| {
+            if columns.contains(name) {
+                format!("{name} AS {name}")
+            } else {
+                format!("NULL AS {name}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+        for candidate_id in &candidates {
+            let mut statement =
+                conn.prepare(&format!("SELECT {selected} FROM threads WHERE id = ?1 LIMIT 1"))?;
+            let row = statement
+                .query_row([candidate_id], |row| {
+                    let found_id = row_string(row, 0).unwrap_or_else(|| candidate_id.clone());
+                    let rollout_path = row_string(row, 1).unwrap_or_default();
+                    let updated_at_ms = row_timestamp(row, 2)
+                        .or_else(|| row_timestamp_millis(row, 3))
+                        .map(|value| (value * 1000.0).round() as i64)
+                        .unwrap_or(0);
+                    let archived = row_bool(row, 4).unwrap_or(false);
+                    Ok((found_id, rollout_path, updated_at_ms, archived))
+                })
+                .optional()?;
+            let Some((found_id, rollout_path, updated_at_ms, archived)) = row else {
+                continue;
+            };
+            if archived || rollout_path.trim().is_empty() {
+                continue;
+            }
+            let path = resolve_rollout_path(home, &rollout_path);
+            if !path.exists() {
+                continue;
+            }
+            let updated_at_ms = if updated_at_ms > 0 {
+                updated_at_ms
+            } else {
+                file_modified(&path)
+                    .ok()
+                    .and_then(system_time_to_unix_ms)
+                    .unwrap_or(0)
+            };
+            let entry = ThreadRolloutEntry {
+                thread_id: found_id,
+                rollout_path: path,
+                updated_at_ms,
+            };
+            if best
+                .as_ref()
+                .map_or(true, |previous| entry.updated_at_ms >= previous.updated_at_ms)
+            {
+                best = Some(entry);
+            }
+        }
+    }
+    let Some(entry) = best else {
+        return Ok(None);
+    };
+    latest_plan_snapshot_from_rollout(&entry.thread_id, &entry.rollout_path, entry.updated_at_ms)
 }
 
 fn collect_recent_thread_rollout_entries(
@@ -4572,6 +4855,7 @@ async fn run_agent(
     let mut last_launch_attempt = now;
     let mut last_bridge_injection = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
     let mut last_plan_injection = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
+    let mut active_plan_seed_attempts: HashMap<String, Instant> = HashMap::new();
     let mut cdp_was_ready = false;
     let mut cdp_has_connected = false;
     let mut auto_launch_paused_after_close = false;
@@ -4600,6 +4884,7 @@ async fn run_agent(
                         .unwrap_or_else(Instant::now);
                     last_bridge_injection = rewind;
                     last_plan_injection = rewind;
+                    active_plan_seed_attempts.clear();
                 }
                 cdp_was_ready = true;
                 cdp_has_connected = true;
@@ -4704,9 +4989,26 @@ async fn run_agent(
                     >= Duration::from_secs(PLAN_UI_REINJECT_INTERVAL_SECS))
         {
             last_plan_injection = Instant::now();
-            if let Err(error) = inject_plan_ui_quiet(debug_port, codex_home.as_deref()).await {
+            if config_changed {
+                active_plan_seed_attempts.clear();
+            }
+            if let Err(error) =
+                inject_plan_ui_inner(debug_port, false, false, codex_home.as_deref()).await
+            {
                 eprintln!("任务清单 UI 重注入失败：{error:#}");
                 cdp_was_ready = false;
+            }
+        }
+
+        if plan_ui && cdp_was_ready {
+            if let Err(error) = seed_active_plan_ui_history_snapshot_if_needed(
+                debug_port,
+                codex_home.as_deref(),
+                &mut active_plan_seed_attempts,
+            )
+            .await
+            {
+                eprintln!("任务清单历史快照按需补灌失败：{error:#}");
             }
         }
 
@@ -4776,7 +5078,9 @@ async fn watch(
                     {
                         eprintln!("Lite 模型白名单注入失败：{error:#}");
                     }
-                    if let Err(error) = inject_plan_ui(debug_port, codex_home.as_deref()).await {
+                    if let Err(error) =
+                        inject_plan_ui_inner(debug_port, true, false, codex_home.as_deref()).await
+                    {
                         eprintln!("任务清单 UI 注入失败：{error:#}");
                     }
                 }
@@ -6299,6 +6603,25 @@ const PLAN_TOOLTIP_SAMPLE_CLEANUP_SCRIPT: &str = r#"
 })()
 "#;
 
+const PLAN_UI_ACTIVE_THREAD_NEEDS_SEED_SCRIPT: &str = r#"
+(() => {
+  const request = window.__codexGatewayLitePlanUiActiveSeedRequest;
+  if (typeof request !== "function") {
+    return { threadId: "", needsSeed: false, reason: "not-injected" };
+  }
+  try {
+    return request() || { threadId: "", needsSeed: false, reason: "empty" };
+  } catch (error) {
+    return {
+      threadId: "",
+      needsSeed: false,
+      reason: "error",
+      error: String(error && error.message || error),
+    };
+  }
+})()
+"#;
+
 const PLAN_UI_SCRIPT: &str = r#"
 (() => {
   const STYLE_ID = "codex-gateway-lite-plan-ui-style";
@@ -6310,11 +6633,12 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 40;
+  const SCRIPT_VERSION = 43;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
   const RIGHT_PANEL_DISMISS_GRACE_MS = 1_500;
+  const RIGHT_RAIL_FOLLOW_FRAME_MS = 420;
 
   const previousState = window.__codexGatewayLitePlanUiState;
   const previousSnapshots = previousState?.snapshotsByThread && typeof previousState.snapshotsByThread === "object"
@@ -6335,6 +6659,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     rightPanelDismissedThreadId: previousState?.rightPanelDismissedThreadId || "",
     rightPanelDismissedAt: Number(previousState?.rightPanelDismissedAt || 0),
     rightPanelDismissedPanelSignature: previousState?.rightPanelDismissedPanelSignature || "",
+    rightRailFollowUntil: 0,
   };
   window.__codexGatewayLitePlanUiState = state;
   if (previousState?.version === SCRIPT_VERSION
@@ -6727,6 +7052,9 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function handleRightPanelDismissEvent(event) {
+    if (eventTouchesRightRail(event)) {
+      scheduleApplyBurst();
+    }
     if (environmentPanelInfo()) return;
     if (hideDockForRightPanelTarget(event?.target)) return;
     const pointInfo = rightSideExpandedContentInfoFromPoint(event?.clientX, event?.clientY);
@@ -6746,6 +7074,15 @@ const PLAN_UI_SCRIPT: &str = r#"
     if (titleId) return titleId;
     if (sidebar.id) return sidebar.id;
     return "visible:unknown";
+  }
+
+  function activeSeedThreadId() {
+    const sidebar = currentSidebarThreadInfo();
+    if (/^(local|remote):/.test(sidebar.id || "")) return sidebar.id;
+    const conversationId = currentConversationThreadId();
+    if (/^(local|remote):/.test(conversationId || "")) return conversationId;
+    const current = currentThreadId();
+    return /^(local|remote):/.test(current || "") ? current : "";
   }
 
   function currentConversationThreadId() {
@@ -6928,6 +7265,24 @@ const PLAN_UI_SCRIPT: &str = r#"
       return normalized;
     }
     return finalSnapshot;
+  }
+
+  function directSnapshotForSeed(threadId) {
+    const id = String(threadId || "");
+    if (!id) return null;
+    const snapshots = state.snapshotsByThread && typeof state.snapshotsByThread === "object"
+      ? state.snapshotsByThread
+      : {};
+    const candidates = [];
+    if (snapshots[id]) candidates.push({ snapshot: snapshots[id], source: "memory" });
+    const external = externalSnapshotForThread(id);
+    if (external) candidates.push({ snapshot: external, source: "history-rollout" });
+    const stored = storedSnapshotForThread(id);
+    if (stored) candidates.push({ snapshot: stored, source: "stored" });
+    if (!candidates.length) return null;
+    const best = candidates
+      .sort((a, b) => Number(b.snapshot?.at || 0) - Number(a.snapshot?.at || 0))[0];
+    return sanitizeSnapshotForStorage({ ...best.snapshot, threadId: id, source: best.snapshot.source || best.source });
   }
 
   function snapshotAliasIdsForThread(threadId) {
@@ -7821,6 +8176,21 @@ const PLAN_UI_SCRIPT: &str = r#"
     renderDock(snapshot || snapshotForThread(threadId));
   }
 
+  function activeHistorySeedRequest() {
+    const threadId = activeSeedThreadId();
+    if (!threadId) {
+      return { threadId: "", needsSeed: false, reason: "no-thread" };
+    }
+    const snapshot = directSnapshotForSeed(threadId);
+    const rows = rowsForSnapshot(snapshot);
+    return {
+      threadId,
+      needsSeed: rows.length === 0,
+      reason: rows.length ? "has-direct-snapshot" : "missing-direct-snapshot",
+      rows: rows.length,
+    };
+  }
+
   const APPLY_THROTTLE_MS = 750;
   let applyThrottleTimer = 0;
   let lastApplyAt = 0;
@@ -7830,6 +8200,59 @@ const PLAN_UI_SCRIPT: &str = r#"
       window.__codexGatewayLitePlanUiFrame = 0;
       lastApplyAt = Date.now();
       apply();
+      continueRightRailFollow();
+    });
+  }
+
+  function scheduleApplyImmediate() {
+    if (applyThrottleTimer) {
+      window.clearTimeout(applyThrottleTimer);
+      applyThrottleTimer = 0;
+    }
+    if (window.__codexGatewayLitePlanUiFrame) return;
+    runApplyOnNextFrame();
+  }
+
+  function scheduleApplyBurst() {
+    const until = Date.now() + RIGHT_RAIL_FOLLOW_FRAME_MS;
+    state.rightRailFollowUntil = Math.max(Number(state.rightRailFollowUntil || 0), until);
+    scheduleApplyImmediate();
+  }
+
+  function continueRightRailFollow() {
+    if (Date.now() >= Number(state.rightRailFollowUntil || 0)) return;
+    scheduleApplyImmediate();
+  }
+
+  function eventTouchesRightRail(event) {
+    const target = elementFromEventTarget(event?.target);
+    let node = target;
+    for (let depth = 0; node && node !== document.body && node !== document.documentElement && depth < 10; depth += 1) {
+      if (managedNode(node)) return false;
+      if (visible(node)) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width > 12 && rect.height > 12 && rect.right > window.innerWidth * 0.55) return true;
+      }
+      node = node.parentElement;
+    }
+    return !!rightSideExpandedContentInfoFromPoint(event?.clientX, event?.clientY);
+  }
+
+  function mutationTouchesRightRail(mutations) {
+    return Array.from(mutations || []).some((mutation) => {
+      const target = mutation.target;
+      if (!target || target.nodeType !== 1 || managedNode(target)) return false;
+      const rect = target.getBoundingClientRect?.();
+      const nearRightRail = rect
+        && rect.width > 16
+        && rect.height > 16
+        && rect.right > window.innerWidth * 0.55;
+      if (!nearRightRail) return false;
+      if (mutation.type === "attributes") {
+        return true;
+      }
+      const value = text(target);
+      return /环境信息|Environment|变更|Changes|本地|Local|来源|Source|输出|Output|任务|Task/.test(value);
     });
   }
 
@@ -7850,6 +8273,14 @@ const PLAN_UI_SCRIPT: &str = r#"
     }, APPLY_THROTTLE_MS - elapsed);
   }
 
+  function scheduleApplyForMutations(mutations) {
+    if (mutationTouchesRightRail(mutations)) {
+      scheduleApplyBurst();
+      return;
+    }
+    scheduleApply();
+  }
+
   if (window.__codexGatewayLitePlanUiObserver) {
     try { window.__codexGatewayLitePlanUiObserver.disconnect(); } catch {}
   }
@@ -7862,23 +8293,36 @@ const PLAN_UI_SCRIPT: &str = r#"
   if (window.__codexGatewayLitePlanUiRightPanelDismiss) {
     try { window.removeEventListener("pointerdown", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
     try { window.removeEventListener("click", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("transitionrun", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("transitionstart", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("transitioncancel", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("transitionend", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("animationstart", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
+    try { window.removeEventListener("animationend", window.__codexGatewayLitePlanUiRightPanelDismiss, true); } catch {}
   }
   if (window.__codexGatewayLitePlanUiTimer) {
     try { window.clearInterval(window.__codexGatewayLitePlanUiTimer); } catch {}
   }
   apply();
-  const observer = new MutationObserver(scheduleApply);
+  const observer = new MutationObserver(scheduleApplyForMutations);
   observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class", "data-state", "hidden", "role", "aria-modal"] });
   window.__codexGatewayLitePlanUiObserver = observer;
-  window.__codexGatewayLitePlanUiResize = scheduleApply;
+  window.__codexGatewayLitePlanUiResize = scheduleApplyImmediate;
   window.__codexGatewayLitePlanUiScroll = scheduleApply;
   window.__codexGatewayLitePlanUiRightPanelDismiss = handleRightPanelDismissEvent;
   window.__codexGatewayLitePlanUiTimer = window.setInterval(scheduleApply, 5000);
-  window.addEventListener("resize", scheduleApply, { passive: true });
+  window.addEventListener("resize", scheduleApplyImmediate, { passive: true });
   window.addEventListener("scroll", scheduleApply, { passive: true, capture: true });
   window.addEventListener("pointerdown", handleRightPanelDismissEvent, { passive: true, capture: true });
   window.addEventListener("click", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("transitionrun", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("transitionstart", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("transitioncancel", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("transitionend", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("animationstart", handleRightPanelDismissEvent, { passive: true, capture: true });
+  window.addEventListener("animationend", handleRightPanelDismissEvent, { passive: true, capture: true });
   window.__codexGatewayLitePlanUiApply = apply;
+  window.__codexGatewayLitePlanUiActiveSeedRequest = activeHistorySeedRequest;
   if (typeof globalThis.__CODEX_GATEWAY_LITE_TEST__ !== "undefined") {
     // 仅测试环境暴露的内部纯函数钩子；真实 Codex App 里不会定义
     // globalThis.__CODEX_GATEWAY_LITE_TEST__，这段代码是死代码，不会执行。
@@ -7895,6 +8339,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       rowsForSnapshot,
       turnInfoFromProps,
       currentThreadId,
+      activeSeedThreadId,
       currentConversationThreadId,
       currentVisibleTitleThreadId,
       currentSidebarThreadId,
@@ -7902,6 +8347,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       knownSnapshotForThreadId,
       snapshotAliasIdsForThread,
       snapshotForThread,
+      directSnapshotForSeed,
       externalSnapshotForThread,
       rightSideExpandedContentRect,
       rightSideExpandedContentSignature,
@@ -7911,6 +8357,12 @@ const PLAN_UI_SCRIPT: &str = r#"
       rightPanelDismissalActive,
       renderDock,
       scheduleApply,
+      activeHistorySeedRequest,
+      scheduleApplyImmediate,
+      scheduleApplyBurst,
+      eventTouchesRightRail,
+      mutationTouchesRightRail,
+      scheduleApplyForMutations,
     };
   }
   return true;
@@ -7955,6 +8407,13 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_to_seconds_accepts_seconds_and_milliseconds() {
+        assert_eq!(timestamp_to_seconds(1_700_000_200.9), 1_700_000_200);
+        assert_eq!(timestamp_to_seconds(1_700_000_200_999.0), 1_700_000_200);
+        assert_eq!(timestamp_to_seconds(0.0), 0);
+    }
 
     // 让 PLAN_UI_SCRIPT 这个 IIFE 能在没有真实浏览器的情况下跑到底所需要的最小 DOM/BOM
     // mock。只覆盖脚本安装阶段实际会调用到的那几个 API，够用即可，不追求完整实现。
@@ -8211,6 +8670,10 @@ CREATE TABLE threads (
         drop(conn);
 
         let snapshots = collect_plan_ui_history_snapshots(&root, 10).expect("collect snapshots");
+        let single_snapshot =
+            collect_plan_ui_history_snapshot_for_thread(&root, "local:thread-history")
+                .expect("collect single snapshot")
+                .expect("single snapshot exists");
         fs::remove_dir_all(&root).ok();
 
         assert_eq!(snapshots.len(), 1);
@@ -8226,6 +8689,9 @@ CREATE TABLE threads (
             vec![("读取历史会话", "done"), ("恢复任务清单", "done")]
         );
         assert_eq!(snapshot.source, "rollout-update-plan-cleared");
+        assert_eq!(single_snapshot.thread_id, "local:thread-history");
+        assert_eq!(single_snapshot.rows.len(), 2);
+        assert_eq!(single_snapshot.source, "rollout-update-plan-cleared");
     }
 
     #[test]
@@ -8540,6 +9006,79 @@ CREATE TABLE threads (
             serde_json::json!("local:history-thread")
         );
         assert_eq!(result["row"], serde_json::json!("历史会话任务"));
+    }
+
+    #[test]
+    fn plan_ui_active_seed_request_uses_real_local_thread_without_visible_alias_cache() {
+        // 点击历史会话时标题区可能先拼出 visible:title，并且旧逻辑会把 visible
+        // 别名缓存当成“已有快照”。按需恢复必须以真实 local/remote thread id
+        // 的直接快照为准，否则 Rust 侧不会去读取对应 rollout。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                const sidebar = {
+                    getAttribute(name) {
+                        return name === "data-app-action-sidebar-thread-id"
+                            ? "local:history-thread"
+                            : null;
+                    },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 44, left: 12, right: 332, top: 480, bottom: 524 };
+                    },
+                    textContent: "历史问题"
+                };
+                const title = {
+                    getBoundingClientRect() {
+                        return { width: 800, height: 46, left: 224, right: 1024, top: 0, bottom: 46 };
+                    },
+                    textContent: "历史问题打开位置"
+                };
+                document.querySelectorAll = function (selector) {
+                    return String(selector).includes("data-above-composer-portal") ? [] : [];
+                };
+                document.querySelector = function (selector) {
+                    const value = String(selector);
+                    if (value.includes("data-app-action-sidebar-thread-active")) return sidebar;
+                    if (value.includes("app-shell-header-context-menu-surface")) return title;
+                    if (value === "header") return title;
+                    return null;
+                };
+                const state = window.__codexGatewayLitePlanUiState;
+                state.snapshotsByThread = {
+                    "visible:历史问题打开位置": {
+                        threadId: "visible:历史问题打开位置",
+                        progress: "第 4 / 4 步",
+                        rows: [{ text: "别名缓存任务", status: "done", iconHtml: "" }],
+                        at: Date.now()
+                    }
+                };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                const seed = hooks.activeHistorySeedRequest();
+                return JSON.stringify({
+                    current: hooks.currentThreadId(),
+                    activeSeed: hooks.activeSeedThreadId(),
+                    directRows: hooks.rowsForSnapshot(hooks.directSnapshotForSeed("local:history-thread")).length,
+                    seed,
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["current"], serde_json::json!("local:history-thread"));
+        assert_eq!(
+            result["activeSeed"],
+            serde_json::json!("local:history-thread")
+        );
+        assert_eq!(result["directRows"], serde_json::json!(0));
+        assert_eq!(
+            result["seed"]["threadId"],
+            serde_json::json!("local:history-thread")
+        );
+        assert_eq!(result["seed"]["needsSeed"], serde_json::json!(true));
+        assert_eq!(
+            result["seed"]["reason"],
+            serde_json::json!("missing-direct-snapshot")
+        );
     }
 
     #[test]
@@ -9368,6 +9907,18 @@ CREATE TABLE threads (
             std::env::temp_dir().join(format!("codex-gateway-lite-native-thread-test-{unique}"));
         let sqlite_dir = home.join("sqlite");
         fs::create_dir_all(&sqlite_dir).expect("creates sqlite dir");
+        fs::write(home.join("config.toml"), r#"model_provider = "CPA""#)
+            .expect("writes config provider");
+        let sessions_dir = home.join("sessions").join("2026").join("07").join("08");
+        fs::create_dir_all(&sessions_dir).expect("creates sessions dir");
+        let rollout_path = sessions_dir.join("rollout-test.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-07-08T00:00:00Z","type":"session_meta","payload":{"id":"local:thread-native","model_provider":"custom","cwd":"D:\\codex-gateway-lite","source":"vscode"}}"#
+                .to_string()
+                + "\n",
+        )
+        .expect("writes rollout session meta");
 
         let native_db = Connection::open(home.join("state_5.sqlite")).expect("opens native db");
         native_db
@@ -9376,17 +9927,17 @@ CREATE TABLE threads (
 CREATE TABLE threads (
   id TEXT PRIMARY KEY,
   rollout_path TEXT,
-  created_at TEXT,
+  created_at INTEGER,
   created_at_ms INTEGER,
-  updated_at TEXT,
+  updated_at INTEGER,
   updated_at_ms INTEGER,
   cwd TEXT,
   title TEXT,
   first_user_message TEXT,
   preview TEXT,
   archived INTEGER,
-  archived_at TEXT,
-  recency_at TEXT,
+  archived_at INTEGER,
+  recency_at INTEGER,
   recency_at_ms INTEGER,
   thread_source TEXT,
   source TEXT,
@@ -9428,7 +9979,7 @@ CREATE TABLE threads (
                     "Imported Title",
                     "Preview from source",
                     "First user prompt",
-                    r#"C:\Users\TEMP\.codex\sessions\thread.jsonl"#,
+                    rollout_path.to_string_lossy().as_ref(),
                     r#"\\?\D:\codex-gateway-lite"#,
                 ],
             )
@@ -9449,7 +10000,7 @@ CREATE TABLE threads (
         let native_db = Connection::open(home.join("state_5.sqlite")).expect("reopens native db");
         let row = native_db
             .query_row(
-                "SELECT title, preview, first_user_message, rollout_path, cwd, archived, archived_at, thread_source, source, model_provider, git_branch, recency_at_ms FROM threads WHERE id = 'local:thread-native'",
+                "SELECT title, preview, first_user_message, rollout_path, cwd, archived, archived_at, thread_source, source, model_provider, git_branch, recency_at, recency_at_ms, typeof(recency_at), updated_at, typeof(updated_at), created_at, typeof(created_at) FROM threads WHERE id = 'local:thread-native'",
                 [],
                 |row| {
                     Ok((
@@ -9465,6 +10016,12 @@ CREATE TABLE threads (
                         row.get::<_, String>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, i64>(16)?,
+                        row.get::<_, String>(17)?,
                     ))
                 },
             )
@@ -9472,15 +10029,31 @@ CREATE TABLE threads (
         assert_eq!(row.0, "Imported Title");
         assert_eq!(row.1, "Preview from source");
         assert_eq!(row.2, "First user prompt");
-        assert_eq!(row.3, r#"C:\Users\TEMP\.codex\sessions\thread.jsonl"#);
+        assert_eq!(row.3, rollout_path.to_string_lossy());
         assert_eq!(row.4, r#"\\?\D:\codex-gateway-lite"#);
         assert_eq!(row.5, 0);
         assert_eq!(row.6, None);
         assert_eq!(row.7, "user");
         assert_eq!(row.8, "vscode");
-        assert_eq!(row.9, "openai");
+        assert_eq!(row.9, "CPA");
         assert_eq!(row.10, "main");
-        assert_eq!(row.11, 1_700_000_200_000);
+        assert_eq!(row.11, 1_700_000_200);
+        assert_eq!(row.12, 1_700_000_200_000);
+        assert_eq!(row.13, "integer");
+        assert_eq!(row.14, 1_700_000_200);
+        assert_eq!(row.15, "integer");
+        assert_eq!(row.16, 1_700_000_000);
+        assert_eq!(row.17, "integer");
+        let rollout_text = fs::read_to_string(&rollout_path).expect("reads rewritten rollout");
+        let first_line = rollout_text.lines().next().expect("has first line");
+        let session_meta: Value = serde_json::from_str(first_line).expect("parses session meta");
+        assert_eq!(
+            session_meta
+                .get("payload")
+                .and_then(|payload| payload.get("model_provider"))
+                .and_then(Value::as_str),
+            Some("CPA")
+        );
         let archived_count = native_db
             .query_row(
                 "SELECT COUNT(*) FROM threads WHERE id = 'local:archived'",
@@ -9701,7 +10274,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 40"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 43"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -9793,6 +10366,20 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 43"));
+        assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
+        assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
+        assert!(PLAN_UI_SCRIPT.contains("const observer = new MutationObserver(scheduleApplyForMutations)"));
+        assert!(PLAN_UI_SCRIPT.contains("window.__codexGatewayLitePlanUiResize = scheduleApplyImmediate"));
+        assert!(PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS >= 10);
+        assert!(PLAN_UI_ACTIVE_THREAD_NEEDS_SEED_SCRIPT.contains("__codexGatewayLitePlanUiActiveSeedRequest"));
+        assert!(PLAN_UI_SCRIPT.contains("activeHistorySeedRequest"));
+        assert!(PLAN_UI_SCRIPT.contains("window.__codexGatewayLitePlanUiActiveSeedRequest = activeHistorySeedRequest"));
+        assert!(PLAN_UI_SCRIPT.contains("RIGHT_RAIL_FOLLOW_FRAME_MS"));
+        assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyBurst()"));
+        assert!(PLAN_UI_SCRIPT.contains("continueRightRailFollow()"));
+        assert!(PLAN_UI_SCRIPT.contains("window.addEventListener(\"transitionend\", handleRightPanelDismissEvent"));
+        assert!(!PLAN_UI_SCRIPT.contains("PLAN_UI_HISTORY_RESEED_INTERVAL_SECS"));
         assert!(!PLAN_UI_SCRIPT.contains("characterData: true"));
         assert!(PLAN_UI_REINJECT_INTERVAL_SECS >= 30);
         assert!(PLAN_UI_SCRIPT.contains("^(打开位置|打开图片|审查)$"));
