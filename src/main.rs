@@ -10637,6 +10637,12 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("Config file: $ConfigFile"));
         assert!(!windows_script.contains("项目目录：$RepoRoot"));
         assert!(!windows_script.contains("配置文件：$ConfigFile"));
+        assert!(windows_script.contains("function Add-CargoBinToPath"));
+        assert!(windows_script.contains("Add-CargoBinToPath\n  if ((Test-Command cargo)"));
+        assert!(windows_script.contains("function Ensure-CargoBinUserPath"));
+        assert!(windows_script.contains("function Test-CargoDepsFresh"));
+        assert!(windows_script.contains("target\\.codex-gateway-lite\\cargo-fetch.stamp"));
+        assert!(windows_script.contains("Rust 依赖已就绪（跳过 cargo fetch）"));
     }
 
     #[test]

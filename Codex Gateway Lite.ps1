@@ -37,6 +37,29 @@ function Test-Command([string]$Name) {
   return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-UserCargoBin {
+  return Join-Path $env:USERPROFILE ".cargo\bin"
+}
+
+function Add-CargoBinToPath {
+  $cargoBin = Get-UserCargoBin
+  if (-not (Test-Path $cargoBin)) { return }
+  $pathParts = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+  if ($pathParts -notcontains $cargoBin) {
+    $env:Path = "$cargoBin;$env:Path"
+  }
+}
+
+function Ensure-CargoBinUserPath {
+  $cargoBin = Get-UserCargoBin
+  if (-not (Test-Path $cargoBin)) { return }
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $userParts = @($userPath -split ';' | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+  if ($userParts -notcontains $cargoBin) {
+    [Environment]::SetEnvironmentVariable("Path", "$cargoBin;$userPath", "User")
+  }
+}
+
 function Test-Url([string]$Url) {
   try {
     Invoke-WebRequest -Uri $Url -UseBasicParsing -Method Head -TimeoutSec 8 | Out-Null
@@ -169,8 +192,10 @@ function Ensure-VSBuildTools {
 }
 
 function Ensure-Rust {
+  Add-CargoBinToPath
   if ((Test-Command cargo) -and (Test-Command rustc)) {
     Write-Ok "Rust toolchain 已可用： $((cargo --version) 2>$null)"
+    Ensure-CargoBinUserPath
     return
   }
   $triple = Get-RustHostTriple
@@ -202,14 +227,33 @@ function Ensure-Rust {
     Fail "Rust 自动安装失败。请删除 %TEMP%\codex-gateway-lite 后重试，或手动安装 Rust：https://rustup.rs/。最后错误：$lastError"
   }
 
-  $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-  $env:Path = "$cargoBin;$env:Path"
-  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  if ($userPath -notlike "*$cargoBin*") {
-    [Environment]::SetEnvironmentVariable("Path", "$cargoBin;$userPath", "User")
-  }
+  Add-CargoBinToPath
+  Ensure-CargoBinUserPath
   if (-not (Test-Command cargo)) { Fail "Rust 安装完成后仍找不到 cargo.exe，请重开终端或检查 PATH。" }
   Write-Ok "Rust toolchain 安装完成： $((cargo --version) 2>$null)"
+}
+
+function Get-CargoFetchStampPath {
+  return Join-Path $RepoRoot "target\.codex-gateway-lite\cargo-fetch.stamp"
+}
+
+function Test-CargoDepsFresh {
+  $stamp = Get-CargoFetchStampPath
+  if (-not (Test-Path $stamp)) { return $false }
+  $stampTime = (Get-Item $stamp).LastWriteTimeUtc
+  foreach ($path in @((Join-Path $RepoRoot "Cargo.toml"), (Join-Path $RepoRoot "Cargo.lock"))) {
+    if ((Test-Path $path) -and ((Get-Item $path).LastWriteTimeUtc -gt $stampTime)) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Update-CargoFetchStamp {
+  $stamp = Get-CargoFetchStampPath
+  $stampDir = Split-Path -Parent $stamp
+  New-Item -ItemType Directory -Force -Path $stampDir | Out-Null
+  Set-Content -Path $stamp -Value (Get-Date).ToUniversalTime().ToString("o") -Encoding UTF8
 }
 
 function Get-CargoConfigPath {
@@ -255,9 +299,14 @@ function Configure-CargoMirror([switch]$Force) {
 
 function Ensure-CargoDeps {
   Configure-CargoMirror
+  if (Test-CargoDepsFresh) {
+    Write-Ok "Rust 依赖已就绪（跳过 cargo fetch）"
+    return
+  }
   Write-Info "预拉取 Rust 依赖（cargo fetch）"
   cargo fetch --manifest-path "Cargo.toml"
   if ($LASTEXITCODE -eq 0) {
+    Update-CargoFetchStamp
     Write-Ok "Rust 依赖已就绪"
     return
   }
@@ -265,6 +314,7 @@ function Ensure-CargoDeps {
   Configure-CargoMirror -Force
   cargo fetch --manifest-path "Cargo.toml"
   if ($LASTEXITCODE -ne 0) { Fail "Rust 依赖拉取失败。请配置代理，或检查 Cargo 镜像设置。" }
+  Update-CargoFetchStamp
   Write-Ok "Rust 依赖已就绪"
 }
 
