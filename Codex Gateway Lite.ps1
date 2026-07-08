@@ -479,11 +479,43 @@ function Test-LiteBinaryStale {
   return [bool]$newerSource
 }
 
+function Get-StaleAgentProcessIds {
+  try {
+    $procs = Get-CimInstance Win32_Process -Filter "Name='codex-gateway-lite.exe'" -ErrorAction SilentlyContinue
+  } catch {
+    return @()
+  }
+  if (-not $procs) { return @() }
+  $ids = @()
+  foreach ($proc in $procs) {
+    $cmd = [string]$proc.CommandLine
+    if ($cmd -and ($cmd -match [regex]::Escape($LiteBin))) {
+      $ids += $proc.ProcessId
+    }
+  }
+  return $ids
+}
+
+function Stop-StaleAgentProcesses {
+  $ids = Get-StaleAgentProcessIds
+  if ($ids.Count -eq 0) { return }
+  Write-Warn "检测到残留的 codex-gateway-lite agent 进程，先停止再构建：$($ids -join ', ')"
+  foreach ($processId in $ids) {
+    try { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } catch {}
+  }
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    if ((Get-StaleAgentProcessIds).Count -eq 0) { break }
+    Start-Sleep -Milliseconds 300
+  }
+}
+
 function Ensure-LiteBinary {
   if (Test-LiteBinaryStale) {
+    Stop-StaleAgentProcesses
     Write-Info "构建 release 二进制（后续源码未变化会直接复用）"
     cargo build --quiet --release --manifest-path "Cargo.toml"
-    if ($LASTEXITCODE -ne 0) { Fail "release 二进制构建失败" }
+    if ($LASTEXITCODE -ne 0) { Fail "release 二进制构建失败；如仍提示拒绝访问，请手动结束 codex-gateway-lite.exe 进程后重试" }
     Write-Ok "release 二进制已就绪：$LiteBin"
   }
 }

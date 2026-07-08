@@ -10841,6 +10841,12 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Add-CargoBinToPath"));
         assert!(windows_script.contains("Add-CargoBinToPath\n  if ((Test-Command cargo)"));
         assert!(windows_script.contains("function Ensure-CargoBinUserPath"));
+        assert!(windows_script.contains("function Stop-StaleAgentProcesses"));
+        assert!(windows_script.contains("function Get-StaleAgentProcessIds"));
+        assert!(
+            windows_script
+                .contains("Stop-StaleAgentProcesses\n    Write-Info \"构建 release 二进制")
+        );
         assert!(windows_script.contains("function Publish-UserEnvironmentChange"));
         assert!(windows_script.contains("SetEnvironmentVariable(\"NO_PROXY\", $merged, \"User\")"));
         assert!(windows_script.contains("SetEnvironmentVariable(\"no_proxy\", $merged, \"User\")"));
