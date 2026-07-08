@@ -22,7 +22,8 @@ mod codex_lite;
 mod protocol_proxy;
 
 const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
-const DEFAULT_CONTEXT_BUDGET: &str = "200K";
+const DEFAULT_CONTEXT_BUDGET: &str = "off";
+const SUGGESTED_CONTEXT_BUDGET: &str = "200K";
 const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
 const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
 const PLAN_UI_INITIAL_HISTORY_SEED: bool = true;
@@ -1140,32 +1141,36 @@ fn model_from_numbered_choice(model_ids: &[String], choice: &str) -> Option<Stri
 fn print_context_budget_notice(config: &LiteConfig) {
     let budget = config.provider.context_budget.trim();
     if let Some(tokens) = parse_context_budget_token(budget) {
+        let limit = explicit_context_budget_limit(tokens, &config.context_window);
         println!(
-            "上下文预算：{}；agent 只在估算输入超过该值时，通过本地代理在发送上游前裁剪旧上下文。",
-            format_token_budget(tokens)
+            "本地裁剪余量：{}；agent 会启动 127.0.0.1:57321，并在估算输入超过窗口安全线时裁掉旧上下文。当前发送目标上限约 {}。若要 Responses 完全直连，请将 provider.contextBudget 设为空或 off。",
+            format_token_budget(tokens),
+            format_token_budget(limit)
         );
         return;
     }
     if config.provider.protocol == LiteProtocol::Responses {
         println!(
-            "上下文预算：未设置；Responses 直连不会启用本地硬裁剪。如需限制上传上下文，请运行 init --force 并保留默认 {DEFAULT_CONTEXT_BUDGET}，或手动填写 provider.contextBudget。"
+            "上下文裁剪余量：未设置；Responses 保持直连，不启动本地代理。如需发送前兜底裁剪，请运行 init --force 并填写 {SUGGESTED_CONTEXT_BUDGET}。"
         );
     } else {
         println!(
-            "上下文预算：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；建议第三方 Claude 类模型显式填写 {DEFAULT_CONTEXT_BUDGET}。"
+            "上下文裁剪余量：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；如需更大安全余量可显式填写 {SUGGESTED_CONTEXT_BUDGET}。"
         );
     }
 }
 
 fn prompt_context_budget() -> anyhow::Result<String> {
-    println!("上下文预算说明：");
-    println!("  - 这是发送给上游前的估算输入 token 上限，不是 KB 文件大小。");
+    println!("本地裁剪余量说明：");
     println!(
-        "  - 默认 {DEFAULT_CONTEXT_BUDGET}；只有超过预算时才裁剪，优先保留最后几轮和最后一条用户消息图片。"
+        "  - 这是发送给上游前预留的上下文安全余量，不是 KB 文件大小；启用后一定会走 127.0.0.1:57321 本地代理。"
+    );
+    println!(
+        "  - 例如 contextWindow=1M 且填写 {SUGGESTED_CONTEXT_BUDGET}，代理会在发送目标超过约 800K 时裁掉旧上下文。"
     );
     println!("  - 可输入 200、200K、200KB、200000；纯数字 200 会按 200K 处理。");
-    println!("  - 如需关闭显式预算，请输入 off。");
-    let raw = prompt_default("上下文预算", DEFAULT_CONTEXT_BUDGET)?;
+    println!("  - 关闭显式预算请输入 off，Responses 模式会继续直连。");
+    let raw = prompt_default("本地裁剪余量", DEFAULT_CONTEXT_BUDGET)?;
     normalize_context_budget_for_config(&raw)
 }
 
@@ -4780,8 +4785,10 @@ fn protocol_proxy_upstream_from_config(
 }
 
 fn resolve_context_budget(config: &LiteConfig) -> protocol_proxy::ContextBudgetConfig {
-    if let Some(tokens) = parse_context_budget_token(&config.provider.context_budget) {
-        return protocol_proxy::ContextBudgetConfig::with_max_tokens(tokens);
+    if let Some(reserve_tokens) = parse_context_budget_token(&config.provider.context_budget) {
+        return protocol_proxy::ContextBudgetConfig::with_max_tokens(
+            explicit_context_budget_limit(reserve_tokens, &config.context_window),
+        );
     }
     if !config.context_window.trim().is_empty() {
         if let Some(tokens) = parse_window_token(config.context_window.trim()) {
@@ -4789,6 +4796,13 @@ fn resolve_context_budget(config: &LiteConfig) -> protocol_proxy::ContextBudgetC
         }
     }
     protocol_proxy::ContextBudgetConfig::default()
+}
+
+fn explicit_context_budget_limit(reserve_tokens: u64, context_window: &str) -> u64 {
+    parse_window_token(context_window)
+        .filter(|window_tokens| *window_tokens > reserve_tokens)
+        .map(|window_tokens| window_tokens - reserve_tokens)
+        .unwrap_or(reserve_tokens)
 }
 
 async fn read_lite_http_request(stream: &mut TcpStream) -> anyhow::Result<LiteHttpRequest> {
@@ -10730,7 +10744,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         );
         assert!(source.contains("Responses 直连模式：不启动本地协议代理 127.0.0.1:57321"));
         assert!(source.contains("fn print_context_budget_notice(config: &LiteConfig)"));
-        assert!(source.contains("Responses 直连不会启用本地硬裁剪"));
+        assert!(source.contains("Responses 保持直连，不启动本地代理"));
         let readme = include_str!("../README.md");
         assert!(
             readme.contains(
@@ -11814,7 +11828,8 @@ mod context_budget_tests {
             plan_hints: true,
         };
         let budget = resolve_context_budget(&config);
-        assert_eq!(budget.max_input_tokens, 200_000);
+        assert_eq!(budget.max_input_tokens, 800_000);
+        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 800_000);
     }
 
     #[test]

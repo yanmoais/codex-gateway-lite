@@ -146,7 +146,7 @@ export CODEX_GATEWAY_API_KEY="sk-..."
 
 | `provider.protocol` | Codex 看到的地址 | 适用场景 | 本地代理 |
 | --- | --- | --- | --- |
-| `responses` | 上游 Base URL；配置 `provider.contextBudget` 时改为 `http://127.0.0.1:57321/v1` | 供应商已支持 `/v1/responses` | 默认配置会启用，用于发上游前裁剪超长上下文；可用 `off` 关闭 |
+| `responses` | 上游 Base URL；配置 `provider.contextBudget` 时改为 `http://127.0.0.1:57321/v1` | 供应商已支持 `/v1/responses` | 默认不启用，保持直连；只有显式填写硬裁剪预算时启用 |
 | `chat_completions` | `http://127.0.0.1:57321/v1` | 供应商只支持 `/v1/chat/completions` | 必须启用，由 agent 做协议转换 |
 
 如果显式填写 `provider.contextBudget`，Codex 会改走本地代理 `http://127.0.0.1:57321/v1`，由 agent 先裁剪上下文再转发到 Responses 上游。
@@ -164,7 +164,7 @@ export CODEX_GATEWAY_API_KEY="sk-..."
 
 自动拉取到的模型会默认写入上下文窗口：GPT/ChatGPT 系列为 `258400`，其他模型为 `1M`。
 
-`provider.contextBudget` 是发送上游前的估算输入 token 上限，不是文件大小。默认初始化为 `200K`；只有请求超过预算时才裁剪，裁剪策略会优先保留最后几轮、最后一条用户消息里的图片，并移除更早的图片和旧消息。支持这些写法：
+`provider.contextBudget` 是发送上游前的本地裁剪余量，不是文件大小。Responses 模式默认留空并保持直连；只有显式填写预算时才会改走本地代理 `http://127.0.0.1:57321/v1`。例如 `contextWindow=1M` 且 `provider.contextBudget=200K` 时，代理会把发送目标控制在约 `800K`，超出时优先裁掉旧上下文，而不是把请求裁到只剩 `200K`。支持这些写法：
 
 - `200`：按 `200K` 处理，方便交互里直接填常见预算值。
 - `200K` / `200KB`：都表示 200,000 个估算输入 token；这里的 `KB` 不是字节。
