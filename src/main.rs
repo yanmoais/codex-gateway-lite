@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use codex_lite::RelayProfile;
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -1499,6 +1499,9 @@ struct SessionIndexEntry {
 struct ThreadCatalogEntry {
     thread_id: String,
     display_title: String,
+    preview: Option<String>,
+    first_user_message: Option<String>,
+    rollout_path: Option<String>,
     source_created_at: f64,
     source_updated_at: f64,
     cwd: String,
@@ -1575,6 +1578,11 @@ fn sync_local_thread_catalog(home: &Path) -> anyhow::Result<ThreadCatalogSyncRep
         report.catalog_inserted = report.catalog_inserted.max(inserted);
         report.catalog_updated = report.catalog_updated.max(updated);
     }
+    if let Some((inserted, updated)) = sync_native_threads_table(home, &selected)? {
+        report.catalog_targets += 1;
+        report.catalog_inserted = report.catalog_inserted.max(inserted);
+        report.catalog_updated = report.catalog_updated.max(updated);
+    }
     Ok(report)
 }
 
@@ -1615,6 +1623,7 @@ fn collect_thread_entries_from_state_dbs(
             "title",
             "preview",
             "first_user_message",
+            "rollout_path",
             "created_at",
             "created_at_ms",
             "updated_at",
@@ -1646,34 +1655,40 @@ fn collect_thread_entries_from_state_dbs(
                 .or_else(|| row_string(row, 3))
                 .and_then(|value| non_empty_string(&value))
                 .unwrap_or_else(|| id.clone());
-            let created_at = row_timestamp(row, 4)
-                .or_else(|| row_timestamp_millis(row, 5))
+            let preview = row_string(row, 2).and_then(|value| non_empty_string(&value));
+            let first_user_message = row_string(row, 3).and_then(|value| non_empty_string(&value));
+            let rollout_path = row_string(row, 4).and_then(|value| non_empty_string(&value));
+            let created_at = row_timestamp(row, 5)
+                .or_else(|| row_timestamp_millis(row, 6))
                 .unwrap_or(0.0);
-            let updated_at = row_timestamp(row, 8)
-                .or_else(|| row_timestamp_millis(row, 9))
-                .or_else(|| row_timestamp(row, 6))
-                .or_else(|| row_timestamp_millis(row, 7))
+            let updated_at = row_timestamp(row, 9)
+                .or_else(|| row_timestamp_millis(row, 10))
+                .or_else(|| row_timestamp(row, 7))
+                .or_else(|| row_timestamp_millis(row, 8))
                 .unwrap_or(created_at);
-            let cwd = row_string(row, 10)
+            let cwd = row_string(row, 11)
                 .and_then(|value| non_empty_string(&value))
                 .unwrap_or_else(|| home.display().to_string());
-            let source_kind = row_string(row, 11)
-                .or_else(|| row_string(row, 12))
+            let source_kind = row_string(row, 12)
+                .or_else(|| row_string(row, 13))
                 .and_then(|value| non_empty_string(&value))
                 .unwrap_or_else(|| "session".to_string());
-            let model_provider = row_string(row, 13)
+            let model_provider = row_string(row, 14)
                 .and_then(|value| non_empty_string(&value))
-                .unwrap_or_else(|| "custom".to_string());
-            let archived = row_bool(row, 15).unwrap_or(false);
+                .unwrap_or_else(|| "openai".to_string());
+            let archived = row_bool(row, 16).unwrap_or(false);
             Ok(ThreadCatalogEntry {
                 thread_id: id,
                 display_title: title,
+                preview,
+                first_user_message,
+                rollout_path,
                 source_created_at: created_at,
                 source_updated_at: updated_at,
                 cwd,
                 source_kind,
                 model_provider,
-                git_branch: row_string(row, 14).and_then(|value| non_empty_string(&value)),
+                git_branch: row_string(row, 15).and_then(|value| non_empty_string(&value)),
                 archived,
             })
         })?;
@@ -1997,6 +2012,295 @@ ON CONFLICT(host_id, thread_id) DO UPDATE SET
     )?;
     tx.commit()?;
     Ok((inserted, updated))
+}
+
+fn sync_native_threads_table(
+    home: &Path,
+    entries: &[ThreadCatalogEntry],
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let db_path = home.join("state_5.sqlite");
+    if !db_path.exists() || !sqlite_has_table(&db_path, "threads") {
+        return Ok(None);
+    }
+    let mut conn = Connection::open(&db_path).with_context(|| {
+        format!(
+            "打开 Codex native threads 数据库失败：{}",
+            db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    let columns = sqlite_table_columns(&conn, "threads")?;
+    if !columns.contains("id") {
+        return Ok(None);
+    }
+    let tx = conn.transaction()?;
+    let mut inserted = 0;
+    let mut updated = 0;
+    for entry in entries.iter().filter(|entry| !entry.archived) {
+        let source_created_at = positive_timestamp(entry.source_created_at)
+            .unwrap_or_else(current_unix_timestamp_seconds);
+        let source_updated_at = positive_timestamp(entry.source_updated_at)
+            .or_else(|| positive_timestamp(entry.source_created_at))
+            .unwrap_or_else(current_unix_timestamp_seconds);
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM threads WHERE id = ?1 LIMIT 1",
+                [&entry.thread_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let mut names = Vec::new();
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "id",
+            text_sql_value(&entry.thread_id),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "rollout_path",
+            option_text_sql_value(entry.rollout_path.as_deref()),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "created_at",
+            text_sql_value(&timestamp_to_rfc3339(source_created_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "created_at_ms",
+            integer_sql_value(timestamp_to_millis(source_created_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "updated_at",
+            text_sql_value(&timestamp_to_rfc3339(source_updated_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "updated_at_ms",
+            integer_sql_value(timestamp_to_millis(source_updated_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "recency_at",
+            text_sql_value(&timestamp_to_rfc3339(source_updated_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "recency_at_ms",
+            integer_sql_value(timestamp_to_millis(source_updated_at)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "cwd",
+            text_sql_value(&entry.cwd),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "title",
+            text_sql_value(&entry.display_title),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "first_user_message",
+            option_text_sql_value(
+                entry
+                    .first_user_message
+                    .as_deref()
+                    .or(Some(entry.display_title.as_str())),
+            ),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "preview",
+            option_text_sql_value(
+                entry
+                    .preview
+                    .as_deref()
+                    .or(Some(entry.display_title.as_str())),
+            ),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "archived",
+            integer_sql_value(0),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "archived_at",
+            rusqlite::types::Value::Null,
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "thread_source",
+            text_sql_value("user"),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "source",
+            text_sql_value(&entry.source_kind),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "model_provider",
+            text_sql_value(&native_model_provider(&entry.model_provider)),
+        );
+        push_native_thread_value(
+            &columns,
+            &mut names,
+            &mut values,
+            "git_branch",
+            option_text_sql_value(entry.git_branch.as_deref()),
+        );
+        if names.len() <= 1 {
+            continue;
+        }
+        if exists {
+            let update_names = names
+                .iter()
+                .filter(|name| name.as_str() != "id")
+                .cloned()
+                .collect::<Vec<_>>();
+            if update_names.is_empty() {
+                continue;
+            }
+            let assignments = update_names
+                .iter()
+                .map(|name| format!("{name} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut update_values = names
+                .iter()
+                .zip(values.iter())
+                .filter_map(|(name, value)| {
+                    if name == "id" {
+                        None
+                    } else {
+                        Some(value.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            update_values.push(text_sql_value(&entry.thread_id));
+            let sql = format!("UPDATE threads SET {assignments} WHERE id = ?");
+            tx.execute(&sql, rusqlite::params_from_iter(update_values.iter()))?;
+            updated += 1;
+        } else {
+            let placeholders = std::iter::repeat_n("?", names.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO threads ({}) VALUES ({})",
+                names.join(", "),
+                placeholders
+            );
+            tx.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+            inserted += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(Some((inserted, updated)))
+}
+
+fn push_native_thread_value(
+    columns: &HashSet<String>,
+    names: &mut Vec<String>,
+    values: &mut Vec<rusqlite::types::Value>,
+    name: &str,
+    value: rusqlite::types::Value,
+) {
+    if columns.contains(name) {
+        names.push(name.to_string());
+        values.push(value);
+    }
+}
+
+fn text_sql_value(value: &str) -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(value.to_string())
+}
+
+fn option_text_sql_value(value: Option<&str>) -> rusqlite::types::Value {
+    value
+        .and_then(non_empty_string)
+        .map(rusqlite::types::Value::Text)
+        .unwrap_or(rusqlite::types::Value::Null)
+}
+
+fn integer_sql_value(value: i64) -> rusqlite::types::Value {
+    rusqlite::types::Value::Integer(value)
+}
+
+fn timestamp_to_millis(value: f64) -> i64 {
+    if value <= 0.0 {
+        0
+    } else {
+        (value * 1000.0).round() as i64
+    }
+}
+
+fn positive_timestamp(value: f64) -> Option<f64> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| *value > 0.0)
+}
+
+fn current_unix_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn timestamp_to_rfc3339(value: f64) -> String {
+    let millis = timestamp_to_millis(value);
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
+fn native_model_provider(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("custom") {
+        "openai".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn sqlite_has_table(path: &Path, table: &str) -> bool {
@@ -6006,7 +6310,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 39;
+  const SCRIPT_VERSION = 40;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -6388,6 +6692,10 @@ const PLAN_UI_SCRIPT: &str = r#"
       clearRightPanelDismissal();
       return false;
     }
+    if (environmentPanelInfo()) {
+      clearRightPanelDismissal();
+      return false;
+    }
     const dismissedAt = Number(state.rightPanelDismissedAt || 0);
     if (!dismissedAt) return false;
     const active = activeRightSideExpandedContentInfo();
@@ -6398,14 +6706,17 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function hideDockForRightPanel(reason) {
+    if (environmentPanelInfo()) return false;
     const dock = document.getElementById(DOCK_ID);
     if (dock) {
       dock.hidden = true;
       dock.dataset.cglPlanHiddenBy = reason || "right-panel";
     }
+    return true;
   }
 
   function hideDockForRightPanelTarget(target) {
+    if (environmentPanelInfo()) return false;
     const info = rightSideExpandedContentInfoFromTarget(target);
     if (!info) return false;
     state.rightPanelDismissedThreadId = currentThreadId();
@@ -6416,6 +6727,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function handleRightPanelDismissEvent(event) {
+    if (environmentPanelInfo()) return;
     if (hideDockForRightPanelTarget(event?.target)) return;
     const pointInfo = rightSideExpandedContentInfoFromPoint(event?.clientX, event?.clientY);
     if (!pointInfo) return;
@@ -7347,7 +7659,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function placeDock(dock) {
-    const anchor = environmentPanelInfo() || rightRailFallbackPanelInfo();
+    const anchor = environmentPanelInfo();
     if (!anchor) return false;
     const rect = anchor.rect;
     const right = Math.max(12, Math.round(window.innerWidth - rect.right + 12));
@@ -8431,9 +8743,9 @@ CREATE TABLE threads (
     }
 
     #[test]
-    fn plan_ui_right_panel_dismissal_keeps_dock_hidden_across_render() {
-        // 真实 Codex App 中 apply()/MutationObserver 会定时重渲染；右侧展开内容被点击后，
-        // renderDock 必须有状态门禁，否则 dock 会在下一轮 apply() 里重新盖到右侧面板上。
+    fn plan_ui_right_panel_click_cannot_hide_dock_while_environment_panel_exists() {
+        // BOSS 现场确认：任务卡片必须和 Codex 原生“环境信息”卡片共生。
+        // 只要原生卡片仍然存在且可见，点击右侧其它按钮/空白/展开内容都不能隐藏 dock。
         let mut ctx = plan_ui_test_context();
         let result = eval_json(
             &mut ctx,
@@ -8491,11 +8803,11 @@ CREATE TABLE threads (
         );
 
         assert_eq!(result["beforeHidden"], serde_json::json!(false));
-        assert_eq!(result["dismissed"], serde_json::json!(true));
-        assert_eq!(result["afterHidden"], serde_json::json!(true));
-        assert_eq!(result["hiddenBy"], serde_json::json!("right-panel-active"));
-        assert_eq!(result["signature"], serde_json::json!(""));
-        assert_eq!(result["active"], serde_json::json!(true));
+        assert_eq!(result["dismissed"], serde_json::json!(false));
+        assert_eq!(result["afterHidden"], serde_json::json!(false));
+        assert_eq!(result["hiddenBy"], serde_json::json!(""));
+        assert_ne!(result["signature"], serde_json::json!(""));
+        assert_eq!(result["active"], serde_json::json!(false));
     }
 
     #[test]
@@ -9047,6 +9359,139 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn sync_local_thread_catalog_writes_windows_native_threads_table() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("codex-gateway-lite-native-thread-test-{unique}"));
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).expect("creates sqlite dir");
+
+        let native_db = Connection::open(home.join("state_5.sqlite")).expect("opens native db");
+        native_db
+            .execute_batch(
+                r#"
+CREATE TABLE threads (
+  id TEXT PRIMARY KEY,
+  rollout_path TEXT,
+  created_at TEXT,
+  created_at_ms INTEGER,
+  updated_at TEXT,
+  updated_at_ms INTEGER,
+  cwd TEXT,
+  title TEXT,
+  first_user_message TEXT,
+  preview TEXT,
+  archived INTEGER,
+  archived_at TEXT,
+  recency_at TEXT,
+  recency_at_ms INTEGER,
+  thread_source TEXT,
+  source TEXT,
+  model_provider TEXT,
+  git_branch TEXT
+);
+"#,
+            )
+            .expect("creates native threads table");
+        drop(native_db);
+
+        let source_db = Connection::open(sqlite_dir.join("custom.sqlite3")).expect("opens source");
+        source_db
+            .execute_batch(
+                r#"
+CREATE TABLE threads (
+  id TEXT PRIMARY KEY,
+  title TEXT,
+  preview TEXT,
+  first_user_message TEXT,
+  rollout_path TEXT,
+  created_at INTEGER,
+  updated_at INTEGER,
+  recency_at INTEGER,
+  cwd TEXT,
+  source TEXT,
+  model_provider TEXT,
+  git_branch TEXT,
+  archived INTEGER
+);
+"#,
+            )
+            .expect("creates source threads table");
+        source_db
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, 1700000000, 1700000100, 1700000200, ?6, 'vscode', 'custom', 'main', 0)",
+                params![
+                    "local:thread-native",
+                    "Imported Title",
+                    "Preview from source",
+                    "First user prompt",
+                    r#"C:\Users\TEMP\.codex\sessions\thread.jsonl"#,
+                    r#"\\?\D:\codex-gateway-lite"#,
+                ],
+            )
+            .expect("inserts source thread");
+        source_db
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, NULL, NULL, NULL, 1700000000, 1700000300, 1700000300, ?3, 'vscode', 'gateway', NULL, 1)",
+                params!["local:archived", "Archived Title", r#"D:\archived"#],
+            )
+            .expect("inserts archived source thread");
+        drop(source_db);
+
+        let report = sync_local_thread_catalog(&home).expect("sync succeeds");
+        assert_eq!(report.threads_seen, 1);
+        assert_eq!(report.catalog_targets, 4);
+        assert_eq!(report.catalog_inserted, 1);
+
+        let native_db = Connection::open(home.join("state_5.sqlite")).expect("reopens native db");
+        let row = native_db
+            .query_row(
+                "SELECT title, preview, first_user_message, rollout_path, cwd, archived, archived_at, thread_source, source, model_provider, git_branch, recency_at_ms FROM threads WHERE id = 'local:thread-native'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .expect("reads native thread");
+        assert_eq!(row.0, "Imported Title");
+        assert_eq!(row.1, "Preview from source");
+        assert_eq!(row.2, "First user prompt");
+        assert_eq!(row.3, r#"C:\Users\TEMP\.codex\sessions\thread.jsonl"#);
+        assert_eq!(row.4, r#"\\?\D:\codex-gateway-lite"#);
+        assert_eq!(row.5, 0);
+        assert_eq!(row.6, None);
+        assert_eq!(row.7, "user");
+        assert_eq!(row.8, "vscode");
+        assert_eq!(row.9, "openai");
+        assert_eq!(row.10, "main");
+        assert_eq!(row.11, 1_700_000_200_000);
+        let archived_count = native_db
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'local:archived'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("counts archived native rows");
+        assert_eq!(archived_count, 0);
+    }
+
+    #[test]
     fn sync_local_thread_catalog_discovers_current_and_legacy_session_dbs() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -9091,7 +9536,7 @@ CREATE TABLE threads (
 
         let report = sync_local_thread_catalog(&home).expect("sync succeeds");
         assert_eq!(report.threads_seen, 2);
-        assert_eq!(report.catalog_targets, 4);
+        assert_eq!(report.catalog_targets, 5);
 
         for db_name in [
             "codex.db",
@@ -9256,7 +9701,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 39"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 40"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -9381,10 +9826,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("hasOutputSourcePair"));
         assert!(PLAN_UI_SCRIPT.contains("candidate.hasOutputSourcePair ? rect.bottom : rect.top"));
         assert!(!PLAN_UI_SCRIPT.contains("function defaultRightRailDockInfo()"));
-        assert!(
-            PLAN_UI_SCRIPT
-                .contains("const anchor = environmentPanelInfo() || rightRailFallbackPanelInfo();")
-        );
+        assert!(PLAN_UI_SCRIPT.contains("const anchor = environmentPanelInfo();"));
         assert!(PLAN_UI_SCRIPT.contains("if (!anchor) return false;"));
         assert!(PLAN_UI_SCRIPT.contains("Math.max(72, window.innerHeight - 96)"));
         assert!(PLAN_UI_SCRIPT.contains("Math.round(rect.width - 12)"));
