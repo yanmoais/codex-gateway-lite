@@ -1244,7 +1244,47 @@ fn models_from_ids(ids: &[String]) -> Vec<LiteModel> {
         .collect()
 }
 
+/// Known official context-window sizes, keyed by a prefix match against the
+/// lowercased model slug (provider namespace such as `openai/` stripped).
+/// Ordered from most specific to least specific; the first match wins.
+///
+/// This table has to be maintained by hand because a lot of users run this
+/// behind gateways/providers without direct access to vendor docs, so the
+/// tool can't reliably auto-discover the real context window from the
+/// `/v1/models` response alone. Please re-check the vendor's official docs
+/// and refresh the numbers below whenever a listed family gets a documented
+/// context-window change:
+/// - OpenAI: https://platform.openai.com/docs/models
+/// - Anthropic: https://docs.anthropic.com/en/docs/about-claude/models
+/// - xAI: https://docs.x.ai/docs/models
+///
+/// Last reviewed: 2026-07-08.
+const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
+    // OpenAI GPT-4.1 family officially supports up to ~1M input tokens.
+    ("gpt-4.1", "1M"),
+    ("chatgpt-4.1", "1M"),
+    // OpenAI o-series reasoning models: 200K context.
+    ("o1", "200K"),
+    ("o3", "200K"),
+    ("o4", "200K"),
+    // Anthropic Claude Sonnet family: 1M context (extended-context tier).
+    ("claude-sonnet", "1M"),
+    // Anthropic Claude Opus / Haiku: 200K context (standard tier).
+    ("claude-opus", "200K"),
+    ("claude-haiku", "200K"),
+    // xAI Grok 4 family: 256K context.
+    ("grok-4", "256K"),
+    // xAI Grok 3 family: 128K context.
+    ("grok-3", "128K"),
+];
+
 fn default_context_window_for_model_id(id: &str) -> &'static str {
+    let slug = normalized_model_slug(id);
+    for (pattern, window) in MODEL_CONTEXT_WINDOW_TABLE {
+        if slug.starts_with(pattern) {
+            return window;
+        }
+    }
     if is_gpt_family_model_id(id) {
         "258400"
     } else {
@@ -1252,13 +1292,16 @@ fn default_context_window_for_model_id(id: &str) -> &'static str {
     }
 }
 
-fn is_gpt_family_model_id(id: &str) -> bool {
-    let model = id
-        .trim()
+fn normalized_model_slug(id: &str) -> String {
+    id.trim()
         .rsplit('/')
         .next()
         .unwrap_or("")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn is_gpt_family_model_id(id: &str) -> bool {
+    let model = normalized_model_slug(id);
     model.starts_with("gpt-") || model.starts_with("chatgpt-")
 }
 
@@ -11253,6 +11296,48 @@ not-a-pid garbage line without valid pid
         assert_eq!(
             windows.get("claude-fable-5").map(String::as_str),
             Some("1M")
+        );
+    }
+
+    #[test]
+    fn default_context_window_uses_known_vendor_family_table() {
+        assert_eq!(default_context_window_for_model_id("gpt-5.5"), "258400");
+        assert_eq!(
+            default_context_window_for_model_id("openai/chatgpt-4o-latest"),
+            "258400"
+        );
+        assert_eq!(default_context_window_for_model_id("gpt-4.1"), "1M");
+        assert_eq!(default_context_window_for_model_id("gpt-4.1-mini"), "1M");
+        assert_eq!(default_context_window_for_model_id("o3-mini"), "200K");
+        assert_eq!(default_context_window_for_model_id("o1-pro"), "200K");
+        assert_eq!(default_context_window_for_model_id("claude-sonnet-5"), "1M");
+        assert_eq!(
+            default_context_window_for_model_id("claude-sonnet-4-6"),
+            "1M"
+        );
+        assert_eq!(
+            default_context_window_for_model_id("claude-opus-4-8"),
+            "200K"
+        );
+        assert_eq!(
+            default_context_window_for_model_id("claude-haiku-4-5-20251001"),
+            "200K"
+        );
+        assert_eq!(default_context_window_for_model_id("grok-4.3"), "256K");
+        assert_eq!(
+            default_context_window_for_model_id("grok-4.20-0309-reasoning"),
+            "256K"
+        );
+        assert_eq!(default_context_window_for_model_id("grok-3-mini"), "128K");
+        assert_eq!(
+            default_context_window_for_model_id("grok-3-mini-fast"),
+            "128K"
+        );
+        // Unknown/unlisted families keep the existing conservative fallback.
+        assert_eq!(default_context_window_for_model_id("claude-fable-5"), "1M");
+        assert_eq!(
+            default_context_window_for_model_id("grok-composer-2.5-fast"),
+            "1M"
         );
     }
 
