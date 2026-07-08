@@ -4661,11 +4661,29 @@ async fn handle_streaming_responses_proxy(
         stream.write_all(header.as_bytes()).await?;
         let mut response = upstream.response;
         loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => write_http_chunk(&mut stream, &chunk).await?,
-                Ok(None) => break,
-                Err(error) => {
-                    eprintln!("Responses 上游流中断: {error}");
+            match tokio::time::timeout(
+                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
+                response.chunk(),
+            )
+            .await
+            {
+                Ok(Ok(Some(chunk))) => write_http_chunk(&mut stream, &chunk).await?,
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
+                    protocol_proxy::log_upstream_event_deduped(
+                        "responses_stream_interrupted",
+                        format!("Responses 上游流中断: {error}"),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    protocol_proxy::log_upstream_event_deduped(
+                        "responses_stream_idle_timeout",
+                        format!(
+                            "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
+                            protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                        ),
+                    );
                     break;
                 }
             }
@@ -4680,18 +4698,36 @@ async fn handle_streaming_responses_proxy(
         let mut response = upstream.response;
 
         loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(
+                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
+                response.chunk(),
+            )
+            .await
+            {
+                Ok(Ok(Some(chunk))) => {
                     let converted = converter.push_bytes(&chunk);
                     if !converted.is_empty() {
                         write_http_chunk(&mut stream, &converted).await?;
                     }
                 }
-                Ok(None) => break,
-                Err(error) => {
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
                     let error_data = converter.fail(
                         format!("上游流中断: {error}"),
                         Some("upstream_error".to_string()),
+                    );
+                    if !error_data.is_empty() {
+                        write_http_chunk(&mut stream, &error_data).await.ok();
+                    }
+                    break;
+                }
+                Err(_) => {
+                    let error_data = converter.fail(
+                        format!(
+                            "上游流超过 {} 秒没有新数据，主动断开",
+                            protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                        ),
+                        Some("upstream_timeout".to_string()),
                     );
                     if !error_data.is_empty() {
                         write_http_chunk(&mut stream, &error_data).await.ok();
@@ -10870,6 +10906,37 @@ model_catalog_json = "model-catalogs/gateway.json"
                 "如果显式填写 `provider.contextBudget`，Codex 会改走本地代理 `http://127.0.0.1:57321/v1`，由 agent 先裁剪上下文再转发到 Responses 上游"
             )
         );
+    }
+
+    #[test]
+    fn responses_stream_forwarding_enforces_idle_timeout() {
+        // Regression guard for a gap where the SSE chunk-forwarding loop
+        // (both true Responses passthrough and Chat-Completions-to-Responses
+        // conversion) awaited `response.chunk()` with no timeout at all. A
+        // stalled upstream (network stall, silent keep-alive with no data)
+        // would leave the local proxy holding the connection to Codex open
+        // but silent indefinitely; Codex's own client-side idle timeout
+        // would eventually fire and tear the session down with an opaque
+        // "stream disconnected before completion" error and no diagnostic
+        // on the proxy side at all. Enforcing an idle timeout here lets the
+        // proxy fail fast with a clear, logged reason instead.
+        let source = include_str!("main.rs");
+        let occurrences = source
+            .matches(
+                "tokio::time::timeout(
+                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
+                response.chunk(),
+            )",
+            )
+            .count();
+        // 2 real call sites (Responses passthrough + Chat Completions SSE
+        // conversion) plus 1 self-match from this test's own source string,
+        // since `include_str!("main.rs")` reads this test file too.
+        assert_eq!(
+            occurrences, 3,
+            "expected both the Responses passthrough and Chat Completions SSE loops to enforce the idle timeout"
+        );
+        assert!(source.contains("上游流超过 {} 秒没有新数据，主动断开"));
     }
 
     #[test]

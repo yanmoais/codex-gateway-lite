@@ -17,6 +17,16 @@ pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum gap allowed between two SSE chunks while relaying an already-open
+/// upstream stream. Without this, a stalled upstream (network stall, silent
+/// keep-alive with no data) leaves the chunk-forwarding loop awaiting
+/// `response.chunk()` forever: the local proxy holds the TCP connection to
+/// Codex open but silent, so Codex's own client-side idle timeout eventually
+/// fires and the session gets torn down with an opaque
+/// "stream disconnected before completion" error that gives BOSS no signal
+/// about what actually stalled. Enforcing our own shorter idle timeout here
+/// lets the proxy fail fast with a clear diagnostic instead.
+pub const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -688,67 +698,88 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     }
 }
 
-/// Consecutive-repeat state for `log_upstream_event_deduped`, keyed by a
-/// fixed call-site identifier so different kinds of diagnostics never get
-/// mixed into the same streak.
+/// Throttle state for `log_upstream_event_deduped`, keyed by a fixed
+/// call-site identifier so different kinds of diagnostics never share a
+/// throttle window.
 struct RepeatedLogState {
-    last_message: String,
-    repeat_count: u32,
+    last_printed_at: std::time::Instant,
+    suppressed_since_print: u32,
 }
+
+/// Minimum gap between two printed lines for the same diagnostic `key`.
+/// Chosen to comfortably cover Codex's fast automatic-retry bursts (which
+/// can fire multiple attempts per second) while still surfacing an update
+/// quickly enough that BOSS can tell the retry loop is still alive.
+const REPEATED_LOG_THROTTLE: Duration = Duration::from_secs(3);
 
 static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Print a diagnostic line to stderr, collapsing byte-identical messages
-/// that repeat back-to-back under the same `key`.
+/// Print a diagnostic line to stderr, throttled per `key` to at most once
+/// every `REPEATED_LOG_THROTTLE`.
 ///
 /// Codex automatically retries a request when the upstream provider returns
 /// a transient-looking error (e.g. a persistent 502 from the third-party
-/// gateway). Every retry re-sends the same unchanged conversation history to
-/// our local proxy, so both the context-budget/reasoning-strip summary and
-/// the upstream error end up byte-identical on every attempt. Printing every
-/// single repeat floods the terminal and makes it look like a stuck loop in
-/// this proxy, when it's actually Codex's own retry behavior against a
-/// still-failing upstream. This prints the first occurrence immediately,
-/// stays quiet for exact repeats, and surfaces a running counter every 5th
-/// repeat so BOSS can still see the retry is ongoing (and that the upstream,
-/// not this proxy, is what needs to recover).
+/// gateway), and it can also have more than one conversation/thread retrying
+/// against a struggling upstream at the same time. Retries of the exact same
+/// request produce byte-identical diagnostics, but interleaved retries from
+/// *different* conversations produce diagnostics that keep changing in
+/// small ways (e.g. a differing reasoning-item count) even though they're
+/// really the same underlying "upstream is unhappy" situation. Throttling by
+/// elapsed time per `key`, instead of by exact message equality, collapses
+/// both cases: it prints the first occurrence immediately, then goes quiet
+/// for the rest of the throttle window regardless of the exact wording, and
+/// on the next print folds in how many occurrences were suppressed in
+/// between so BOSS can still see the retry loop is active.
 pub fn log_upstream_event_deduped(key: &'static str, message: String) {
     let mut state = REPEATED_LOG_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(line) = dedup_repeated_log_line(&mut state, key, message) {
+    if let Some(line) = throttle_repeated_log_line(
+        &mut state,
+        key,
+        message,
+        std::time::Instant::now(),
+        REPEATED_LOG_THROTTLE,
+    ) {
         eprintln!("{line}");
     }
 }
 
 /// Pure decision logic behind `log_upstream_event_deduped`, separated out so
-/// the counting/suppression behavior can be unit-tested without capturing
-/// process stderr. Returns `Some(line_to_print)` on the first occurrence of
-/// a message and every 5th identical repeat, `None` otherwise.
-fn dedup_repeated_log_line(
+/// the throttling behavior can be unit-tested with a controlled clock
+/// instead of capturing process stderr or sleeping in tests.
+fn throttle_repeated_log_line(
     state: &mut HashMap<&'static str, RepeatedLogState>,
     key: &'static str,
     message: String,
+    now: std::time::Instant,
+    throttle: Duration,
 ) -> Option<String> {
     match state.get_mut(key) {
-        Some(entry) if entry.last_message == message => {
-            entry.repeat_count += 1;
-            if entry.repeat_count % 5 == 0 {
-                Some(format!(
-                    "{message}（相同信息已连续重复 {} 次，Codex 仍在自动重试，问题多半在上游供应商而不是本地代理）",
-                    entry.repeat_count
-                ))
-            } else {
-                None
-            }
+        Some(entry) if now.saturating_duration_since(entry.last_printed_at) < throttle => {
+            entry.suppressed_since_print += 1;
+            None
         }
-        _ => {
+        Some(entry) => {
+            let suppressed = entry.suppressed_since_print;
+            entry.last_printed_at = now;
+            entry.suppressed_since_print = 0;
+            Some(if suppressed > 0 {
+                format!(
+                    "{message}（过去 {}s 内同类提示又出现了 {suppressed} 次，已合并显示；Codex 仍在自动重试，多半是上游供应商暂时不稳定，不是本地代理的问题）",
+                    throttle.as_secs()
+                )
+            } else {
+                message
+            })
+        }
+        None => {
             state.insert(
                 key,
                 RepeatedLogState {
-                    last_message: message.clone(),
-                    repeat_count: 1,
+                    last_printed_at: now,
+                    suppressed_since_print: 0,
                 },
             );
             Some(message)
@@ -888,7 +919,15 @@ pub async fn handle_responses_upstream(
     let upstream_content_type = upstream.content_type;
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
-    let upstream_body = upstream.response.bytes().await?;
+    let upstream_body =
+        tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, upstream.response.bytes())
+            .await
+            .with_context(|| {
+                format!(
+                    "上游响应体读取超过 {} 秒未完成",
+                    UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                )
+            })??;
 
     if !(200..300).contains(&status_code) {
         let error =
@@ -4616,63 +4655,121 @@ pub fn apply_responses_context_budget(
 #[cfg(test)]
 mod repeated_log_tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
-    fn dedup_prints_first_occurrence_and_every_fifth_repeat() {
+    fn throttle_prints_first_occurrence_immediately() {
         let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
-        let key = "test_key";
-        let message = "same message".to_string();
-
-        // First occurrence always prints.
+        let now = Instant::now();
         assert_eq!(
-            dedup_repeated_log_line(&mut state, key, message.clone()),
-            Some(message.clone())
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "hello".to_string(),
+                now,
+                Duration::from_secs(3)
+            ),
+            Some("hello".to_string())
         );
-
-        // Repeats 2-4 are suppressed; the 5th repeat prints with a counter.
-        for _ in 0..3 {
-            assert_eq!(
-                dedup_repeated_log_line(&mut state, key, message.clone()),
-                None
-            );
-        }
-        let fifth = dedup_repeated_log_line(&mut state, key, message.clone());
-        assert!(fifth.is_some());
-        assert!(fifth.unwrap().contains("连续重复 5 次"));
-
-        // Repeats 6-9 suppressed again, 10th prints.
-        for _ in 0..4 {
-            assert_eq!(
-                dedup_repeated_log_line(&mut state, key, message.clone()),
-                None
-            );
-        }
-        let tenth = dedup_repeated_log_line(&mut state, key, message.clone());
-        assert!(tenth.unwrap().contains("连续重复 10 次"));
     }
 
     #[test]
-    fn dedup_resets_and_prints_immediately_when_message_changes() {
+    fn throttle_suppresses_bursts_within_the_window_even_if_wording_changes() {
+        // Simulates two interleaved conversations retrying against a
+        // struggling upstream: the reasoning-strip counts differ (111 vs
+        // 75) between attempts, but they're really the same underlying
+        // "upstream is unhappy" situation and should collapse together.
         let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
-        let key = "test_key";
+        let throttle = Duration::from_secs(3);
+        let t0 = Instant::now();
 
-        assert!(dedup_repeated_log_line(&mut state, key, "first".to_string()).is_some());
+        assert!(
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "cleaned 111 items".to_string(),
+                t0,
+                throttle
+            )
+            .is_some()
+        );
         assert_eq!(
-            dedup_repeated_log_line(&mut state, key, "first".to_string()),
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "cleaned 75 items".to_string(),
+                t0 + Duration::from_millis(200),
+                throttle
+            ),
             None
         );
-        // A different message always prints immediately, even mid-streak.
         assert_eq!(
-            dedup_repeated_log_line(&mut state, key, "second".to_string()),
-            Some("second".to_string())
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "cleaned 111 items".to_string(),
+                t0 + Duration::from_millis(400),
+                throttle
+            ),
+            None
         );
     }
 
     #[test]
-    fn dedup_keeps_independent_streaks_per_key() {
+    fn throttle_prints_again_after_window_elapses_with_suppressed_count() {
         let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
-        assert!(dedup_repeated_log_line(&mut state, "key_a", "msg".to_string()).is_some());
-        // A different key starts its own fresh streak even with the same message text.
-        assert!(dedup_repeated_log_line(&mut state, "key_b", "msg".to_string()).is_some());
+        let throttle = Duration::from_secs(3);
+        let t0 = Instant::now();
+
+        assert!(
+            throttle_repeated_log_line(&mut state, "key", "msg".to_string(), t0, throttle)
+                .is_some()
+        );
+        assert_eq!(
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "msg".to_string(),
+                t0 + Duration::from_millis(500),
+                throttle
+            ),
+            None
+        );
+        assert_eq!(
+            throttle_repeated_log_line(
+                &mut state,
+                "key",
+                "msg".to_string(),
+                t0 + Duration::from_secs(1),
+                throttle
+            ),
+            None
+        );
+
+        let after_window = throttle_repeated_log_line(
+            &mut state,
+            "key",
+            "msg".to_string(),
+            t0 + Duration::from_secs(4),
+            throttle,
+        );
+        let line = after_window.expect("should print once the throttle window elapses");
+        assert!(line.contains("又出现了 2 次"));
+    }
+
+    #[test]
+    fn throttle_keeps_independent_windows_per_key() {
+        let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
+        let throttle = Duration::from_secs(3);
+        let t0 = Instant::now();
+        assert!(
+            throttle_repeated_log_line(&mut state, "key_a", "msg".to_string(), t0, throttle)
+                .is_some()
+        );
+        // A different key prints immediately too, independent of key_a's window.
+        assert!(
+            throttle_repeated_log_line(&mut state, "key_b", "msg".to_string(), t0, throttle)
+                .is_some()
+        );
     }
 }
