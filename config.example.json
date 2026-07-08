@@ -6,7 +6,7 @@
     "apiKeyEnv": "CODEX_GATEWAY_API_KEY",
     "mode": "mixed_api",
     "protocol": "responses",
-    "contextBudget": ""
+    "contextBudget": "200K"
   },
   "model": "",
   "models": [],

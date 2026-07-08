@@ -146,7 +146,7 @@ export CODEX_GATEWAY_API_KEY="sk-..."
 
 | `provider.protocol` | Codex 看到的地址 | 适用场景 | 本地代理 |
 | --- | --- | --- | --- |
-| `responses` | 上游 Base URL | 供应商已支持 `/v1/responses` | 默认不启用；配置 `provider.contextBudget` 时启用 |
+| `responses` | 上游 Base URL；配置 `provider.contextBudget` 时改为 `http://127.0.0.1:57321/v1` | 供应商已支持 `/v1/responses` | 默认配置会启用，用于发上游前裁剪超长上下文；可用 `off` 关闭 |
 | `chat_completions` | `http://127.0.0.1:57321/v1` | 供应商只支持 `/v1/chat/completions` | 必须启用，由 agent 做协议转换 |
 
 如果显式填写 `provider.contextBudget`，Codex 会改走本地代理 `http://127.0.0.1:57321/v1`，由 agent 先裁剪上下文再转发到 Responses 上游。
@@ -163,6 +163,13 @@ export CODEX_GATEWAY_API_KEY="sk-..."
 - 其它整数 token 数
 
 自动拉取到的模型会默认写入上下文窗口：GPT/ChatGPT 系列为 `258400`，其他模型为 `1M`。
+
+`provider.contextBudget` 是发送上游前的估算输入 token 上限，不是文件大小。默认初始化为 `200K`；只有请求超过预算时才裁剪，裁剪策略会优先保留最后几轮、最后一条用户消息里的图片，并移除更早的图片和旧消息。支持这些写法：
+
+- `200`：按 `200K` 处理，方便交互里直接填常见预算值。
+- `200K` / `200KB`：都表示 200,000 个估算输入 token；这里的 `KB` 不是字节。
+- `200000`：明确 token 数。
+- `off` / `none` / `0`：关闭显式预算。`responses` 模式会回到直连，不做本地硬裁剪；`chat_completions` 仍会走本地代理，并按 `contextWindow` 自动推导预算。
 
 ## CLI commands
 
@@ -205,7 +212,7 @@ cargo run --manifest-path Cargo.toml -- uninstall-agent
 `agent` 会持续做这些事：
 
 - 启动或重新拉起 Codex App，并带上 `--remote-debugging-port`、`CODEX_HOME` 和 macOS `--user-data-dir`。
-- 仅在 `chat_completions` 或显式 `provider.contextBudget` 时启动本地协议代理 `http://127.0.0.1:57321/v1`。
+- 仅在 `chat_completions` 或已启用 `provider.contextBudget` 时启动本地协议代理 `http://127.0.0.1:57321/v1`。
 - 启动时 apply gateway/provider、`commonConfig` 公共配置和按当前 Codex schema 生成的 `model_catalog_json`。
 - 从同一个 `CODEX_HOME` 的 session/state 元数据重建本地 `local_thread_catalog`，减少切换启动方式后侧栏历史为空的问题。
 - 监听 `~/.codex-gateway-lite/config.json`，配置变化后重新 apply，并尝试通过 CDP 软刷新 Codex renderer。

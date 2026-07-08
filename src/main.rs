@@ -22,6 +22,7 @@ mod codex_lite;
 mod protocol_proxy;
 
 const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
+const DEFAULT_CONTEXT_BUDGET: &str = "200K";
 const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
 const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
 const PLAN_UI_INITIAL_HISTORY_SEED: bool = true;
@@ -982,7 +983,7 @@ fn build_profile(config: &LiteConfig) -> anyhow::Result<RelayProfile> {
 
 fn provider_uses_local_proxy(config: &LiteConfig) -> bool {
     config.provider.protocol == LiteProtocol::ChatCompletions
-        || !config.provider.context_budget.trim().is_empty()
+        || parse_context_budget_token(&config.provider.context_budget).is_some()
 }
 
 fn codex_provider_base_url(config: &LiteConfig) -> String {
@@ -1011,6 +1012,7 @@ fn validate_config(config: &LiteConfig) -> anyhow::Result<()> {
     if resolve_api_key(&config.provider)?.trim().is_empty() {
         bail!("API Key 为空；请设置 provider.apiKey 或 provider.apiKeyEnv");
     }
+    validate_context_budget_for_config(&config.provider.context_budget)?;
     Ok(())
 }
 
@@ -1053,10 +1055,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
         "2" => LiteProtocol::ChatCompletions,
         _ => LiteProtocol::Responses,
     };
-    let context_budget = prompt_default(
-        "上下文预算（显式填写才会启用本地代理硬裁剪；建议第三方模型设 128K~200K，留空则仅使用 Codex/model_catalog 自身窗口控制）",
-        "",
-    )?;
+    let context_budget = prompt_context_budget()?;
 
     println!("任务清单指引（Plan Hints）：");
     println!("  开启后，模型 catalog 的 base_instructions 会追加一段指引，");
@@ -1140,19 +1139,34 @@ fn model_from_numbered_choice(model_ids: &[String], choice: &str) -> Option<Stri
 
 fn print_context_budget_notice(config: &LiteConfig) {
     let budget = config.provider.context_budget.trim();
-    if !budget.is_empty() {
-        println!("上下文预算：{budget}；agent 会通过本地代理在发送上游前硬裁剪上下文。");
+    if let Some(tokens) = parse_context_budget_token(budget) {
+        println!(
+            "上下文预算：{}；agent 只在估算输入超过该值时，通过本地代理在发送上游前裁剪旧上下文。",
+            format_token_budget(tokens)
+        );
         return;
     }
     if config.provider.protocol == LiteProtocol::Responses {
         println!(
-            "上下文预算：未设置；Responses 直连不会启用本地硬裁剪。如需限制上传上下文，请运行 init --force 并填写 128K~200K。"
+            "上下文预算：未设置；Responses 直连不会启用本地硬裁剪。如需限制上传上下文，请运行 init --force 并保留默认 {DEFAULT_CONTEXT_BUDGET}，或手动填写 provider.contextBudget。"
         );
     } else {
         println!(
-            "上下文预算：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；也可运行 init --force 显式填写。"
+            "上下文预算：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；建议第三方 Claude 类模型显式填写 {DEFAULT_CONTEXT_BUDGET}。"
         );
     }
+}
+
+fn prompt_context_budget() -> anyhow::Result<String> {
+    println!("上下文预算说明：");
+    println!("  - 这是发送给上游前的估算输入 token 上限，不是 KB 文件大小。");
+    println!(
+        "  - 默认 {DEFAULT_CONTEXT_BUDGET}；只有超过预算时才裁剪，优先保留最后几轮和最后一条用户消息图片。"
+    );
+    println!("  - 可输入 200、200K、200KB、200000；纯数字 200 会按 200K 处理。");
+    println!("  - 如需关闭显式预算，请输入 off。");
+    let raw = prompt_default("上下文预算", DEFAULT_CONTEXT_BUDGET)?;
+    normalize_context_budget_for_config(&raw)
 }
 
 fn write_lite_config(path: &Path, config: &LiteConfig) -> anyhow::Result<()> {
@@ -1400,6 +1414,32 @@ fn normalize_window_for_config(value: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("窗口值不合法：{trimmed}，请使用 1M / 200K / 1000000"))
 }
 
+fn normalize_context_budget_for_config(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if context_budget_is_disabled(trimmed) {
+        return Ok(String::new());
+    }
+    parse_context_budget_token(trimmed)
+        .map(format_token_budget)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "上下文预算不合法：{trimmed}，请使用 200 / 200K / 200KB / 200000，或输入 off 关闭"
+            )
+        })
+}
+
+fn validate_context_budget_for_config(value: &str) -> anyhow::Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || context_budget_is_disabled(trimmed) {
+        return Ok(());
+    }
+    parse_context_budget_token(trimmed).map(|_| ()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider.contextBudget 不合法：{trimmed}，请使用 200 / 200K / 200KB / 200000，或 off/none/0 关闭"
+        )
+    })
+}
+
 fn parse_window_token(token: &str) -> Option<u64> {
     let token = token.trim();
     if token.is_empty() {
@@ -1417,6 +1457,55 @@ fn parse_window_token(token: &str) -> Option<u64> {
         .ok()
         .map(|value| value * multiplier)
         .filter(|value| *value > 0)
+}
+
+fn parse_context_budget_token(token: &str) -> Option<u64> {
+    let compact = token
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if compact.is_empty() || context_budget_is_disabled(&compact) {
+        return None;
+    }
+
+    let (number, multiplier) = if let Some(number) = compact.strip_suffix("kb") {
+        (number, 1_000u64)
+    } else if let Some(number) = compact.strip_suffix('k') {
+        (number, 1_000u64)
+    } else if let Some(number) = compact.strip_suffix("mb") {
+        (number, 1_000_000u64)
+    } else if let Some(number) = compact.strip_suffix('m') {
+        (number, 1_000_000u64)
+    } else {
+        (compact.as_str(), 1u64)
+    };
+
+    let raw = number.trim().parse::<u64>().ok()?;
+    let tokens = if multiplier == 1 && raw <= 512 {
+        raw.saturating_mul(1_000)
+    } else {
+        raw.saturating_mul(multiplier)
+    };
+    (tokens > 0).then_some(tokens)
+}
+
+fn context_budget_is_disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "off" | "none" | "no" | "false" | "disable" | "disabled"
+    )
+}
+
+fn format_token_budget(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn sanitize_provider_id(value: &str) -> String {
@@ -4666,10 +4755,8 @@ fn protocol_proxy_upstream_from_config(
 }
 
 fn resolve_context_budget(config: &LiteConfig) -> protocol_proxy::ContextBudgetConfig {
-    if !config.provider.context_budget.trim().is_empty() {
-        if let Some(tokens) = parse_window_token(config.provider.context_budget.trim()) {
-            return protocol_proxy::ContextBudgetConfig::with_max_tokens(tokens);
-        }
+    if let Some(tokens) = parse_context_budget_token(&config.provider.context_budget) {
+        return protocol_proxy::ContextBudgetConfig::with_max_tokens(tokens);
     }
     if !config.context_window.trim().is_empty() {
         if let Some(tokens) = parse_window_token(config.context_window.trim()) {
@@ -4811,6 +4898,7 @@ async fn run_agent(
     };
     let config = read_lite_config(&config_path)
         .with_context(|| format!("读取 Lite 配置失败：{}", config_path.display()))?;
+    validate_context_budget_for_config(&config.provider.context_budget)?;
     if provider_uses_local_proxy(&config) {
         println!(
             "当前配置需要本地协议代理，准备监听 127.0.0.1:{}",
@@ -10600,7 +10688,11 @@ model_catalog_json = "model-catalogs/gateway.json"
     fn agent_starts_local_protocol_proxy_only_when_needed() {
         let source = include_str!("main.rs");
         assert!(source.contains("fn provider_uses_local_proxy(config: &LiteConfig) -> bool"));
-        assert!(source.contains("|| !config.provider.context_budget.trim().is_empty()"));
+        assert!(
+            source.contains(
+                "|| parse_context_budget_token(&config.provider.context_budget).is_some()"
+            )
+        );
         assert!(source.contains("Responses 直连模式：不启动本地协议代理 127.0.0.1:57321"));
         assert!(source.contains("fn print_context_budget_notice(config: &LiteConfig)"));
         assert!(source.contains("Responses 直连不会启用本地硬裁剪"));
@@ -11688,6 +11780,43 @@ mod context_budget_tests {
         };
         let budget = resolve_context_budget(&config);
         assert_eq!(budget.max_input_tokens, 200_000);
+    }
+
+    #[test]
+    fn context_budget_accepts_user_friendly_units() {
+        assert_eq!(parse_context_budget_token("200"), Some(200_000));
+        assert_eq!(parse_context_budget_token("200K"), Some(200_000));
+        assert_eq!(parse_context_budget_token("200kb"), Some(200_000));
+        assert_eq!(parse_context_budget_token("200000"), Some(200_000));
+        assert_eq!(
+            normalize_context_budget_for_config("200 kb").unwrap(),
+            "200K"
+        );
+    }
+
+    #[test]
+    fn context_budget_off_disables_explicit_proxy_for_responses() {
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "test".to_string(),
+                name: String::new(),
+                base_url: "https://api.example.com".to_string(),
+                api_key: "sk-test".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::Responses,
+                context_budget: "off".to_string(),
+            },
+            model: String::new(),
+            models: vec![LiteModel::Id("model".to_string())],
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+        };
+        assert!(!provider_uses_local_proxy(&config));
+        assert_eq!(normalize_context_budget_for_config("off").unwrap(), "");
+        assert!(validate_context_budget_for_config("off").is_ok());
     }
 
     #[test]
