@@ -22,8 +22,8 @@ function Write-Header {
   Write-Host "╭────────────────────────────────────────────╮" -ForegroundColor Cyan
   Write-Host "│        Codex Gateway Lite Bootstrap        │" -ForegroundColor Cyan
   Write-Host "╰────────────────────────────────────────────╯" -ForegroundColor Cyan
-  Write-Host "项目目录：$RepoRoot" -ForegroundColor DarkGray
-  Write-Host "配置文件：$ConfigFile" -ForegroundColor DarkGray
+  Write-Host "Project dir: $RepoRoot" -ForegroundColor DarkGray
+  Write-Host "Config file: $ConfigFile" -ForegroundColor DarkGray
   Write-Host ""
 }
 
@@ -363,16 +363,25 @@ function Ensure-LiteBinary {
   }
 }
 
+function Test-InteractiveLiteCommand([string[]]$ArgsList) {
+  if ($ArgsList.Count -eq 0) { return $false }
+  return $ArgsList[0] -in @("agent", "init")
+}
+
 function Run-Lite([string[]]$ArgsList) {
   Ensure-LiteBinary
-  if ($ArgsList.Count -gt 0 -and $ArgsList[0] -eq "agent") {
-    Write-Info "agent 将保持前台运行；关闭此窗口或按 Ctrl+C 会停止 agent。"
+  if (Test-InteractiveLiteCommand $ArgsList) {
+    if ($ArgsList[0] -eq "agent") {
+      Write-Info "agent 将保持前台运行；关闭此窗口或按 Ctrl+C 会停止 agent。"
+    }
     & $LiteBin @ArgsList
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
       Write-Warn "codex-gateway-lite 子命令退出码：$exitCode"
       Write-Info "可手动复现：`"$LiteBin`" $($ArgsList -join ' ')"
-      Run-AgentDiagnostics
+      if ($ArgsList[0] -eq "agent") {
+        Run-AgentDiagnostics
+      }
       Fail "codex-gateway-lite 命令失败： $($ArgsList -join ' ')"
     }
     return

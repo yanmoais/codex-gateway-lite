@@ -6644,7 +6644,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 43;
+  const SCRIPT_VERSION = 44;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -6921,6 +6921,36 @@ const PLAN_UI_SCRIPT: &str = r#"
     if (/^\+/.test(token)) return "rgb(0, 166, 65)";
     if (/^-/.test(token)) return "rgb(220, 38, 38)";
     return "";
+  }
+
+  function existingMetaColor(snapshot, token) {
+    const value = String(token || "");
+    const parts = Array.isArray(snapshot?.metaParts) ? snapshot.metaParts : [];
+    const exact = parts.find((part) => String(part?.text || "") === value && safeCssColor(part?.color));
+    if (exact) return exact.color;
+    if (progressPattern.test(value)) {
+      const progressPart = parts.find((part) => progressPattern.test(String(part?.text || "")) && safeCssColor(part?.color));
+      if (progressPart) return progressPart.color;
+    }
+    return "";
+  }
+
+  function metaPartsFromProgressDetail(progress, detail, colorForPart = () => "") {
+    const parts = [];
+    if (progress) {
+      parts.push({ text: progress, color: colorForPart(progress) });
+    }
+    if (detail) {
+      if (parts.length) parts.push({ text: " · ", color: "" });
+      String(detail).split(/([+-]\d[\d,]*)/g).forEach((part) => {
+        if (!part) return;
+        const color = /^[+-]\d[\d,]*$/.test(part)
+          ? (colorForPart(part) || fallbackDeltaColor(part))
+          : colorForPart(part);
+        parts.push({ text: part, color });
+      });
+    }
+    return parts;
   }
 
   function safeIconHtml(value) {
@@ -7374,13 +7404,13 @@ const PLAN_UI_SCRIPT: &str = r#"
     if (!match) return null;
     const progress = match[1].replace(/\s+/g, " ").trim();
     const detail = String(match[2] || "").replace(/\s+/g, " ").trim();
-    if (detail && !/^(?:\d+\s*个文件已更改(?:\s*[+-]\d+){0,4}|[+-]\d+(?:\s*[+-]\d+){0,3})$/.test(detail)) return null;
+    if (detail && !/^(?:\d+\s*个文件已更改(?:\s*[+-]\d[\d,]*){0,4}|[+-]\d[\d,]*(?:\s*[+-]\d[\d,]*){0,3})$/.test(detail)) return null;
     return { value: detail ? `${progress} · ${detail}` : progress, progress, detail };
   }
 
   function extractFileChangeDetail(value) {
     const normalized = String(value || "").replace(/\s+/g, " ").trim();
-    const match = normalized.match(/(?:^|[·•\s])(\d+\s*个文件已更改(?:\s*[+-]\d+){0,4}|[+-]\d+(?:\s*[+-]\d+){0,3})(?:$|\s)/);
+    const match = normalized.match(/(?:^|[·•\s])(\d+\s*个文件已更改(?:\s*[+-]\d[\d,]*){0,4}|[+-]\d[\d,]*(?:\s*[+-]\d[\d,]*){0,3})(?:$|\s)/);
     if (!match) return "";
     return match[1].replace(/\s+/g, " ").trim();
   }
@@ -7801,21 +7831,29 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function metaPartsFromPill(pill, progress, detail) {
-    const parts = [];
-    if (progress) {
-      parts.push({ text: progress, color: colorForToken(pill, progress) });
-    }
-    if (detail) {
-      if (parts.length) parts.push({ text: " · ", color: "" });
-      String(detail).split(/([+-]\d+)/g).forEach((part) => {
-        if (!part) return;
-        const color = /^[+-]\d+$/.test(part)
-          ? (colorForToken(pill, part) || fallbackDeltaColor(part))
-          : "";
-        parts.push({ text: part, color });
-      });
-    }
-    return parts;
+    return metaPartsFromProgressDetail(progress, detail, (part) => colorForToken(pill, part));
+  }
+
+  function metaPartsFromSnapshot(snapshot) {
+    return metaPartsFromProgressDetail(
+      snapshot?.progress || "",
+      snapshot?.detail || "",
+      (part) => existingMetaColor(snapshot, part)
+    );
+  }
+
+  function environmentChangeDetail() {
+    const panel = environmentPanelInfo()?.node;
+    if (!panel) return "";
+    return extractFileChangeDetail(text(panel));
+  }
+
+  function renderSnapshotForRows(snapshot, rows) {
+    const normalized = normalizedSnapshotForRows(snapshot, rows);
+    if (!normalized || typeof normalized !== "object") return normalized;
+    const detail = environmentChangeDetail() || normalized.detail || "";
+    const next = { ...normalized, detail };
+    return { ...next, metaParts: metaPartsFromSnapshot(next) };
   }
 
   function snapshotFromExternal(base, threadId) {
@@ -7968,7 +8006,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       const childRect = node.getBoundingClientRect();
       contentBottom = Math.max(contentBottom, childRect.bottom);
     });
-    return { rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
+    return { node: panel, rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
   }
 
   function rightRailFallbackPanelInfo() {
@@ -8129,7 +8167,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       return;
     }
     const rows = rowsForSnapshot(snapshot);
-    const normalizedSnapshot = normalizedSnapshotForRows(snapshot, rows);
+    const normalizedSnapshot = renderSnapshotForRows(snapshot, rows);
     const signature = renderSignature(normalizedSnapshot, rows);
     const sourceTurnId = normalizedSnapshot?.sourceTurnId || "";
     dock.hidden = false;
@@ -9361,6 +9399,58 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_render_meta_uses_normalized_progress_and_environment_delta() {
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                const envPanel = {
+                    nodeType: 1,
+                    id: "",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 240, left: 1100, right: 1428, top: 90, bottom: 330 };
+                    },
+                    textContent: "环境信息 变更 +431 -34 本地 main 提交或推送 来源 暂无来源"
+                };
+                document.querySelectorAll = function (selector) {
+                    return String(selector).includes("aside") ? [envPanel] : [];
+                };
+                document.elementFromPoint = function () { return envPanel; };
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                hooks.renderDock({
+                    threadId: "visible:unknown",
+                    progress: "第 1 / 4 步",
+                    detail: "",
+                    metaParts: [{ text: "第 1 / 4 步", color: "rgb(1, 2, 3)" }],
+                    rows: [
+                        { text: "读取本地交接和启动脚本线索", status: "done", iconHtml: "" },
+                        { text: "定位 Windows 卡住与中文重复输出原因", status: "done", iconHtml: "" },
+                        { text: "修复脚本并补充轻量验证", status: "done", iconHtml: "" },
+                        { text: "运行格式化/测试并汇报变更", status: "done", iconHtml: "" }
+                    ],
+                    at: Date.now()
+                });
+                return JSON.stringify({
+                    hidden: dock.hidden,
+                    html: dock.innerHTML
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["hidden"], serde_json::json!(false));
+        let html = result["html"].as_str().unwrap_or_default();
+        assert!(html.contains("第 4 / 4 步"), "{html}");
+        assert!(!html.contains("第 1 / 4 步"), "{html}");
+        assert!(html.contains("+431"), "{html}");
+        assert!(html.contains("-34"), "{html}");
+    }
+
+    #[test]
     fn plan_ui_keeps_dock_visible_when_right_panel_exists_without_click() {
         // 历史会话打开时，Codex 右侧可能已有“输出/来源”面板；这个面板只是被动存在，
         // 不应该被当成用户点击右侧展开内容，否则任务卡片会先出现、下一轮重渲染又消失。
@@ -10285,7 +10375,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 43"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 44"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -10377,7 +10467,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 43"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 44"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
@@ -10540,6 +10630,13 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(
             windows_script.contains("cargo build --quiet --release --manifest-path \"Cargo.toml\"")
         );
+        assert!(windows_script.contains("function Test-InteractiveLiteCommand"));
+        assert!(windows_script.contains("@(\"agent\", \"init\")"));
+        assert!(windows_script.contains("if (Test-InteractiveLiteCommand $ArgsList)"));
+        assert!(windows_script.contains("Project dir: $RepoRoot"));
+        assert!(windows_script.contains("Config file: $ConfigFile"));
+        assert!(!windows_script.contains("项目目录：$RepoRoot"));
+        assert!(!windows_script.contains("配置文件：$ConfigFile"));
     }
 
     #[test]
