@@ -12236,4 +12236,76 @@ mod responses_budget_tests {
         assert_eq!(last["content"].as_str().unwrap(), "Current question");
         let _ = report;
     }
+
+    #[test]
+    fn responses_budget_strips_stale_reasoning_from_completed_turns() {
+        // Simulates a mid-conversation model switch / client-side context
+        // compaction: an older, completed turn still carries a Claude
+        // `thinking` block (represented here as a Responses `reasoning`
+        // item). Anthropic rejects this with HTTP 400 unless it is dropped
+        // before relaying, since it can no longer be replayed byte-for-byte.
+        let budget = crate::protocol_proxy::ContextBudgetConfig::default();
+        let mut body = json!({
+            "model": "test",
+            "input": [
+                { "role": "user", "content": "old question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_stale",
+                    "summary": [{ "type": "summary_text", "text": "stale thinking" }]
+                },
+                { "role": "assistant", "content": "old answer" },
+                { "role": "user", "content": "new question after model switch" }
+            ]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert_eq!(report.stale_reasoning_items_stripped, 1);
+
+        let items = body["input"].as_array().unwrap();
+        let has_reasoning = items
+            .iter()
+            .any(|i| i.get("type").and_then(|v| v.as_str()) == Some("reasoning"));
+        assert!(
+            !has_reasoning,
+            "stale reasoning item should have been removed"
+        );
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn responses_budget_keeps_in_flight_reasoning_after_last_user_message() {
+        // Reasoning that belongs to the still-open tool-call loop of the
+        // *current* turn (i.e. after the last user message) must be left
+        // completely untouched, since Anthropic requires it for interleaved
+        // thinking + tool use within a single turn.
+        let budget = crate::protocol_proxy::ContextBudgetConfig::default();
+        let mut body = json!({
+            "model": "test",
+            "input": [
+                { "role": "user", "content": "old question" },
+                { "role": "assistant", "content": "old answer" },
+                { "role": "user", "content": "current question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_live",
+                    "summary": [{ "type": "summary_text", "text": "live thinking" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{}"
+                }
+            ]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert_eq!(report.stale_reasoning_items_stripped, 0);
+
+        let items = body["input"].as_array().unwrap();
+        let has_reasoning = items
+            .iter()
+            .any(|i| i.get("type").and_then(|v| v.as_str()) == Some("reasoning"));
+        assert!(has_reasoning, "in-flight reasoning must be preserved");
+        assert_eq!(items.len(), 5);
+    }
 }

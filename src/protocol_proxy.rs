@@ -192,6 +192,10 @@ pub struct ContextBudgetReport {
     pub images_stripped: usize,
     pub messages_removed: usize,
     pub was_trimmed: bool,
+    /// Count of stale `reasoning` items stripped from completed prior turns
+    /// (see `strip_stale_reasoning_items`). Independent of `was_trimmed`,
+    /// which only reflects token-budget trimming.
+    pub stale_reasoning_items_stripped: usize,
 }
 
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
@@ -690,6 +694,12 @@ fn upstream_request_parts(
         RelayProtocol::Responses => {
             let mut body = request_json;
             let report = apply_responses_context_budget(&mut body, &relay.context_budget);
+            if report.stale_reasoning_items_stripped > 0 {
+                eprintln!(
+                    "Responses 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
+                    report.stale_reasoning_items_stripped,
+                );
+            }
             if report.was_trimmed {
                 eprintln!(
                     "Responses 上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条项目）",
@@ -4349,13 +4359,53 @@ fn find_responses_recent_boundary(items: &[Value], min_turns: usize) -> usize {
     0
 }
 
+/// Strip `type: "reasoning"` items that belong to *completed* prior turns
+/// from a Responses API `input` array before relaying upstream.
+///
+/// Anthropic's Messages API requires `thinking`/`redacted_thinking` blocks in
+/// the *latest* assistant message to be replayed byte-for-byte exactly as
+/// originally returned. Client-side context compaction (Codex's own history
+/// summarization) or a mid-conversation model switch can rebuild/merge an
+/// older assistant turn while it still carries a stale reasoning item,
+/// which Anthropic then rejects with an HTTP 400
+/// (`thinking blocks ... cannot be modified`). Reasoning content from
+/// completed turns isn't needed to continue the conversation — the model
+/// re-derives its own reasoning for the *current* turn — so it is always
+/// safe to drop it here, as long as the still-open tail of the conversation
+/// (everything from the last user message onward, e.g. an in-flight
+/// tool-call loop within the current turn) is left completely untouched.
+fn strip_stale_reasoning_items(items: &mut Vec<Value>) -> usize {
+    let mut boundary = items
+        .iter()
+        .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let mut removed = 0usize;
+    let mut i = 0usize;
+    while i < boundary {
+        if items[i].get("type").and_then(Value::as_str) == Some("reasoning") {
+            items.remove(i);
+            boundary -= 1;
+            removed += 1;
+        } else {
+            i += 1;
+        }
+    }
+    removed
+}
+
 /// Apply context budget trimming directly on a Responses API request body.
 pub fn apply_responses_context_budget(
     body: &mut Value,
     budget: &ContextBudgetConfig,
 ) -> ContextBudgetReport {
+    let mut report = ContextBudgetReport::default();
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        report.stale_reasoning_items_stripped = strip_stale_reasoning_items(items);
+    }
+
     if budget.is_unlimited() {
-        return ContextBudgetReport::default();
+        return report;
     }
     let image_est = budget.image_token_estimate.max(1);
 
@@ -4371,15 +4421,13 @@ pub fn apply_responses_context_budget(
             .and_then(Value::as_str)
             .map(estimate_text_tokens)
             .unwrap_or(0);
-        return ContextBudgetReport {
-            original_estimated_tokens: instructions_tokens + text_tokens,
-            final_estimated_tokens: instructions_tokens + text_tokens,
-            ..Default::default()
-        };
+        report.original_estimated_tokens = instructions_tokens + text_tokens;
+        report.final_estimated_tokens = instructions_tokens + text_tokens;
+        return report;
     }
 
     let Some(items) = body.get("input").and_then(Value::as_array) else {
-        return ContextBudgetReport::default();
+        return report;
     };
 
     let item_tokens: Vec<u64> = items
@@ -4389,19 +4437,14 @@ pub fn apply_responses_context_budget(
     let original = instructions_tokens + item_tokens.iter().sum::<u64>();
 
     if original <= budget.max_input_tokens {
-        return ContextBudgetReport {
-            original_estimated_tokens: original,
-            final_estimated_tokens: original,
-            ..Default::default()
-        };
+        report.original_estimated_tokens = original;
+        report.final_estimated_tokens = original;
+        return report;
     }
 
     let items = body.get_mut("input").and_then(Value::as_array_mut).unwrap();
-    let mut report = ContextBudgetReport {
-        original_estimated_tokens: original,
-        was_trimmed: true,
-        ..Default::default()
-    };
+    report.original_estimated_tokens = original;
+    report.was_trimmed = true;
 
     // Phase 1: Strip images from older items (keep last 2 user items' images).
     let mut recent_user_seen = 0usize;
