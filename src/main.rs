@@ -24,6 +24,7 @@ mod protocol_proxy;
 const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
 const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
 const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
+const PLAN_UI_INITIAL_HISTORY_SEED: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -692,7 +693,8 @@ fn apply_config(
         .join("model-catalogs")
         .join(format!("{}.json", sanitize_catalog_filename(&profile.id)));
     let session_file_count = count_session_files(&home).ok();
-    let thread_catalog_sync = match sync_local_thread_catalog_for_provider(&home, Some(&profile.id)) {
+    let thread_catalog_sync = match sync_local_thread_catalog_for_provider(&home, Some(&profile.id))
+    {
         Ok(report) => Some(report),
         Err(error) => {
             eprintln!("同步 Codex 历史会话索引失败，继续启动：{error:#}");
@@ -2346,7 +2348,10 @@ fn normalize_rollout_session_meta_providers(
     Ok(changed)
 }
 
-fn normalize_rollout_session_meta_provider(path: &Path, active_model_provider: &str) -> anyhow::Result<bool> {
+fn normalize_rollout_session_meta_provider(
+    path: &Path,
+    active_model_provider: &str,
+) -> anyhow::Result<bool> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -2390,9 +2395,7 @@ fn normalize_rollout_session_meta_provider(path: &Path, active_model_provider: &
     }
     let temp_path = path.with_extension(format!(
         "{}.tmp",
-        path.extension()
-            .and_then(OsStr::to_str)
-            .unwrap_or("jsonl")
+        path.extension().and_then(OsStr::to_str).unwrap_or("jsonl")
     ));
     fs::write(&temp_path, rewritten)
         .with_context(|| format!("写入临时 rollout 失败：{}", temp_path.display()))?;
@@ -2412,15 +2415,13 @@ fn rollout_path_belongs_to_home_sessions(home: &Path, path: &Path) -> bool {
 }
 
 fn strip_windows_extended_prefix(value: &str) -> String {
-    value
-        .strip_prefix(r"\\?\")
-        .unwrap_or(value)
-        .to_string()
+    value.strip_prefix(r"\\?\").unwrap_or(value).to_string()
 }
 
 fn codex_home_model_provider(home: &Path) -> Option<String> {
     let config_text = fs::read_to_string(home.join("config.toml")).ok()?;
-    root_config_string_value(&config_text, "model_provider").and_then(|value| non_empty_string(&value))
+    root_config_string_value(&config_text, "model_provider")
+        .and_then(|value| non_empty_string(&value))
 }
 
 fn native_model_provider(value: &str, active_model_provider: Option<&str>) -> String {
@@ -2547,7 +2548,8 @@ async fn soft_reload_codex(debug_port: u16) -> anyhow::Result<()> {
 async fn wait_and_inject_plan_ui(debug_port: u16, codex_home: Option<&Path>) -> anyhow::Result<()> {
     let mut last_error = None;
     for _ in 0..40 {
-        match inject_plan_ui_inner(debug_port, true, false, codex_home).await {
+        match inject_plan_ui_inner(debug_port, true, PLAN_UI_INITIAL_HISTORY_SEED, codex_home).await
+        {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -2644,10 +2646,9 @@ async fn seed_active_plan_ui_history_snapshot_if_needed(
         return Ok(());
     };
     let now = Instant::now();
-    if recent_attempts
-        .get(&thread_id)
-        .is_some_and(|previous| previous.elapsed() < Duration::from_secs(PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS))
-    {
+    if recent_attempts.get(&thread_id).is_some_and(|previous| {
+        previous.elapsed() < Duration::from_secs(PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS)
+    }) {
         return Ok(());
     }
     recent_attempts.insert(thread_id.clone(), now);
@@ -2863,8 +2864,9 @@ fn collect_plan_ui_history_snapshot_for_thread(
         .collect::<Vec<_>>()
         .join(", ");
         for candidate_id in &candidates {
-            let mut statement =
-                conn.prepare(&format!("SELECT {selected} FROM threads WHERE id = ?1 LIMIT 1"))?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT {selected} FROM threads WHERE id = ?1 LIMIT 1"
+            ))?;
             let row = statement
                 .query_row([candidate_id], |row| {
                     let found_id = row_string(row, 0).unwrap_or_else(|| candidate_id.clone());
@@ -2900,10 +2902,9 @@ fn collect_plan_ui_history_snapshot_for_thread(
                 rollout_path: path,
                 updated_at_ms,
             };
-            if best
-                .as_ref()
-                .map_or(true, |previous| entry.updated_at_ms >= previous.updated_at_ms)
-            {
+            if best.as_ref().map_or(true, |previous| {
+                entry.updated_at_ms >= previous.updated_at_ms
+            }) {
                 best = Some(entry);
             }
         }
@@ -4992,8 +4993,9 @@ async fn run_agent(
             if config_changed {
                 active_plan_seed_attempts.clear();
             }
+            let seed_history = should_seed_plan_ui_history_on_reinject(config_changed);
             if let Err(error) =
-                inject_plan_ui_inner(debug_port, false, false, codex_home.as_deref()).await
+                inject_plan_ui_inner(debug_port, false, seed_history, codex_home.as_deref()).await
             {
                 eprintln!("任务清单 UI 重注入失败：{error:#}");
                 cdp_was_ready = false;
@@ -5078,8 +5080,13 @@ async fn watch(
                     {
                         eprintln!("Lite 模型白名单注入失败：{error:#}");
                     }
-                    if let Err(error) =
-                        inject_plan_ui_inner(debug_port, true, false, codex_home.as_deref()).await
+                    if let Err(error) = inject_plan_ui_inner(
+                        debug_port,
+                        true,
+                        PLAN_UI_INITIAL_HISTORY_SEED,
+                        codex_home.as_deref(),
+                    )
+                    .await
                     {
                         eprintln!("任务清单 UI 注入失败：{error:#}");
                     }
@@ -5089,6 +5096,10 @@ async fn watch(
         }
         tokio::time::sleep(Duration::from_millis(interval_ms.max(250))).await;
     }
+}
+
+fn should_seed_plan_ui_history_on_reinject(config_changed: bool) -> bool {
+    config_changed
 }
 
 fn file_modified(path: &Path) -> anyhow::Result<SystemTime> {
@@ -10369,16 +10380,31 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 43"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
-        assert!(PLAN_UI_SCRIPT.contains("const observer = new MutationObserver(scheduleApplyForMutations)"));
-        assert!(PLAN_UI_SCRIPT.contains("window.__codexGatewayLitePlanUiResize = scheduleApplyImmediate"));
+        assert!(
+            PLAN_UI_SCRIPT
+                .contains("const observer = new MutationObserver(scheduleApplyForMutations)")
+        );
+        assert!(
+            PLAN_UI_SCRIPT
+                .contains("window.__codexGatewayLitePlanUiResize = scheduleApplyImmediate")
+        );
         assert!(PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS >= 10);
-        assert!(PLAN_UI_ACTIVE_THREAD_NEEDS_SEED_SCRIPT.contains("__codexGatewayLitePlanUiActiveSeedRequest"));
+        assert!(
+            PLAN_UI_ACTIVE_THREAD_NEEDS_SEED_SCRIPT
+                .contains("__codexGatewayLitePlanUiActiveSeedRequest")
+        );
         assert!(PLAN_UI_SCRIPT.contains("activeHistorySeedRequest"));
-        assert!(PLAN_UI_SCRIPT.contains("window.__codexGatewayLitePlanUiActiveSeedRequest = activeHistorySeedRequest"));
+        assert!(PLAN_UI_SCRIPT.contains(
+            "window.__codexGatewayLitePlanUiActiveSeedRequest = activeHistorySeedRequest"
+        ));
         assert!(PLAN_UI_SCRIPT.contains("RIGHT_RAIL_FOLLOW_FRAME_MS"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyBurst()"));
         assert!(PLAN_UI_SCRIPT.contains("continueRightRailFollow()"));
-        assert!(PLAN_UI_SCRIPT.contains("window.addEventListener(\"transitionend\", handleRightPanelDismissEvent"));
+        assert!(
+            PLAN_UI_SCRIPT.contains(
+                "window.addEventListener(\"transitionend\", handleRightPanelDismissEvent"
+            )
+        );
         assert!(!PLAN_UI_SCRIPT.contains("PLAN_UI_HISTORY_RESEED_INTERVAL_SECS"));
         assert!(!PLAN_UI_SCRIPT.contains("characterData: true"));
         assert!(PLAN_UI_REINJECT_INTERVAL_SECS >= 30);
@@ -10462,6 +10488,13 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(!PLAN_UI_SCRIPT.contains("cleanupUnsafeMarks"));
         assert!(!PLAN_UI_SCRIPT.contains("[${MARK}=\"pill\"]"));
         assert!(!PLAN_UI_SCRIPT.contains("[${MARK}=\"container\"]"));
+    }
+
+    #[test]
+    fn plan_ui_history_seed_runs_for_initial_and_reload_injection() {
+        assert!(PLAN_UI_INITIAL_HISTORY_SEED);
+        assert!(should_seed_plan_ui_history_on_reinject(true));
+        assert!(!should_seed_plan_ui_history_on_reinject(false));
     }
 
     #[test]
