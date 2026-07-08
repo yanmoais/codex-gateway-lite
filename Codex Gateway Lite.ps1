@@ -245,20 +245,31 @@ function Test-VSBuildTools {
   return $false
 }
 
+function Install-VSBuildToolsViaDirectInstaller([string]$WorkloadArgs) {
+  $installer = Join-Path $env:TEMP "vs_BuildTools.exe"
+  Download-File "https://aka.ms/vs/17/release/vs_BuildTools.exe" $installer "Visual Studio Build Tools"
+  $proc = Start-Process -FilePath $installer -ArgumentList $WorkloadArgs -Wait -PassThru
+  if ($proc.ExitCode -notin @(0, 3010)) { Fail "Visual Studio Build Tools 安装失败：exit $($proc.ExitCode)" }
+}
+
 function Ensure-VSBuildTools {
   if (Test-VSBuildTools) {
     Write-Ok "Microsoft C++ Build Tools 已可用"
     return
   }
-  Write-Warn "未检测到 Microsoft C++ Build Tools，开始安装 VC++ build tools。"
-  $args = "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --norestart"
+  Write-Warn "未检测到 Microsoft C++ Build Tools（缺少 C++ 桌面开发工作负载），开始安装 VC++ build tools。"
+  $workloadArgs = "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --norestart"
   if (Test-Command winget) {
-    winget install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-package-agreements --accept-source-agreements --override $args
+    winget install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-package-agreements --accept-source-agreements --override $workloadArgs
   } else {
-    $installer = Join-Path $env:TEMP "vs_BuildTools.exe"
-    Download-File "https://aka.ms/vs/17/release/vs_BuildTools.exe" $installer "Visual Studio Build Tools"
-    $proc = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
-    if ($proc.ExitCode -notin @(0, 3010)) { Fail "Visual Studio Build Tools 安装失败：exit $($proc.ExitCode)" }
+    Install-VSBuildToolsViaDirectInstaller $workloadArgs
+  }
+  if (-not (Test-VSBuildTools)) {
+    # winget 只会在包本身有新版本时才把 --override 参数透传给安装器；如果 Build Tools
+    # 这个包 ID 已经存在（哪怕没装 C++ 工作负载），winget 会当成"无可用升级"直接跳过，
+    # 导致 C++ 工作负载始终没被补装。这时改用官方安装器以“修改现有安装”的方式直接补装。
+    Write-Warn "winget 未能补齐 C++ 工作负载（已安装的 Build Tools 包判定为无需升级），改用官方安装器直接补装工作负载。"
+    Install-VSBuildToolsViaDirectInstaller $workloadArgs
   }
   if (-not (Test-VSBuildTools)) {
     Fail "Microsoft C++ Build Tools 仍不可用。如果安装器要求重启，请重启后重新运行脚本。"

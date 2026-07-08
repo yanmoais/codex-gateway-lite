@@ -10857,6 +10857,10 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Test-CargoDepsFresh"));
         assert!(windows_script.contains("target\\.codex-gateway-lite\\cargo-fetch.stamp"));
         assert!(windows_script.contains("Rust 依赖已就绪（跳过 cargo fetch）"));
+        assert!(windows_script.contains("function Install-VSBuildToolsViaDirectInstaller"));
+        assert!(windows_script.contains(
+            "winget 未能补齐 C++ 工作负载（已安装的 Build Tools 包判定为无需升级），改用官方安装器直接补装工作负载。"
+        ));
     }
 
     #[test]
