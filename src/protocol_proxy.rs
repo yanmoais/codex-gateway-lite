@@ -713,7 +713,7 @@ static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState
 /// stays quiet for exact repeats, and surfaces a running counter every 5th
 /// repeat so BOSS can still see the retry is ongoing (and that the upstream,
 /// not this proxy, is what needs to recover).
-fn log_upstream_event_deduped(key: &'static str, message: String) {
+pub fn log_upstream_event_deduped(key: &'static str, message: String) {
     let mut state = REPEATED_LOG_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

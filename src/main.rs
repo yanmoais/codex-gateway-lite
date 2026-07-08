@@ -4966,6 +4966,19 @@ fn method_not_allowed_response() -> protocol_proxy::ProxyHttpResponse {
 }
 
 fn protocol_proxy_error_response(error: &anyhow::Error) -> protocol_proxy::ProxyHttpResponse {
+    // This covers local-proxy-level failures that never reach an HTTP status
+    // from upstream at all: malformed request bodies, connection refused,
+    // DNS failures, TLS errors, and header/stream timeouts talking to the
+    // upstream provider. Without logging here, a repeated timeout/connection
+    // failure just shows up to BOSS as the pre-request diagnostic lines
+    // (context trimming / stale-reasoning stripping) repeating on every
+    // Codex retry with no visible explanation, since those diagnostics are
+    // printed before the request is even sent and say nothing about why the
+    // attempt actually failed.
+    protocol_proxy::log_upstream_event_deduped(
+        "local_proxy_error",
+        format!("本地代理处理请求失败：{error:#}"),
+    );
     protocol_proxy::ProxyHttpResponse {
         status: "500 Internal Server Error".to_string(),
         content_type: "application/json; charset=utf-8".to_string(),
@@ -10857,6 +10870,23 @@ model_catalog_json = "model-catalogs/gateway.json"
                 "如果显式填写 `provider.contextBudget`，Codex 会改走本地代理 `http://127.0.0.1:57321/v1`，由 agent 先裁剪上下文再转发到 Responses 上游"
             )
         );
+    }
+
+    #[test]
+    fn protocol_proxy_error_response_logs_local_proxy_failures() {
+        // Regression guard for a blind spot where connection-level failures
+        // to the upstream (timeouts, connection refused, DNS/TLS errors) —
+        // as opposed to a non-2xx HTTP status returned *by* the upstream —
+        // were silently turned into a 500 response to Codex with nothing
+        // printed to stderr. When Codex then retried the exact same request,
+        // BOSS would only see the pre-request diagnostic lines (context
+        // trimming / stale-reasoning stripping) repeating forever with no
+        // indication of what actually failed.
+        let source = include_str!("main.rs");
+        assert!(source.contains("fn protocol_proxy_error_response(error: &anyhow::Error)"));
+        assert!(source.contains("protocol_proxy::log_upstream_event_deduped("));
+        assert!(source.contains("\"local_proxy_error\","));
+        assert!(source.contains("本地代理处理请求失败：{error:#}"));
     }
 
     #[test]
