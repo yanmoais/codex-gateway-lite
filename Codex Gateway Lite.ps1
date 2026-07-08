@@ -60,6 +60,28 @@ function Ensure-CargoBinUserPath {
   }
 }
 
+function Merge-BypassList([string]$Existing, [string[]]$Required) {
+  $items = @()
+  if ($Existing) {
+    $items += @($Existing -split '[,;]' | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { $_.Trim() })
+  }
+  foreach ($item in $Required) {
+    if (-not ($items | Where-Object { $_ -ieq $item } | Select-Object -First 1)) {
+      $items += $item
+    }
+  }
+  return ($items -join ',')
+}
+
+function Ensure-LocalProxyBypass {
+  $required = @('localhost', '127.0.0.1', '::1')
+  $existing = if ($env:NO_PROXY) { $env:NO_PROXY } elseif ($env:no_proxy) { $env:no_proxy } else { '' }
+  $merged = Merge-BypassList $existing $required
+  $env:NO_PROXY = $merged
+  $env:no_proxy = $merged
+  Write-Info "本地代理绕过已设置：localhost / 127.0.0.1 / ::1"
+}
+
 function Test-Url([string]$Url) {
   try {
     Invoke-WebRequest -Uri $Url -UseBasicParsing -Method Head -TimeoutSec 8 | Out-Null
@@ -479,6 +501,7 @@ function Stop-AgentOnExit {
 try {
   Write-Header
   Set-Location $RepoRoot
+  Ensure-LocalProxyBypass
 
   Write-Section "1/3 环境检测与依赖准备"
   Ensure-Git

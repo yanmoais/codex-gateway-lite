@@ -5250,6 +5250,7 @@ async fn launch_codex(
     if !app_dir.exists() {
         bail!("Codex App 不存在：{}", app_dir.display());
     }
+    ensure_local_proxy_bypass_env();
     #[cfg(not(target_os = "macos"))]
     let _ = codex_home;
     #[cfg(target_os = "macos")]
@@ -5365,6 +5366,40 @@ async fn launch_codex(
             .with_context(|| format!("启动 Codex 失败：{executable}"))?;
         Ok(())
     }
+}
+
+fn ensure_local_proxy_bypass_env() {
+    const LOCAL_PROXY_BYPASS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+    let merged = merge_no_proxy_value(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .unwrap_or_default()
+            .as_str(),
+        LOCAL_PROXY_BYPASS,
+    );
+    // SAFETY: This is called from the single-threaded launcher path before spawning
+    // Codex App. It intentionally updates the process environment inherited by the
+    // spawned app so local 127.0.0.1 proxy traffic is never sent to an upstream proxy.
+    unsafe {
+        std::env::set_var("NO_PROXY", &merged);
+        std::env::set_var("no_proxy", &merged);
+    }
+}
+
+fn merge_no_proxy_value(existing: &str, required: &[&str]) -> String {
+    let mut parts: Vec<String> = existing
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    for item in required {
+        if !parts.iter().any(|part| part.eq_ignore_ascii_case(item)) {
+            parts.push((*item).to_string());
+        }
+    }
+    parts.join(",")
 }
 
 #[cfg(target_os = "macos")]
@@ -10721,6 +10756,17 @@ model_catalog_json = "model-catalogs/gateway.json"
 
         let other = anyhow::anyhow!("读取本地协议代理请求失败");
         assert!(!protocol_proxy_request_closed_before_headers(&other));
+    }
+
+    #[test]
+    fn no_proxy_merge_preserves_existing_and_adds_localhost() {
+        let merged =
+            merge_no_proxy_value("example.com;127.0.0.1", &["localhost", "127.0.0.1", "::1"]);
+        assert!(merged.contains("example.com"));
+        assert!(merged.contains("localhost"));
+        assert!(merged.contains("127.0.0.1"));
+        assert!(merged.contains("::1"));
+        assert_eq!(merged.matches("127.0.0.1").count(), 1);
     }
 
     #[test]
