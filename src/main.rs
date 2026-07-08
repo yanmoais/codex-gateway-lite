@@ -1267,11 +1267,14 @@ const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
     ("o1", "200K"),
     ("o3", "200K"),
     ("o4", "200K"),
-    // Anthropic Claude Sonnet family: 1M context (extended-context tier).
+    // Anthropic Claude Sonnet / Opus: confirmed running with a 1M context
+    // window on this gateway (verified against claude-sonnet-5,
+    // claude-opus-4-6/4-7/4-8). Anthropic's own docs list a smaller
+    // standalone context for some of these, but this gateway's deployment
+    // is what actually matters here — do not shrink this without a
+    // BOSS-confirmed correction.
     ("claude-sonnet", "1M"),
-    // Anthropic Claude Opus / Haiku: 200K context (standard tier).
-    ("claude-opus", "200K"),
-    ("claude-haiku", "200K"),
+    ("claude-opus", "1M"),
     // xAI Grok 4 family: 256K context.
     ("grok-4", "256K"),
     // xAI Grok 3 family: 128K context.
@@ -11315,13 +11318,12 @@ not-a-pid garbage line without valid pid
             default_context_window_for_model_id("claude-sonnet-4-6"),
             "1M"
         );
-        assert_eq!(
-            default_context_window_for_model_id("claude-opus-4-8"),
-            "200K"
-        );
+        assert_eq!(default_context_window_for_model_id("claude-opus-4-6"), "1M");
+        assert_eq!(default_context_window_for_model_id("claude-opus-4-7"), "1M");
+        assert_eq!(default_context_window_for_model_id("claude-opus-4-8"), "1M");
         assert_eq!(
             default_context_window_for_model_id("claude-haiku-4-5-20251001"),
-            "200K"
+            "1M"
         );
         assert_eq!(default_context_window_for_model_id("grok-4.3"), "256K");
         assert_eq!(
