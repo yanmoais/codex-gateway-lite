@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -686,6 +688,74 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     }
 }
 
+/// Consecutive-repeat state for `log_upstream_event_deduped`, keyed by a
+/// fixed call-site identifier so different kinds of diagnostics never get
+/// mixed into the same streak.
+struct RepeatedLogState {
+    last_message: String,
+    repeat_count: u32,
+}
+
+static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Print a diagnostic line to stderr, collapsing byte-identical messages
+/// that repeat back-to-back under the same `key`.
+///
+/// Codex automatically retries a request when the upstream provider returns
+/// a transient-looking error (e.g. a persistent 502 from the third-party
+/// gateway). Every retry re-sends the same unchanged conversation history to
+/// our local proxy, so both the context-budget/reasoning-strip summary and
+/// the upstream error end up byte-identical on every attempt. Printing every
+/// single repeat floods the terminal and makes it look like a stuck loop in
+/// this proxy, when it's actually Codex's own retry behavior against a
+/// still-failing upstream. This prints the first occurrence immediately,
+/// stays quiet for exact repeats, and surfaces a running counter every 5th
+/// repeat so BOSS can still see the retry is ongoing (and that the upstream,
+/// not this proxy, is what needs to recover).
+fn log_upstream_event_deduped(key: &'static str, message: String) {
+    let mut state = REPEATED_LOG_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(line) = dedup_repeated_log_line(&mut state, key, message) {
+        eprintln!("{line}");
+    }
+}
+
+/// Pure decision logic behind `log_upstream_event_deduped`, separated out so
+/// the counting/suppression behavior can be unit-tested without capturing
+/// process stderr. Returns `Some(line_to_print)` on the first occurrence of
+/// a message and every 5th identical repeat, `None` otherwise.
+fn dedup_repeated_log_line(
+    state: &mut HashMap<&'static str, RepeatedLogState>,
+    key: &'static str,
+    message: String,
+) -> Option<String> {
+    match state.get_mut(key) {
+        Some(entry) if entry.last_message == message => {
+            entry.repeat_count += 1;
+            if entry.repeat_count % 5 == 0 {
+                Some(format!(
+                    "{message}（相同信息已连续重复 {} 次，Codex 仍在自动重试，问题多半在上游供应商而不是本地代理）",
+                    entry.repeat_count
+                ))
+            } else {
+                None
+            }
+        }
+        _ => {
+            state.insert(
+                key,
+                RepeatedLogState {
+                    last_message: message.clone(),
+                    repeat_count: 1,
+                },
+            );
+            Some(message)
+        }
+    }
+}
+
 fn upstream_request_parts(
     relay: &ProtocolProxyUpstream,
     request_json: Value,
@@ -695,18 +765,24 @@ fn upstream_request_parts(
             let mut body = request_json;
             let report = apply_responses_context_budget(&mut body, &relay.context_budget);
             if report.stale_reasoning_items_stripped > 0 {
-                eprintln!(
-                    "Responses 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
-                    report.stale_reasoning_items_stripped,
+                log_upstream_event_deduped(
+                    "responses_reasoning_strip",
+                    format!(
+                        "Responses 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
+                        report.stale_reasoning_items_stripped,
+                    ),
                 );
             }
             if report.was_trimmed {
-                eprintln!(
-                    "Responses 上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条项目）",
-                    report.original_estimated_tokens,
-                    report.final_estimated_tokens,
-                    report.images_stripped,
-                    report.messages_removed,
+                log_upstream_event_deduped(
+                    "responses_budget_trim",
+                    format!(
+                        "Responses 上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条项目）",
+                        report.original_estimated_tokens,
+                        report.final_estimated_tokens,
+                        report.images_stripped,
+                        report.messages_removed,
+                    ),
                 );
             }
             Ok((
@@ -719,12 +795,15 @@ fn upstream_request_parts(
             let mut chat_body = responses_to_chat_completions(request_json)?;
             let report = apply_context_budget(&mut chat_body, &relay.context_budget);
             if report.was_trimmed {
-                eprintln!(
-                    "上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
-                    report.original_estimated_tokens,
-                    report.final_estimated_tokens,
-                    report.images_stripped,
-                    report.messages_removed,
+                log_upstream_event_deduped(
+                    "chat_budget_trim",
+                    format!(
+                        "上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
+                        report.original_estimated_tokens,
+                        report.final_estimated_tokens,
+                        report.images_stripped,
+                        report.messages_removed,
+                    ),
                 );
             }
             Ok((
@@ -819,7 +898,10 @@ pub async fn handle_responses_upstream(
             .and_then(|value| value.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("Unknown error");
-        eprintln!("上游返回 HTTP {status_code}: {message}");
+        log_upstream_event_deduped(
+            "upstream_error_status",
+            format!("上游返回 HTTP {status_code}: {message}"),
+        );
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
@@ -4529,4 +4611,68 @@ pub fn apply_responses_context_budget(
             .map(|i| estimate_responses_item_tokens(i, image_est))
             .sum::<u64>();
     report
+}
+
+#[cfg(test)]
+mod repeated_log_tests {
+    use super::*;
+
+    #[test]
+    fn dedup_prints_first_occurrence_and_every_fifth_repeat() {
+        let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
+        let key = "test_key";
+        let message = "same message".to_string();
+
+        // First occurrence always prints.
+        assert_eq!(
+            dedup_repeated_log_line(&mut state, key, message.clone()),
+            Some(message.clone())
+        );
+
+        // Repeats 2-4 are suppressed; the 5th repeat prints with a counter.
+        for _ in 0..3 {
+            assert_eq!(
+                dedup_repeated_log_line(&mut state, key, message.clone()),
+                None
+            );
+        }
+        let fifth = dedup_repeated_log_line(&mut state, key, message.clone());
+        assert!(fifth.is_some());
+        assert!(fifth.unwrap().contains("连续重复 5 次"));
+
+        // Repeats 6-9 suppressed again, 10th prints.
+        for _ in 0..4 {
+            assert_eq!(
+                dedup_repeated_log_line(&mut state, key, message.clone()),
+                None
+            );
+        }
+        let tenth = dedup_repeated_log_line(&mut state, key, message.clone());
+        assert!(tenth.unwrap().contains("连续重复 10 次"));
+    }
+
+    #[test]
+    fn dedup_resets_and_prints_immediately_when_message_changes() {
+        let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
+        let key = "test_key";
+
+        assert!(dedup_repeated_log_line(&mut state, key, "first".to_string()).is_some());
+        assert_eq!(
+            dedup_repeated_log_line(&mut state, key, "first".to_string()),
+            None
+        );
+        // A different message always prints immediately, even mid-streak.
+        assert_eq!(
+            dedup_repeated_log_line(&mut state, key, "second".to_string()),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_keeps_independent_streaks_per_key() {
+        let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
+        assert!(dedup_repeated_log_line(&mut state, "key_a", "msg".to_string()).is_some());
+        // A different key starts its own fresh streak even with the same message text.
+        assert!(dedup_repeated_log_line(&mut state, "key_b", "msg".to_string()).is_some());
+    }
 }
