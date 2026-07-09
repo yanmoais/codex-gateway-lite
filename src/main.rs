@@ -7100,7 +7100,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 45;
+  const SCRIPT_VERSION = 46;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8489,6 +8489,18 @@ const PLAN_UI_SCRIPT: &str = r#"
     // just under the visible card chrome even when the outer shell is tall.
     if (!matchedLabel) {
       contentBottom = Math.min(rect.bottom, rect.top + Math.max(120, Math.min(220, rect.height * 0.55)));
+    } else {
+      // BOSS 实测：真实卡片里最后一行内容（比如"提交或推送"按钮文字）到卡片
+      // 自己的外边缘之间通常只有 ~12px 的内边距/边框/阴影，跟 placeDock() 后面
+      // 再叠加的 12px 悬浮间距几乎完全抵消，dock 贴着卡片边缘几乎零间距，
+      // 肉眼看就是"贴着"。这种正常内边距场景（差值不大）直接贴卡片真实外边缘
+      // rect.bottom 走，才能让 dock 真正悬浮在卡片下方留出可见间距；只有当
+      // 差值很大（说明抓到的是包住卡片的高大外层壳，而不是卡片本身）才继续用
+      // 内容行的位置，避免重新掉回“锚点抓错外层壳”的旧 bug。
+      const paddingBelowLastRow = rect.bottom - contentBottom;
+      if (paddingBelowLastRow <= 60) {
+        contentBottom = rect.bottom;
+      }
     }
     return { node: panel, rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
   }
@@ -10132,6 +10144,86 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_leaves_visible_gap_instead_of_sitting_flush_against_card_edge() {
+        // BOSS 实测复现（通过 CDP 直接连正在跑的 Codex App 量出来的真实 DOM
+        // 坐标）：真实“环境信息”卡片自身 rect.bottom=230.5，但卡片内最后一行
+        // 内容（“提交或推送”按钮）文字框的 bottom 只有 218.5 —— 中间 12px 是
+        // 卡片自己的底部内边距/边框/阴影。旧逻辑拿 218.5 + 12px 悬浮间距去算
+        // dock 的 top，正好落在 230.5 上下（只差 0.5px），dock 贴着卡片边缘
+        // 几乎零间距，肉眼看就是“贴着”而不是悬浮在下方。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                globalThis.innerWidth = 1800;
+                globalThis.innerHeight = 1070;
+                const envCard = {
+                    nodeType: 1,
+                    id: "env-card",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || (node && node.id === "env-actions"); },
+                    getAttribute() { return null; },
+                    querySelectorAll() {
+                        return [
+                            {
+                                nodeType: 1,
+                                id: "env-actions",
+                                parentElement: null,
+                                closest() { return null; },
+                                contains() { return false; },
+                                getAttribute() { return null; },
+                                querySelectorAll() { return []; },
+                                getBoundingClientRect() {
+                                    return { width: 268, height: 28, left: 1500, right: 1768, top: 190.5, bottom: 218.5 };
+                                },
+                                textContent: "提交或推送"
+                            }
+                        ];
+                    },
+                    getBoundingClientRect() {
+                        return { width: 300, height: 160, left: 1484, right: 1784, top: 70.5, bottom: 230.5 };
+                    },
+                    textContent: "环境信息 变更+348-0 本地 main 提交或推送"
+                };
+                document.querySelectorAll = function (selector) {
+                    if (String(selector).includes("aside") || String(selector).includes("section") || String(selector) === "aside,section,div") {
+                        return [envCard];
+                    }
+                    return [];
+                };
+                document.elementFromPoint = function () { return envCard; };
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                hooks.renderDock({
+                    threadId: "visible:unknown",
+                    progress: "第 3 / 3 步",
+                    rows: [{ text: "验证卡片与任务卡之间必须留出可见间距", status: "running", iconHtml: "" }],
+                    at: Date.now()
+                });
+                const top = dock.style.getPropertyValue("--cgl-plan-top");
+                const topPx = Number.parseFloat(top) || 0;
+                return JSON.stringify({
+                    hidden: dock.hidden,
+                    hiddenBy: dock.dataset.cglPlanHiddenBy || "",
+                    topPx,
+                    gap: topPx - 230.5
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["hidden"], serde_json::json!(false), "{result}");
+        assert_eq!(result["hiddenBy"], serde_json::json!(""), "{result}");
+        let gap = result["gap"].as_f64().unwrap_or(0.0);
+        // Must leave a real visible gap below the card's own outer edge
+        // (230.5), not just past the last content row's text box.
+        assert!(
+            gap >= 8.0,
+            "dock must float below the card with a visible gap, got gap={gap}: {result}"
+        );
+    }
+
+    #[test]
     fn plan_ui_hides_dock_when_native_environment_panel_disappears() {
         // 原生“环境信息”卡片被弹窗/侧边菜单顶掉后（比如切到 移交至工作树 弹窗，
         // 或者点开 审查/终端/浏览器 侧栏切换菜单），dock 不能落到一个瞎猜的默认位置，
@@ -10994,7 +11086,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 45"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 46"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -11086,7 +11178,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 45"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 46"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
