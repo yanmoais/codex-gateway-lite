@@ -7100,7 +7100,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 44;
+  const SCRIPT_VERSION = 45;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8427,41 +8427,69 @@ const PLAN_UI_SCRIPT: &str = r#"
 
   function environmentPanelInfo() {
     if (blockingOverlayActive()) return null;
+    // Prefer the tightest matching panel. Codex sometimes wraps the native
+    // environment card inside a taller right-rail shell; if we pick that
+    // outer shell, contentBottom lands near the bottom of the rail and the
+    // dock is pushed far below the real "环境信息" card (exactly the drift
+    // BOSS keeps reporting). Prefer smaller area / higher top first, then
+    // rightmost, so the actual compact card wins.
     const candidates = Array.from(document.querySelectorAll("aside,section,div"))
-      .filter((node) => {
-        if (!visible(node) || managedNode(node)) return false;
+      .map((node) => {
+        if (!visible(node) || managedNode(node)) return null;
         const value = text(node);
-        if (!/环境信息|Environment/.test(value) || !/变更|Changes/.test(value)) return false;
-        if (!/本地|Local/.test(value) || !/提交或推送|Commit|Push/.test(value)) return false;
-        if (value.length > 360) return false;
-        if (/function|querySelector|const\s|return\s|=>|PLAN_UI_SCRIPT|codex-gateway-lite/.test(value)) return false;
+        if (!/环境信息|Environment/.test(value) || !/变更|Changes/.test(value)) return null;
+        if (!/本地|Local/.test(value) || !/提交或推送|Commit|Push/.test(value)) return null;
+        if (value.length > 360) return null;
+        if (/function|querySelector|const\s|return\s|=>|PLAN_UI_SCRIPT|codex-gateway-lite/.test(value)) return null;
         const rect = node.getBoundingClientRect();
-        return rect.width >= 220
+        if (!(rect.width >= 220
           && rect.width <= 520
           && rect.height >= 120
           && rect.height <= Math.min(640, window.innerHeight * 0.72)
-          && rect.right > window.innerWidth * 0.55;
+          && rect.right > window.innerWidth * 0.55)) return null;
+        return { node, rect, area: rect.width * rect.height, top: rect.top, right: rect.right };
       })
+      .filter(Boolean)
       .sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        const rightDelta = Math.abs(br.right - ar.right);
-        if (rightDelta > 16) return br.right - ar.right;
-        return br.bottom - ar.bottom;
+        const areaDelta = a.area - b.area;
+        if (Math.abs(areaDelta) > 8_000) return areaDelta;
+        const topDelta = a.top - b.top;
+        if (Math.abs(topDelta) > 12) return topDelta;
+        const rightDelta = b.right - a.right;
+        if (Math.abs(rightDelta) > 16) return rightDelta;
+        return a.area - b.area;
       });
-    const panel = candidates[0] || null;
+    const panel = candidates[0]?.node || null;
     if (!panel) return null;
     const rect = panel.getBoundingClientRect();
     if (!topLayerOwns(panel, rect)) return null;
+    // Anchor to the bottom of the label / action rows inside the card, not
+    // the outer shell. Prefer short tokens that only exist in the real
+    // environment card so a taller wrapper cannot push contentBottom down.
     let contentBottom = rect.top;
+    let matchedLabel = false;
     Array.from(panel.querySelectorAll("*")).forEach((node) => {
       if (!visible(node) || managedNode(node)) return;
       const value = text(node);
-      if (!value || value.length > 80) return;
-      if (!/环境信息|Environment|变更|Changes|本地|main|提交或推送|来源|Source|暂无来源/.test(value)) return;
+      if (!value || value.length > 48) return;
+      const isEnvLabel = /^(环境信息|Environment|变更|Changes|本地|Local|提交或推送|Commit|Push|来源|Source|暂无来源|No sources?)$/i.test(value);
+      const isBranchLike = /^(?:[A-Za-z0-9._\-\/]{1,32})$/.test(value)
+        && !/function|querySelector|const\s|return\s|=>|PLAN_UI_SCRIPT|codex-gateway-lite|README|依赖|一键|引导|任务|Task|输出|Output|Artifacts?/i.test(value);
+      const isChangeCounter = /^(?:\+\d[\d,]*(?:\s+-\d[\d,]*)?|-\d[\d,]*)$/.test(value);
+      if (!isEnvLabel && !isBranchLike && !isChangeCounter) return;
       const childRect = node.getBoundingClientRect();
+      if (childRect.right < window.innerWidth * 0.55) return;
+      if (childRect.left < rect.left - 8 || childRect.right > rect.right + 8) return;
       contentBottom = Math.max(contentBottom, childRect.bottom);
+      matchedLabel = true;
     });
+    // If the panel matched but none of its short label children did (e.g.
+    // text is nested oddly), fall back to a conservative fraction of the
+    // panel height instead of its absolute bottom — that keeps the dock
+    // just under the visible card chrome even when the outer shell is tall.
+    if (!matchedLabel) {
+      contentBottom = Math.min(rect.bottom, rect.top + Math.max(120, Math.min(220, rect.height * 0.55)));
+    }
     return { node: panel, rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
   }
 
@@ -8978,7 +9006,11 @@ mod tests {
       constructor(tagName) {
         this.tagName = String(tagName || "DIV").toUpperCase();
         this._attrs = {};
-        this.style = { setProperty() {}, getPropertyValue() { return ""; } };
+        this.style = {
+          _props: Object.create(null),
+          setProperty(name, value) { this._props[String(name)] = String(value); },
+          getPropertyValue(name) { return this._props[String(name)] || ""; },
+        };
         this.dataset = {};
         this.children = [];
         this.parentElement = null;
@@ -9969,6 +10001,137 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_anchors_dock_under_compact_environment_card_not_tall_shell() {
+        // BOSS 现场：右侧 rail 经常有一个更高的外层壳包住原生“环境信息”卡片。
+        // 旧逻辑按最靠右 / 更靠下的候选挑锚点，会误抓外层壳，contentBottom 被
+        // 顶到壳底部，任务卡片就整张下沉到右侧中下部。必须优先贴紧真实卡片。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                globalThis.innerWidth = 1920;
+                globalThis.innerHeight = 1080;
+                const envCard = {
+                    nodeType: 1,
+                    id: "env-card",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || (node && (node.id === "env-label" || node.id === "env-actions")); },
+                    getAttribute() { return null; },
+                    querySelectorAll() {
+                        return [
+                            {
+                                nodeType: 1,
+                                id: "env-label",
+                                parentElement: null,
+                                closest() { return null; },
+                                contains() { return false; },
+                                getAttribute() { return null; },
+                                querySelectorAll() { return []; },
+                                getBoundingClientRect() {
+                                    return { width: 180, height: 20, left: 1620, right: 1800, top: 100, bottom: 120 };
+                                },
+                                textContent: "环境信息"
+                            },
+                            {
+                                nodeType: 1,
+                                id: "env-actions",
+                                parentElement: null,
+                                closest() { return null; },
+                                contains() { return false; },
+                                getAttribute() { return null; },
+                                querySelectorAll() { return []; },
+                                getBoundingClientRect() {
+                                    return { width: 220, height: 28, left: 1610, right: 1830, top: 250, bottom: 278 };
+                                },
+                                textContent: "提交或推送"
+                            }
+                        ];
+                    },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 220, left: 1600, right: 1920, top: 90, bottom: 310 };
+                    },
+                    textContent: "环境信息 变更 +11 -18 本地 main 提交或推送 来源 暂无来源"
+                };
+                const tallShell = {
+                    nodeType: 1,
+                    id: "right-rail-shell",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || node === envCard; },
+                    getAttribute() { return null; },
+                    querySelectorAll() {
+                        return [
+                            {
+                                nodeType: 1,
+                                id: "shell-bottom",
+                                parentElement: null,
+                                closest() { return null; },
+                                contains() { return false; },
+                                getAttribute() { return null; },
+                                querySelectorAll() { return []; },
+                                getBoundingClientRect() {
+                                    return { width: 280, height: 24, left: 1620, right: 1900, top: 760, bottom: 784 };
+                                },
+                                textContent: "来源"
+                            }
+                        ];
+                    },
+                    getBoundingClientRect() {
+                        return { width: 340, height: 720, left: 1580, right: 1920, top: 80, bottom: 800 };
+                    },
+                    textContent: "环境信息 变更 +11 -18 本地 main 提交或推送 来源 暂无来源 输出 暂无产物"
+                };
+                document.querySelectorAll = function (selector) {
+                    // Only return right-rail candidates for the environment-panel
+                    // scan. Returning them for dialog/overlay selectors would
+                    // blow up blockingOverlayActive (no getAttribute) and is
+                    // not how the real DOM behaves.
+                    if (String(selector).includes("aside") || String(selector).includes("section") || String(selector) === "aside,section,div") {
+                        return [tallShell, envCard];
+                    }
+                    return [];
+                };
+                document.elementFromPoint = function (_x, y) {
+                    if (y < 340) return envCard;
+                    return tallShell;
+                };
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                const snapshot = {
+                    threadId: "visible:unknown",
+                    progress: "第 4 / 4 步",
+                    rows: [
+                        { text: "定位 CLIProxyAPI 中 Grok function_call 编码路径与 namespace 丢失点", status: "done", iconHtml: "" },
+                        { text: "实现 namespace 回填修复并保持 GPT/Claude 路径不变", status: "done", iconHtml: "" },
+                        { text: "本地验证修复逻辑，备份并部署到 VPS CLIProxyAPI", status: "done", iconHtml: "" },
+                        { text: "关闭 Grok remap 做端到端验证，向 BOSS 汇报", status: "done", iconHtml: "" }
+                    ],
+                    at: Date.now()
+                };
+                hooks.renderDock(snapshot);
+                const top = dock.style.getPropertyValue("--cgl-plan-top");
+                return JSON.stringify({
+                    hidden: dock.hidden,
+                    hiddenBy: dock.dataset.cglPlanHiddenBy || "",
+                    top,
+                    topPx: Number.parseFloat(top) || 0
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["hidden"], serde_json::json!(false), "{result}");
+        assert_eq!(result["hiddenBy"], serde_json::json!(""), "{result}");
+        let top_px = result["topPx"].as_f64().unwrap_or(9999.0);
+        // Compact card action row ends ~278; dock should sit just under it
+        // (~290), never near the tall shell bottom (~800).
+        assert!(
+            top_px >= 280.0 && top_px <= 360.0,
+            "dock top should sit under the compact environment card, got {top_px}: {result}"
+        );
+    }
+
+    #[test]
     fn plan_ui_hides_dock_when_native_environment_panel_disappears() {
         // 原生“环境信息”卡片被弹窗/侧边菜单顶掉后（比如切到 移交至工作树 弹窗，
         // 或者点开 审查/终端/浏览器 侧栏切换菜单），dock 不能落到一个瞎猜的默认位置，
@@ -10831,7 +10994,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 44"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 45"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -10923,7 +11086,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 44"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 45"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
@@ -10986,6 +11149,10 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("candidate.hasOutputSourcePair ? rect.bottom : rect.top"));
         assert!(!PLAN_UI_SCRIPT.contains("function defaultRightRailDockInfo()"));
         assert!(PLAN_UI_SCRIPT.contains("const anchor = environmentPanelInfo();"));
+        assert!(PLAN_UI_SCRIPT.contains("Prefer the tightest matching panel"));
+        assert!(PLAN_UI_SCRIPT.contains("const areaDelta = a.area - b.area"));
+        assert!(PLAN_UI_SCRIPT.contains("matchedLabel"));
+
         assert!(PLAN_UI_SCRIPT.contains("if (!anchor) return false;"));
         assert!(PLAN_UI_SCRIPT.contains("Math.max(72, window.innerHeight - 96)"));
         assert!(PLAN_UI_SCRIPT.contains("Math.round(rect.width - 12)"));
