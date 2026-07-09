@@ -7100,7 +7100,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 46;
+  const SCRIPT_VERSION = 47;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8848,7 +8848,27 @@ const PLAN_UI_SCRIPT: &str = r#"
   if (window.__codexGatewayLitePlanUiTimer) {
     try { window.clearInterval(window.__codexGatewayLitePlanUiTimer); } catch {}
   }
+  if (Array.isArray(window.__codexGatewayLitePlanUiSettleTimers)) {
+    window.__codexGatewayLitePlanUiSettleTimers.forEach((timerId) => {
+      try { window.clearTimeout(timerId); } catch {}
+    });
+  }
   apply();
+  // Cold-start / fresh-injection settle burst: right after Codex.app's own
+  // renderer finishes a full reload (agent restart, app relaunch), a long
+  // thread history can still be hydrating for a brief moment even though
+  // this script's very first apply() above already ran once — the native
+  // "环境信息" card's own layout can still shift slightly as it settles.
+  // Without this, the dock can render its first frame flush against the
+  // card (BOSS-reported "贴着") and only self-correct up to 5s later via
+  // the interval timer below. Re-run apply() a few more times over the
+  // next ~1.6s so the dock catches up to the settled layout almost
+  // immediately instead of visibly sitting in the wrong spot meanwhile.
+  window.__codexGatewayLitePlanUiSettleTimers = [120, 350, 800, 1600].map((delay) =>
+    window.setTimeout(() => {
+      try { apply(); } catch {}
+    }, delay)
+  );
   const observer = new MutationObserver(scheduleApplyForMutations);
   observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class", "data-state", "hidden", "role", "aria-modal"] });
   window.__codexGatewayLitePlanUiObserver = observer;
@@ -10285,6 +10305,42 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_initial_injection_schedules_settle_burst_reapplies() {
+        // BOSS 现场：agent 重启后 Codex.app 也整个冷启动，长会话历史还在
+        // hydrate 的那几百毫秒里，脚本的第一次 apply() 可能贴着还没最终定型的
+        // “环境信息”卡片算出一个偏低的位置，看起来任务卡贴着卡片；5 秒定时器
+        // 才会纠正过来，这段时间里肉眼就能看到"贴着"。这里改成脚本刚注入时
+        // 额外在 120/350/800/1600ms 补跑几次 apply()，不用等到 5 秒定时器。
+        let mut ctx = boa_engine::Context::default();
+        ctx.eval(boa_engine::Source::from_bytes(PLAN_UI_MOCK_DOM_SCRIPT))
+            .expect("mock dom should evaluate cleanly");
+        ctx.eval(boa_engine::Source::from_bytes(
+            r#"
+            window.__cglSettleTimeoutDelays = [];
+            window.setTimeout = function (cb, delay) {
+                window.__cglSettleTimeoutDelays.push(delay);
+                return window.__cglSettleTimeoutDelays.length;
+            };
+            "#,
+        ))
+        .expect("setTimeout spy should install cleanly");
+        ctx.eval(boa_engine::Source::from_bytes(PLAN_UI_SCRIPT))
+            .expect("PLAN_UI_SCRIPT should evaluate cleanly under the mock DOM");
+        let result = eval_json(&mut ctx, "JSON.stringify(window.__cglSettleTimeoutDelays)");
+        let delays: Vec<i64> = result
+            .as_array()
+            .expect("delays should be an array")
+            .iter()
+            .map(|value| value.as_i64().expect("delay should be a number"))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![120, 350, 800, 1600],
+            "expected a settle burst of quick re-applies right after injection: {delays:?}"
+        );
+    }
+
+    #[test]
     fn plan_ui_schedule_apply_throttles_high_frequency_mutation_bursts() {
         // 真实页面流式回复期间，MutationObserver 会在几秒内触发成百上千次
         // scheduleApply（childList/subtree/attributes 全部在监听范围内）。
@@ -11086,7 +11142,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 46"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 47"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -11178,7 +11234,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 46"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 47"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
