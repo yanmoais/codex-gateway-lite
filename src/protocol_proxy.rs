@@ -4480,16 +4480,25 @@ fn find_responses_recent_boundary(items: &[Value], min_turns: usize) -> usize {
     0
 }
 
-/// Strip `type: "reasoning"` items that belong to *completed* prior turns
-/// from a Responses API `input` array before relaying upstream.
+/// Strip `type: "reasoning"` items from a Responses API `input` array
+/// before relaying upstream, covering two distinct ways Anthropic rejects
+/// stale/malformed reasoning blocks:
 ///
-/// Anthropic's Messages API requires `thinking`/`redacted_thinking` blocks in
-/// the *latest* assistant message to be replayed byte-for-byte exactly as
-/// originally returned. Client-side context compaction (Codex's own history
-/// summarization) or a mid-conversation model switch can rebuild/merge an
-/// older assistant turn while it still carries a stale reasoning item,
-/// which Anthropic then rejects with an HTTP 400
-/// (`thinking blocks ... cannot be modified`). Reasoning content from
+/// 1. Reasoning items that belong to *completed* prior turns (anything
+///    strictly before the last user message). Anthropic's Messages API
+///    requires `thinking`/`redacted_thinking` blocks in the *latest*
+///    assistant message to be replayed byte-for-byte exactly as originally
+///    returned. Client-side context compaction (Codex's own history
+///    summarization) or a mid-conversation model switch can rebuild/merge an
+///    older assistant turn while it still carries a stale reasoning item,
+///    which Anthropic then rejects with an HTTP 400
+///    (`thinking blocks ... cannot be modified`).
+/// 2. A dangling reasoning item at the very tail of the array (see
+///    `strip_dangling_trailing_reasoning_item`), which Anthropic rejects
+///    with a *different* HTTP 400
+///    (`The final block in an assistant message cannot be thinking`).
+///
+/// Reasoning content from
 /// completed turns isn't needed to continue the conversation — the model
 /// re-derives its own reasoning for the *current* turn — so it is always
 /// safe to drop it here, as long as the still-open tail of the conversation
@@ -4511,6 +4520,40 @@ fn strip_stale_reasoning_items(items: &mut Vec<Value>) -> usize {
         } else {
             i += 1;
         }
+    }
+    removed += strip_dangling_trailing_reasoning_item(items);
+    removed
+}
+
+/// Drop the very last `input` item if it is a `type: "reasoning"` block with
+/// nothing after it.
+///
+/// A `reasoning` item can only ever be *history* in the Responses `input`
+/// array — the model hasn't produced this turn's reasoning yet when we're
+/// building the request, so any reasoning item present is always a leftover
+/// from an earlier, already-generated turn. When that earlier turn's stream
+/// got interrupted (retry, model switch, client-side compaction) right after
+/// the model started thinking but before it produced the accompanying
+/// `function_call`/text, the trailing reasoning item ends up dangling with
+/// nothing after it. Anthropic's Messages API rejects that outright with
+/// `The final block in an assistant message cannot be thinking`, distinct
+/// from (and not covered by) the "must replay byte-for-byte" rule that the
+/// boundary-based stripping above already guards against. Unlike the
+/// boundary-based stripping, this check is independent of where the last
+/// user message is — a dangling trailing reasoning item is never valid to
+/// resend regardless of position, and by definition it can't be part of a
+/// still-open tool-call loop (an active loop would have a subsequent
+/// `function_call`/`function_call_output` item after it).
+fn strip_dangling_trailing_reasoning_item(items: &mut Vec<Value>) -> usize {
+    let mut removed = 0usize;
+    while items
+        .last()
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("reasoning")
+    {
+        items.pop();
+        removed += 1;
     }
     removed
 }

@@ -10965,6 +10965,14 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(
             macos_script.contains("cargo run --quiet --manifest-path Cargo.toml -- stop-agent")
         );
+        assert!(macos_script.contains("stop_stale_agent_processes() {"));
+        assert!(macos_script.contains(
+            "  stop_stale_agent_processes
+"
+        ));
+        assert!(macos_script.contains("pgrep -f -- \"$pattern\""));
+        assert!(macos_script.contains("pkill -TERM -f -- \"$pattern\""));
+        assert!(macos_script.contains("pkill -KILL -f -- \"$pattern\""));
 
         let windows_script = include_str!("../Codex Gateway Lite.ps1");
         assert!(windows_script.contains("function Stop-AgentOnExit"));
@@ -12404,5 +12412,66 @@ mod responses_budget_tests {
             .any(|i| i.get("type").and_then(|v| v.as_str()) == Some("reasoning"));
         assert!(has_reasoning, "in-flight reasoning must be preserved");
         assert_eq!(items.len(), 5);
+    }
+
+    #[test]
+    fn responses_budget_strips_dangling_trailing_reasoning_item() {
+        // Anthropic rejects "The final block in an assistant message cannot
+        // be `thinking`" when the very last item sent is a reasoning block
+        // with nothing after it (e.g. an interrupted turn from a retry or
+        // model switch that captured the thinking but never got to the
+        // matching function_call/text). This must be stripped regardless of
+        // where the last user message is.
+        let budget = crate::protocol_proxy::ContextBudgetConfig::default();
+        let mut body = json!({
+            "model": "test",
+            "input": [
+                { "role": "user", "content": "current question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_dangling",
+                    "summary": [{ "type": "summary_text", "text": "cut off mid-thought" }]
+                }
+            ]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert_eq!(report.stale_reasoning_items_stripped, 1);
+
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .all(|i| i.get("type").and_then(|v| v.as_str()) != Some("reasoning"))
+        );
+    }
+
+    #[test]
+    fn responses_budget_keeps_reasoning_followed_by_function_call_at_the_tail() {
+        // Sanity check for the opposite case: reasoning immediately followed
+        // by its matching function_call at the very end of the array (a
+        // genuinely in-flight, still-open tool-call loop) must NOT be
+        // treated as dangling and must survive untouched.
+        let budget = crate::protocol_proxy::ContextBudgetConfig::default();
+        let mut body = json!({
+            "model": "test",
+            "input": [
+                { "role": "user", "content": "current question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_live",
+                    "summary": [{ "type": "summary_text", "text": "live thinking" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{}"
+                }
+            ]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert_eq!(report.stale_reasoning_items_stripped, 0);
+        assert_eq!(body["input"].as_array().unwrap().len(), 3);
     }
 }

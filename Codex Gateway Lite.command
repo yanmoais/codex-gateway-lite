@@ -246,9 +246,36 @@ run_lite() {
   "$LITE_BIN" "$@"
 }
 
+stop_stale_agent_processes() {
+  # `run_lite stop-agent` (below) also asks the Rust binary itself to sweep
+  # and kill any other codex-gateway-lite agent process system-wide, but
+  # that only runs *after* `ensure_lite_binary` has already built/located a
+  # binary. This is a script-level safety net that runs first, independent
+  # of whether the binary exists or builds cleanly yet, so a stray agent
+  # left running from an earlier session/manual invocation (e.g. the
+  # terminal window got closed without the exit trap running, or the agent
+  # was started outside this script) always gets cleared before this run
+  # continues — otherwise it keeps serving stale code on every relaunch.
+  local pattern="${LITE_BIN} agent"
+  if ! pgrep -f -- "$pattern" >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "检测到残留的 codex-gateway-lite agent 进程，先停止再继续"
+  pkill -TERM -f -- "$pattern" >/dev/null 2>&1 || true
+  local waited=0
+  while (( waited < 10 )) && pgrep -f -- "$pattern" >/dev/null 2>&1; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if pgrep -f -- "$pattern" >/dev/null 2>&1; then
+    pkill -KILL -f -- "$pattern" >/dev/null 2>&1 || true
+  fi
+}
+
 main() {
   print_header
   cd "$SCRIPT_DIR"
+  stop_stale_agent_processes
 
   section "1/3 环境检测与依赖准备"
   ensure_xcode_tools
