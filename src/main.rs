@@ -7100,7 +7100,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 47;
+  const SCRIPT_VERSION = 48;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8425,6 +8425,52 @@ const PLAN_UI_SCRIPT: &str = r#"
     return `<svg viewBox="0 0 20 20" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M10 2.08a7.92 7.92 0 1 1 0 15.84 7.92 7.92 0 0 1 0-15.84Zm0 1.33a6.59 6.59 0 1 0 0 13.18 6.59 6.59 0 0 0 0-13.18Z" fill="currentColor"/></svg>`;
   }
 
+  function expandEnvironmentPanelRoot(panel, rect) {
+    let best = { node: panel, rect };
+    let node = panel?.parentElement || null;
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (!visible(node) || managedNode(node)) {
+        node = node.parentElement;
+        continue;
+      }
+      const value = text(node);
+      if (!/环境信息|Environment/.test(value) || !/变更|Changes/.test(value)) {
+        node = node.parentElement;
+        continue;
+      }
+      if (!/本地|Local/.test(value) || !/提交或推送|Commit|Push/.test(value)) {
+        node = node.parentElement;
+        continue;
+      }
+      if (value.length > 420 || /function|querySelector|const\s|return\s|=>|PLAN_UI_SCRIPT|codex-gateway-lite/.test(value)) {
+        node = node.parentElement;
+        continue;
+      }
+      const parentRect = node.getBoundingClientRect();
+      const safelyContainsPanel = parentRect.left <= rect.left + 8
+        && parentRect.right >= rect.right - 8
+        && parentRect.top <= rect.top + 16
+        && parentRect.bottom >= rect.bottom - 8;
+      const sameRightRailCard = parentRect.width >= 220
+        && parentRect.width <= 520
+        && parentRect.height >= rect.height
+        && parentRect.height <= Math.min(640, window.innerHeight * 0.72)
+        && parentRect.right > window.innerWidth * 0.55
+        && Math.abs(parentRect.width - rect.width) <= 12;
+      if (safelyContainsPanel && sameRightRailCard) {
+        // The real Codex right rail often renders the visible rounded card as
+        // an ancestor of the inner "环境信息" section. Anchor to that card root
+        // when it is still the same narrow rail, but never to the much taller
+        // absolute shell that spans the viewport.
+        if (parentRect.bottom > best.rect.bottom || parentRect.top < best.rect.top) {
+          best = { node, rect: parentRect };
+        }
+      }
+      node = node.parentElement;
+    }
+    return best;
+  }
+
   function environmentPanelInfo() {
     if (blockingOverlayActive()) return null;
     // Prefer the tightest matching panel. Codex sometimes wraps the native
@@ -8432,7 +8478,8 @@ const PLAN_UI_SCRIPT: &str = r#"
     // outer shell, contentBottom lands near the bottom of the rail and the
     // dock is pushed far below the real "环境信息" card (exactly the drift
     // BOSS keeps reporting). Prefer smaller area / higher top first, then
-    // rightmost, so the actual compact card wins.
+    // rightmost, so the actual compact card wins; after that, expand only to
+    // a same-width safe card root so the dock does not sit inside the card.
     const candidates = Array.from(document.querySelectorAll("aside,section,div"))
       .map((node) => {
         if (!visible(node) || managedNode(node)) return null;
@@ -8459,9 +8506,12 @@ const PLAN_UI_SCRIPT: &str = r#"
         if (Math.abs(rightDelta) > 16) return rightDelta;
         return a.area - b.area;
       });
-    const panel = candidates[0]?.node || null;
-    if (!panel) return null;
-    const rect = panel.getBoundingClientRect();
+    const compactPanel = candidates[0]?.node || null;
+    if (!compactPanel) return null;
+    const compactRect = compactPanel.getBoundingClientRect();
+    const expanded = expandEnvironmentPanelRoot(compactPanel, compactRect);
+    const panel = expanded.node;
+    const rect = expanded.rect;
     if (!topLayerOwns(panel, rect)) return null;
     // Anchor to the bottom of the label / action rows inside the card, not
     // the outer shell. Prefer short tokens that only exist in the real
@@ -10244,6 +10294,131 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_expands_inner_environment_section_to_visible_card_root() {
+        // 真实 Codex 右栏 DOM：候选扫描会先遇到更小的“环境信息”SECTION，
+        // 但视觉上的白色圆角卡片是它的同宽祖先，下面还可能带“来源”区块。
+        // dock 必须锚到整张圆角卡片下面，不能落在卡片内部。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                globalThis.innerWidth = 1800;
+                globalThis.innerHeight = 1070;
+                const actionRow = {
+                    nodeType: 1,
+                    id: "env-actions",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains() { return false; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 268, height: 28, left: 1500, right: 1768, top: 190.5, bottom: 218.5 };
+                    },
+                    textContent: "提交或推送"
+                };
+                const sourceLabel = {
+                    nodeType: 1,
+                    id: "source-label",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains() { return false; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 52, height: 25, left: 1500, right: 1552, top: 243, bottom: 268 };
+                    },
+                    textContent: "来源"
+                };
+                const envSection = {
+                    nodeType: 1,
+                    id: "env-section",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || node === actionRow; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return [actionRow]; },
+                    getBoundingClientRect() {
+                        return { width: 300, height: 160, left: 1484, right: 1784, top: 70.5, bottom: 230.5 };
+                    },
+                    textContent: "环境信息 变更 +348 -0 本地 main 提交或推送"
+                };
+                const cardRoot = {
+                    nodeType: 1,
+                    id: "card-root",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || node === envSection || node === actionRow || node === sourceLabel; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return [envSection, actionRow, sourceLabel]; },
+                    getBoundingClientRect() {
+                        return { width: 300, height: 255, left: 1484, right: 1784, top: 58.5, bottom: 313.5 };
+                    },
+                    textContent: "环境信息 变更 +348 -0 本地 main 提交或推送 来源 暂无来源"
+                };
+                const tallShell = {
+                    nodeType: 1,
+                    id: "tall-shell",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || cardRoot.contains(node); },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return [cardRoot, envSection, actionRow, sourceLabel]; },
+                    getBoundingClientRect() {
+                        return { width: 316, height: 999.5, left: 1484, right: 1800, top: 58.5, bottom: 1058 };
+                    },
+                    textContent: "环境信息 变更 +348 -0 本地 main 提交或推送 来源 暂无来源"
+                };
+                envSection.parentElement = cardRoot;
+                actionRow.parentElement = envSection;
+                sourceLabel.parentElement = cardRoot;
+                cardRoot.parentElement = tallShell;
+                document.querySelectorAll = function (selector) {
+                    if (String(selector).includes("aside") || String(selector).includes("section") || String(selector) === "aside,section,div") {
+                        return [tallShell, cardRoot, envSection];
+                    }
+                    return [];
+                };
+                document.elementFromPoint = function (_x, y) {
+                    if (y < 231) return envSection;
+                    if (y < 314) return sourceLabel;
+                    return tallShell;
+                };
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                hooks.renderDock({
+                    threadId: "visible:unknown",
+                    progress: "第 3 / 3 步",
+                    rows: [{ text: "验证锚点扩展到整张右栏卡片", status: "running", iconHtml: "" }],
+                    at: Date.now()
+                });
+                const top = dock.style.getPropertyValue("--cgl-plan-top");
+                const topPx = Number.parseFloat(top) || 0;
+                return JSON.stringify({
+                    hidden: dock.hidden,
+                    hiddenBy: dock.dataset.cglPlanHiddenBy || "",
+                    topPx,
+                    gapBelowInnerSection: topPx - 230.5,
+                    gapBelowCardRoot: topPx - 313.5
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["hidden"], serde_json::json!(false), "{result}");
+        assert_eq!(result["hiddenBy"], serde_json::json!(""), "{result}");
+        let gap_below_card_root = result["gapBelowCardRoot"].as_f64().unwrap_or(0.0);
+        let gap_below_inner_section = result["gapBelowInnerSection"].as_f64().unwrap_or(0.0);
+        assert!(
+            gap_below_card_root >= 8.0,
+            "dock must float below the whole visible right-rail card, got {result}"
+        );
+        assert!(
+            gap_below_inner_section >= 80.0,
+            "dock should not anchor to the inner environment section anymore: {result}"
+        );
+    }
+
+    #[test]
     fn plan_ui_hides_dock_when_native_environment_panel_disappears() {
         // 原生“环境信息”卡片被弹窗/侧边菜单顶掉后（比如切到 移交至工作树 弹窗，
         // 或者点开 审查/终端/浏览器 侧栏切换菜单），dock 不能落到一个瞎猜的默认位置，
@@ -11142,7 +11317,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 47"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 48"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -11234,7 +11409,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 47"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 48"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
