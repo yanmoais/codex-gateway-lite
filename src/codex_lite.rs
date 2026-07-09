@@ -193,7 +193,14 @@ pub fn build_model_catalog_json(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let context_window = entry.suffix_window.or(fallback_window).unwrap_or(272_000);
+            // Same fallback table used when auto-populating `contextWindow`
+            // for freshly-discovered models (`default_context_window_for_model_id`
+            // in main.rs), so an unknown model doesn't get a different
+            // default window depending on which code path fills it in.
+            let context_window = entry.suffix_window.or(fallback_window).unwrap_or_else(|| {
+                parse_window_token(crate::default_context_window_for_model_id(&entry.slug))
+                    .unwrap_or(272_000)
+            });
             json!({
                 "slug": entry.slug,
                 "id": entry.slug,

@@ -658,21 +658,54 @@ pub async fn open_chat_completions_proxy_request(
     }
     validate_upstream(relay)?;
 
-    let request_json: Value = serde_json::from_str(body)?;
+    let mut request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = upstream_http_client_with_user_agent(&effective_user_agent(
+    // Codex's own traffic always goes through /v1/responses (converted
+    // above in `upstream_request_parts`); this path is for direct
+    // `/v1/chat/completions` callers bypassing that conversion, so the
+    // context budget has to be applied here too or it silently never runs
+    // for those callers.
+    let report = apply_context_budget(&mut request_json, &relay.context_budget);
+    if report.was_trimmed {
+        log_upstream_event_deduped(
+            "chat_direct_budget_trim",
+            format!(
+                "Chat Completions 直连上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
+                report.original_estimated_tokens,
+                report.final_estimated_tokens,
+                report.images_stripped,
+                report.messages_removed,
+            ),
+        );
+    }
+    warn_if_still_over_budget(
+        "chat_direct_budget_still_over_after_trim",
+        &report,
+        relay.context_budget.max_input_tokens,
+    );
+    let request_builder = upstream_http_client_with_user_agent(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
     ))?
     .post(chat_completions_url(&relay.base_url))
     .bearer_auth(relay.api_key.trim())
     .header(reqwest::header::CONTENT_TYPE, "application/json")
-    .json(&request_json)
-    .send()
-    .await?;
+    .json(&request_json);
+    let upstream = send_upstream_request_with_header_timeout(
+        request_builder,
+        response_header_timeout(is_stream),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "供应商「{}」请求上游 Chat Completions 失败，endpoint: {}",
+            relay.name,
+            chat_completions_url(&relay.base_url)
+        )
+    })?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -787,6 +820,30 @@ fn throttle_repeated_log_line(
     }
 }
 
+/// After best-effort trimming, warn (deduped) if the request is still over
+/// budget instead of staying silent. Trimming only removes whole
+/// messages/images; a single oversized turn (e.g. one huge tool output) can
+/// still leave the request over `max_input_tokens`, and the upstream is then
+/// left to reject it with its own context-overflow error. Surfacing this
+/// here at least makes the cause visible instead of Codex seeing an opaque
+/// upstream 400 and blindly retrying.
+fn warn_if_still_over_budget(
+    event_key: &'static str,
+    report: &ContextBudgetReport,
+    max_input_tokens: u64,
+) {
+    if max_input_tokens == 0 || report.final_estimated_tokens <= max_input_tokens {
+        return;
+    }
+    log_upstream_event_deduped(
+        event_key,
+        format!(
+            "上下文预算裁剪后仍超出预算：{} > {} tokens（可能被上游以 context overflow 拒绝，建议减小单轮内容或调大 contextWindow/contextBudget）",
+            report.final_estimated_tokens, max_input_tokens
+        ),
+    );
+}
+
 fn upstream_request_parts(
     relay: &ProtocolProxyUpstream,
     request_json: Value,
@@ -816,6 +873,11 @@ fn upstream_request_parts(
                     ),
                 );
             }
+            warn_if_still_over_budget(
+                "responses_budget_still_over_after_trim",
+                &report,
+                relay.context_budget.max_input_tokens,
+            );
             Ok((
                 responses_url(&relay.base_url),
                 body,
@@ -823,6 +885,21 @@ fn upstream_request_parts(
             ))
         }
         RelayProtocol::ChatCompletions => {
+            let mut request_json = request_json;
+            let stale_reasoning_items_stripped = request_json
+                .get_mut("input")
+                .and_then(Value::as_array_mut)
+                .map(|items| strip_stale_reasoning_items(items))
+                .unwrap_or(0);
+            if stale_reasoning_items_stripped > 0 {
+                log_upstream_event_deduped(
+                    "chat_reasoning_strip",
+                    format!(
+                        "Chat Completions 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
+                        stale_reasoning_items_stripped,
+                    ),
+                );
+            }
             let mut chat_body = responses_to_chat_completions(request_json)?;
             let report = apply_context_budget(&mut chat_body, &relay.context_budget);
             if report.was_trimmed {
@@ -837,6 +914,11 @@ fn upstream_request_parts(
                     ),
                 );
             }
+            warn_if_still_over_budget(
+                "chat_budget_still_over_after_trim",
+                &report,
+                relay.context_budget.max_input_tokens,
+            );
             Ok((
                 chat_completions_url(&relay.base_url),
                 chat_body,
@@ -909,25 +991,44 @@ pub async fn handle_responses_proxy_request(
     handle_responses_upstream(upstream, &request_json).await
 }
 
+/// Read an upstream response body chunk-by-chunk, applying the idle timeout
+/// between chunks rather than to the whole download. A slow-but-still-active
+/// non-streaming generation can legitimately take longer than
+/// `UPSTREAM_STREAM_IDLE_TIMEOUT` in total; what actually indicates a stuck
+/// upstream is no new bytes arriving for that long.
+async fn read_upstream_body_with_idle_timeout(
+    response: &mut reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        match tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => body.extend_from_slice(&chunk),
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                return Err(anyhow::Error::new(error).context("读取上游响应体失败"));
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "上游响应体超过 {} 秒没有新数据，读取超时",
+                    UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+    Ok(body)
+}
+
 /// Convert an already-opened upstream response into a buffered `ProxyHttpResponse`.
 /// Useful as a fallback when true streaming cannot be used.
 pub async fn handle_responses_upstream(
-    upstream: UpstreamProxyResponse,
+    mut upstream: UpstreamProxyResponse,
     request_json: &Value,
 ) -> anyhow::Result<ProxyHttpResponse> {
     let status_code = upstream.status_code;
     let upstream_content_type = upstream.content_type;
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
-    let upstream_body =
-        tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, upstream.response.bytes())
-            .await
-            .with_context(|| {
-                format!(
-                    "上游响应体读取超过 {} 秒未完成",
-                    UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
-                )
-            })??;
+    let upstream_body = read_upstream_body_with_idle_timeout(&mut upstream.response).await?;
 
     if !(200..300).contains(&status_code) {
         let error =
@@ -1082,6 +1183,34 @@ fn push_sse(output: &mut String, event: &str, data: Value) {
     output.push_str("\ndata: ");
     output.push_str(&serde_json::to_string(&data).unwrap_or_default());
     output.push_str("\n\n");
+}
+
+/// Build a standalone `response.failed` SSE frame for the Responses
+/// passthrough path, where upstream bytes are relayed verbatim and never
+/// parsed into a `ChatSseState`. Used when the upstream stream is
+/// interrupted or idle-times-out, so Codex sees an explicit terminal
+/// failure event instead of the chunked stream just ending mid-flight.
+pub fn responses_passthrough_failure_sse(message: &str, error_type: &str) -> Vec<u8> {
+    let mut output = String::new();
+    let response = json!({
+        "id": "resp_compat",
+        "object": "response",
+        "status": "failed",
+        "output": [],
+        "error": {
+            "message": message,
+            "type": error_type
+        }
+    });
+    push_sse(
+        &mut output,
+        "response.failed",
+        json!({
+            "type": "response.failed",
+            "response": response
+        }),
+    );
+    output.into_bytes()
 }
 
 #[derive(Debug, Default)]
@@ -2204,6 +2333,10 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            if !pending_reasoning.is_empty() {
+                let reasoning = std::mem::take(pending_reasoning).join("\n");
+                append_reasoning_to_assistant_message(last, &reasoning);
+            }
             return;
         }
     }
@@ -4814,5 +4947,154 @@ mod repeated_log_tests {
             throttle_repeated_log_line(&mut state, "key_b", "msg".to_string(), t0, throttle)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod grok_review_fix_tests {
+    use super::*;
+
+    fn test_relay(
+        protocol: RelayProtocol,
+        context_budget: ContextBudgetConfig,
+    ) -> ProtocolProxyUpstream {
+        ProtocolProxyUpstream {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            api_key: "key".to_string(),
+            protocol,
+            user_agent: String::new(),
+            context_budget,
+        }
+    }
+
+    #[test]
+    fn chat_completions_relay_strips_stale_reasoning_items_too() {
+        // Before the fix, `strip_stale_reasoning_items` only ran on the
+        // Responses relay path; a stale `reasoning` item from a completed
+        // turn would survive conversion into `reasoning_content` on a Chat
+        // Completions message and get sent upstream, risking the same
+        // "thinking blocks cannot be modified" rejection the Responses path
+        // already guards against.
+        let request_json = json!({
+            "model": "test-model",
+            "input": [
+                { "role": "user", "content": "old question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_stale",
+                    "summary": [{ "type": "summary_text", "text": "stale thinking" }]
+                },
+                { "role": "assistant", "content": "old answer" },
+                { "role": "user", "content": "new question after model switch" }
+            ]
+        });
+        let relay = test_relay(
+            RelayProtocol::ChatCompletions,
+            ContextBudgetConfig::default(),
+        );
+        let (_, chat_body, wire_api) = upstream_request_parts(&relay, request_json).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
+        let messages = chat_body["messages"].as_array().unwrap();
+        let carries_stale_reasoning = messages.iter().any(|message| {
+            message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .map(|text| text.contains("stale thinking"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !carries_stale_reasoning,
+            "stale reasoning from a completed turn must not reach the Chat Completions body: {chat_body:?}"
+        );
+    }
+
+    #[test]
+    fn flush_tool_calls_merge_attaches_pending_reasoning_instead_of_dropping_it() {
+        // Before the fix, merging tool_calls into an already-pushed
+        // assistant message returned early without touching
+        // `pending_reasoning`, so reasoning that arrived between an
+        // assistant text turn and its follow-up tool call either got
+        // attached to the wrong message or spilled into a spurious
+        // trailing assistant message with empty content.
+        let body = json!({
+            "model": "test-model",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "earlier answer" }]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "in-between thinking" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "do_thing",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "result"
+                }
+            ]
+        });
+        let chat = responses_to_chat_completions(body).expect("converts");
+        let messages = chat["messages"].as_array().expect("messages array");
+        let assistant_messages: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            1,
+            "reasoning must not spill into a second spurious assistant message: {messages:?}"
+        );
+        let assistant = assistant_messages[0];
+        assert_eq!(
+            assistant.get("reasoning_content").and_then(Value::as_str),
+            Some("in-between thinking")
+        );
+        assert!(assistant.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn responses_passthrough_failure_sse_emits_response_failed_event() {
+        // Before the fix, an idle-timeout/interruption on the pure Responses
+        // passthrough streaming path just broke the loop with no SSE frame
+        // at all, leaving Codex to see the chunked stream end abruptly
+        // instead of a legible terminal failure.
+        let frame = responses_passthrough_failure_sse("boom", "upstream_timeout");
+        let text = String::from_utf8(frame).expect("utf8");
+        assert!(text.starts_with("event: response.failed\n"));
+        let data_line = text
+            .lines()
+            .find(|line| line.starts_with("data: "))
+            .expect("data line present");
+        let payload: Value = serde_json::from_str(&data_line["data: ".len()..]).unwrap();
+        assert_eq!(payload["type"], json!("response.failed"));
+        assert_eq!(payload["response"]["status"], json!("failed"));
+        assert_eq!(payload["response"]["error"]["message"], json!("boom"));
+        assert_eq!(
+            payload["response"]["error"]["type"],
+            json!("upstream_timeout")
+        );
+    }
+
+    #[test]
+    fn warn_if_still_over_budget_is_noop_when_within_budget_or_unlimited() {
+        let report = ContextBudgetReport {
+            final_estimated_tokens: 100,
+            ..Default::default()
+        };
+        // Should not panic; max_input_tokens == 0 means unlimited.
+        warn_if_still_over_budget("test_event_unlimited", &report, 0);
+        // Within budget: also should not panic (and has nothing to assert
+        // externally since this only logs to stderr).
+        warn_if_still_over_budget("test_event_within_budget", &report, 200);
     }
 }

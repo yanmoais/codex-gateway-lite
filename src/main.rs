@@ -1014,6 +1014,17 @@ fn validate_config(config: &LiteConfig) -> anyhow::Result<()> {
         bail!("API Key 为空；请设置 provider.apiKey 或 provider.apiKeyEnv");
     }
     validate_context_budget_for_config(&config.provider.context_budget)?;
+    if let Some(reserve_tokens) = parse_context_budget_token(&config.provider.context_budget) {
+        if let Some(window_tokens) = parse_window_token(&config.context_window) {
+            if window_tokens <= reserve_tokens {
+                bail!(
+                    "provider.contextBudget（{}）必须小于 contextWindow（{}）；contextBudget 是要在窗口顶部预留的裁剪余量，不能大于等于窗口本身，否则裁剪不会生效",
+                    format_token_budget(reserve_tokens),
+                    format_token_budget(window_tokens)
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1080,7 +1091,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
     if model_ids.is_empty() {
         bail!("供应商 /models 没有返回任何模型");
     }
-    let models = models_from_ids(&model_ids);
+    let models = models_from_ids(&model_ids, &[]);
     let common_config = match extract_common_config_from_home(&default_user_codex_home_dir()) {
         Ok(common_config) => {
             if !common_config.trim().is_empty() {
@@ -1199,7 +1210,7 @@ async fn refresh_config_models(path: &Path) -> anyhow::Result<usize> {
         bail!("供应商 /models 没有返回任何模型");
     }
     let current_model = strip_suffix(config.model.trim()).0;
-    config.models = models_from_ids(&model_ids);
+    config.models = models_from_ids(&model_ids, &original_config.models);
     config.model = if model_ids.iter().any(|id| id == &current_model) {
         current_model
     } else {
@@ -1235,11 +1246,32 @@ fn populate_missing_common_config_from_home(
     Ok(true)
 }
 
-fn models_from_ids(ids: &[String]) -> Vec<LiteModel> {
+/// Build the refreshed `models` list from a freshly-fetched `/models` id
+/// list, but keep any `contextWindow` the user (or a prior refresh) had
+/// already set for a model that is still present, instead of blindly
+/// re-deriving it from the built-in family table every time. Without this,
+/// a manual per-model override gets silently reset on the next refresh
+/// cycle since this always fully replaces `config.models`.
+fn models_from_ids(ids: &[String], existing_models: &[LiteModel]) -> Vec<LiteModel> {
+    let existing_windows: HashMap<&str, &str> = existing_models
+        .iter()
+        .filter_map(|model| match model {
+            LiteModel::Detailed { id, context_window } if !context_window.trim().is_empty() => {
+                Some((id.as_str(), context_window.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
     ids.iter()
-        .map(|id| LiteModel::Detailed {
-            id: id.to_string(),
-            context_window: default_context_window_for_model_id(id).to_string(),
+        .map(|id| {
+            let context_window = existing_windows
+                .get(id.as_str())
+                .map(|window| window.to_string())
+                .unwrap_or_else(|| default_context_window_for_model_id(id).to_string());
+            LiteModel::Detailed {
+                id: id.to_string(),
+                context_window,
+            }
         })
         .collect()
 }
@@ -1281,7 +1313,7 @@ const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
     ("grok-3", "128K"),
 ];
 
-fn default_context_window_for_model_id(id: &str) -> &'static str {
+pub(crate) fn default_context_window_for_model_id(id: &str) -> &'static str {
     let slug = normalized_model_slug(id);
     for (pattern, window) in MODEL_CONTEXT_WINDOW_TABLE {
         if slug.starts_with(pattern) {
@@ -4499,11 +4531,12 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
 
 struct ProtocolProxyRuntime {
     port: u16,
-    _handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for ProtocolProxyRuntime {
     fn drop(&mut self) {
+        self.handle.abort();
         println!("本地协议代理已停止：127.0.0.1:{}", self.port);
     }
 }
@@ -4549,8 +4582,38 @@ async fn start_protocol_proxy(config_path: PathBuf) -> anyhow::Result<ProtocolPr
     println!("本地协议代理已启动：http://{local_addr}/v1");
     Ok(ProtocolProxyRuntime {
         port: local_addr.port(),
-        _handle: handle,
+        handle,
     })
+}
+
+/// Start or stop the local protocol proxy so it always matches whether the
+/// current config actually needs it. Without this, an agent that had the
+/// proxy running (or not running) at startup would keep that state forever
+/// even after a config change flips `provider_uses_local_proxy`, leaving
+/// Codex pointed at a dead `127.0.0.1:57321` or a proxy nobody uses.
+async fn sync_protocol_proxy_lifecycle(
+    runtime: &mut Option<ProtocolProxyRuntime>,
+    needed: bool,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    match (needed, runtime.is_some()) {
+        (true, false) => {
+            println!(
+                "当前配置需要本地协议代理，准备监听 127.0.0.1:{}",
+                protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+            );
+            let started = start_protocol_proxy(config_path.to_path_buf())
+                .await
+                .context("当前配置需要本地协议代理")?;
+            *runtime = Some(started);
+        }
+        (false, true) => {
+            println!("配置已切换为 Responses 直连：停止本地协议代理 127.0.0.1:57321");
+            *runtime = None;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn handle_protocol_proxy_connection(
@@ -4562,6 +4625,25 @@ async fn handle_protocol_proxy_connection(
         Err(error) if protocol_proxy_request_closed_before_headers(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
+
+    // The bearer token Codex sends here is the fixed constant this agent
+    // wrote into Codex's own `experimental_bearer_token`, not a real
+    // upstream secret; this is a cheap guard against other local processes
+    // on the same machine casually hitting 127.0.0.1:57321 to ride along on
+    // the real upstream key, not a real authn boundary.
+    if request.method != "OPTIONS" && !request_has_valid_local_proxy_token(&request) {
+        let response = local_proxy_unauthorized_response();
+        stream
+            .write_all(&lite_http_response_bytes(
+                &response.status,
+                &response.content_type,
+                &response.body,
+            ))
+            .await
+            .context("写入本地协议代理响应失败")?;
+        stream.shutdown().await.ok();
+        return Ok(());
+    }
 
     // Streaming path for responses proxy (Chat Completions SSE → Responses SSE)
     if protocol_proxy::is_responses_proxy_path(&request.path) && request.method == "POST" {
@@ -4584,6 +4666,36 @@ async fn handle_protocol_proxy_connection(
     Ok(())
 }
 
+fn request_has_valid_local_proxy_token(request: &LiteHttpRequest) -> bool {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| {
+            value
+                .trim()
+                .strip_prefix("Bearer ")
+                .map(str::trim)
+                .unwrap_or("")
+                == LOCAL_PROXY_CODEX_BEARER_TOKEN
+        })
+        .unwrap_or(false)
+}
+
+fn local_proxy_unauthorized_response() -> protocol_proxy::ProxyHttpResponse {
+    protocol_proxy::ProxyHttpResponse {
+        status: "401 Unauthorized".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(&json!({
+            "error": {
+                "message": "unauthorized: missing or invalid local proxy bearer token",
+                "type": "invalid_request_error"
+            }
+        }))
+        .unwrap_or_default(),
+    }
+}
+
 fn protocol_proxy_request_closed_before_headers(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -4596,7 +4708,6 @@ async fn handle_streaming_responses_proxy(
     config_path: &Path,
 ) -> anyhow::Result<()> {
     let config = read_lite_config(config_path)?;
-    let upstream_config = protocol_proxy_upstream_from_config(&config)?;
     let user_agent = request
         .headers
         .iter()
@@ -4619,6 +4730,8 @@ async fn handle_streaming_responses_proxy(
                 return Ok(());
             }
         };
+    let request_model = request_json.get("model").and_then(Value::as_str);
+    let upstream_config = protocol_proxy_upstream_from_config(&config, request_model)?;
 
     let upstream = match protocol_proxy::open_responses_proxy_request(
         &request.body,
@@ -4670,20 +4783,32 @@ async fn handle_streaming_responses_proxy(
                 Ok(Ok(Some(chunk))) => write_http_chunk(&mut stream, &chunk).await?,
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => {
+                    let message = format!("Responses 上游流中断: {error}");
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_interrupted",
-                        format!("Responses 上游流中断: {error}"),
+                        message.clone(),
                     );
+                    let error_frame = protocol_proxy::responses_passthrough_failure_sse(
+                        &message,
+                        "upstream_error",
+                    );
+                    write_http_chunk(&mut stream, &error_frame).await.ok();
                     break;
                 }
                 Err(_) => {
+                    let message = format!(
+                        "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
+                        protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                    );
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_idle_timeout",
-                        format!(
-                            "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
-                            protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
-                        ),
+                        message.clone(),
                     );
+                    let error_frame = protocol_proxy::responses_passthrough_failure_sse(
+                        &message,
+                        "upstream_timeout",
+                    );
+                    write_http_chunk(&mut stream, &error_frame).await.ok();
                     break;
                 }
             }
@@ -4784,7 +4909,15 @@ async fn route_protocol_proxy_request(
     }
 
     let config = read_lite_config(config_path)?;
-    let upstream = protocol_proxy_upstream_from_config(&config)?;
+    let request_model: Option<String> =
+        serde_json::from_str::<Value>(&request.body)
+            .ok()
+            .and_then(|body| {
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+    let upstream = protocol_proxy_upstream_from_config(&config, request_model.as_deref())?;
     let user_agent = request
         .headers
         .iter()
@@ -4858,8 +4991,9 @@ async fn proxy_upstream_raw_response(
 
 fn protocol_proxy_upstream_from_config(
     config: &LiteConfig,
+    request_model: Option<&str>,
 ) -> anyhow::Result<protocol_proxy::ProtocolProxyUpstream> {
-    let context_budget = resolve_context_budget(config);
+    let context_budget = resolve_context_budget(config, request_model);
     Ok(protocol_proxy::ProtocolProxyUpstream {
         id: sanitize_provider_id(&config.provider.id),
         name: if config.provider.name.trim().is_empty() {
@@ -4880,25 +5014,63 @@ fn protocol_proxy_upstream_from_config(
     })
 }
 
-fn resolve_context_budget(config: &LiteConfig) -> protocol_proxy::ContextBudgetConfig {
+fn resolve_context_budget(
+    config: &LiteConfig,
+    request_model: Option<&str>,
+) -> protocol_proxy::ContextBudgetConfig {
+    let model_window = request_model.and_then(|id| model_context_window_override(config, id));
+    let context_window = model_window
+        .as_deref()
+        .unwrap_or(config.context_window.as_str());
     if let Some(reserve_tokens) = parse_context_budget_token(&config.provider.context_budget) {
         return protocol_proxy::ContextBudgetConfig::with_max_tokens(
-            explicit_context_budget_limit(reserve_tokens, &config.context_window),
+            explicit_context_budget_limit(reserve_tokens, context_window),
         );
     }
-    if !config.context_window.trim().is_empty() {
-        if let Some(tokens) = parse_window_token(config.context_window.trim()) {
+    if !context_window.trim().is_empty() {
+        if let Some(tokens) = parse_window_token(context_window.trim()) {
             return protocol_proxy::ContextBudgetConfig::from_context_window(tokens);
         }
     }
     protocol_proxy::ContextBudgetConfig::default()
 }
 
+/// Look up the requested model's own `contextWindow` override from
+/// `config.models`, if the catalog carries one for it. Falls back to
+/// `None` (caller then uses the single global `config.context_window`)
+/// when the model isn't listed or has no per-model window configured, so a
+/// small-window model doesn't get the large global window applied to it
+/// (under-trimmed) and vice versa.
+fn model_context_window_override(config: &LiteConfig, model_id: &str) -> Option<String> {
+    let requested = strip_suffix(model_id.trim()).0;
+    if requested.is_empty() {
+        return None;
+    }
+    config.models.iter().find_map(|model| match model {
+        LiteModel::Detailed { id, context_window } if !context_window.trim().is_empty() => {
+            if strip_suffix(id.trim()).0 == requested {
+                Some(context_window.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
 fn explicit_context_budget_limit(reserve_tokens: u64, context_window: &str) -> u64 {
-    parse_window_token(context_window)
-        .filter(|window_tokens| *window_tokens > reserve_tokens)
-        .map(|window_tokens| window_tokens - reserve_tokens)
-        .unwrap_or(reserve_tokens)
+    match parse_window_token(context_window) {
+        Some(window_tokens) if window_tokens > reserve_tokens => window_tokens - reserve_tokens,
+        // Misconfigured: contextBudget (reserve) is >= the known window, so
+        // `window - reserve` would be zero/negative. Returning reserve_tokens
+        // as-is here would make the budget *larger* than the window, i.e.
+        // effectively disable trimming. `validate_config` already rejects
+        // this combination up front; this branch is only a defensive
+        // fallback, so clamp to a conservative fraction of the window
+        // instead of silently defeating the budget.
+        Some(window_tokens) => window_tokens.saturating_mul(85) / 100,
+        None => reserve_tokens,
+    }
 }
 
 async fn read_lite_http_request(stream: &mut TcpStream) -> anyhow::Result<LiteHttpRequest> {
@@ -5047,22 +5219,16 @@ async fn run_agent(
     let config = read_lite_config(&config_path)
         .with_context(|| format!("读取 Lite 配置失败：{}", config_path.display()))?;
     validate_context_budget_for_config(&config.provider.context_budget)?;
-    if provider_uses_local_proxy(&config) {
-        println!(
-            "当前配置需要本地协议代理，准备监听 127.0.0.1:{}",
-            protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
-        );
-    }
-    let _protocol_proxy = if provider_uses_local_proxy(&config) {
-        Some(
-            start_protocol_proxy(config_path.clone())
-                .await
-                .context("当前配置需要本地协议代理")?,
-        )
-    } else {
+    let mut protocol_proxy_runtime: Option<ProtocolProxyRuntime> = None;
+    sync_protocol_proxy_lifecycle(
+        &mut protocol_proxy_runtime,
+        provider_uses_local_proxy(&config),
+        &config_path,
+    )
+    .await?;
+    if protocol_proxy_runtime.is_none() {
         println!("Responses 直连模式：不启动本地协议代理 127.0.0.1:57321");
-        None
-    };
+    }
     let interval = Duration::from_millis(interval_ms.max(1000));
     let app_dir = resolve_codex_app(app_path.as_deref()).with_context(|| {
         "识别 Codex App 路径失败；请运行 where-app，或通过 CODEX_GATEWAY_LITE_APP / --app 指定 Codex.exe"
@@ -5178,25 +5344,44 @@ async fn run_agent(
                 if let Ok(modified) = file_modified(&config_path) {
                     last_modified = Some(modified);
                 }
-                match read_lite_config(&config_path).and_then(|config| {
-                    apply_config(&config, codex_home.as_deref(), config.plan_hints)
-                }) {
-                    Ok(report) => {
-                        print_apply_report(&report);
-                        if cdp_was_ready {
-                            if let Err(error) = soft_reload_codex(debug_port).await {
-                                eprintln!("配置已写入，但软刷新失败：{error:#}");
-                                cdp_was_ready = false;
-                            } else if let Err(error) = wait_and_inject_lite_model_whitelist(
-                                debug_port,
+                match read_lite_config(&config_path) {
+                    Ok(new_config) => {
+                        match sync_protocol_proxy_lifecycle(
+                            &mut protocol_proxy_runtime,
+                            provider_uses_local_proxy(&new_config),
+                            &config_path,
+                        )
+                        .await
+                        {
+                            Ok(()) => match apply_config(
+                                &new_config,
                                 codex_home.as_deref(),
-                            )
-                            .await
-                            {
-                                eprintln!("Lite 模型白名单重注入失败：{error:#}");
-                                cdp_was_ready = false;
-                            } else {
-                                last_bridge_injection = Instant::now();
+                                new_config.plan_hints,
+                            ) {
+                                Ok(report) => {
+                                    print_apply_report(&report);
+                                    if cdp_was_ready {
+                                        if let Err(error) = soft_reload_codex(debug_port).await {
+                                            eprintln!("配置已写入，但软刷新失败：{error:#}");
+                                            cdp_was_ready = false;
+                                        } else if let Err(error) =
+                                            wait_and_inject_lite_model_whitelist(
+                                                debug_port,
+                                                codex_home.as_deref(),
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("Lite 模型白名单重注入失败：{error:#}");
+                                            cdp_was_ready = false;
+                                        } else {
+                                            last_bridge_injection = Instant::now();
+                                        }
+                                    }
+                                }
+                                Err(error) => eprintln!("应用配置失败：{error:#}"),
+                            },
+                            Err(error) => {
+                                eprintln!("同步本地协议代理状态失败，跳过本次配置应用：{error:#}")
                             }
                         }
                     }
@@ -11383,11 +11568,14 @@ not-a-pid garbage line without valid pid
                 context_budget: String::new(),
             },
             model: "gpt-5.5".to_string(),
-            models: models_from_ids(&[
-                "gpt-5.5".to_string(),
-                "openai/chatgpt-4o-latest".to_string(),
-                "claude-fable-5".to_string(),
-            ]),
+            models: models_from_ids(
+                &[
+                    "gpt-5.5".to_string(),
+                    "openai/chatgpt-4o-latest".to_string(),
+                    "claude-fable-5".to_string(),
+                ],
+                &[],
+            ),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -11462,7 +11650,7 @@ not-a-pid garbage line without valid pid
                 context_budget: String::new(),
             },
             model: "claude-fable-5".to_string(),
-            models: models_from_ids(&["claude-fable-5".to_string()]),
+            models: models_from_ids(&["claude-fable-5".to_string()], &[]),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -11501,7 +11689,7 @@ not-a-pid garbage line without valid pid
                 context_budget: "200K".to_string(),
             },
             model: "claude-fable-5".to_string(),
-            models: models_from_ids(&["claude-fable-5".to_string()]),
+            models: models_from_ids(&["claude-fable-5".to_string()], &[]),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -11654,7 +11842,7 @@ enabled = true
                 context_budget: String::new(),
             },
             model: "claude-fable-5".to_string(),
-            models: models_from_ids(&["claude-fable-5".to_string()]),
+            models: models_from_ids(&["claude-fable-5".to_string()], &[]),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -11811,7 +11999,7 @@ trusted_hash = "abc"
                 context_budget: String::new(),
             },
             model: "claude-fable-5".to_string(),
-            models: models_from_ids(&["claude-fable-5".to_string(), "gpt-5.5".to_string()]),
+            models: models_from_ids(&["claude-fable-5".to_string(), "gpt-5.5".to_string()], &[]),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -12096,7 +12284,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: true,
         };
-        let budget = resolve_context_budget(&config);
+        let budget = resolve_context_budget(&config, None);
         assert_eq!(budget.max_input_tokens, 800_000);
         assert_eq!(explicit_context_budget_limit(200_000, "1M"), 800_000);
     }
@@ -12158,9 +12346,146 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: true,
         };
-        let budget = resolve_context_budget(&config);
+        let budget = resolve_context_budget(&config, None);
         // 85% of 200K = 170K
         assert_eq!(budget.max_input_tokens, 170_000);
+    }
+
+    #[test]
+    fn explicit_context_budget_limit_clamps_when_reserve_would_exceed_window() {
+        // Before the fix, a reserve >= the window fell back to
+        // `reserve_tokens` itself, which is *larger* than the window, so the
+        // computed budget never actually trimmed anything.
+        let clamped = explicit_context_budget_limit(200_000, "100K");
+        assert!(
+            clamped < 100_000,
+            "clamped budget must stay below the window itself, got {clamped}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_context_budget_reserve_not_smaller_than_window() {
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "test".to_string(),
+                name: String::new(),
+                base_url: "https://api.example.com".to_string(),
+                api_key: "sk-test".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::ChatCompletions,
+                context_budget: "200K".to_string(),
+            },
+            model: "m".to_string(),
+            models: vec![LiteModel::Id("m".to_string())],
+            context_window: "100K".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+        };
+        let error = validate_config(&config).expect_err("reserve >= window must fail validation");
+        assert!(error.to_string().contains("contextBudget"));
+    }
+
+    #[test]
+    fn resolve_context_budget_uses_requested_models_own_context_window() {
+        // Before the fix, the budget always came from the single global
+        // `contextWindow`, even when the request targeted a specific model
+        // with its own (smaller or larger) `contextWindow` override.
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "test".to_string(),
+                name: String::new(),
+                base_url: "https://api.example.com".to_string(),
+                api_key: "sk-test".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::ChatCompletions,
+                context_budget: String::new(),
+            },
+            model: "small-model".to_string(),
+            models: vec![
+                LiteModel::Detailed {
+                    id: "small-model".to_string(),
+                    context_window: "128K".to_string(),
+                },
+                LiteModel::Detailed {
+                    id: "big-model".to_string(),
+                    context_window: "1M".to_string(),
+                },
+            ],
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+        };
+        // No explicit contextBudget reserve configured, so the budget is
+        // derived as 85% of whichever window applies.
+        let small_model_budget = resolve_context_budget(&config, Some("small-model"));
+        assert_eq!(small_model_budget.max_input_tokens, 108_800);
+        let big_model_budget = resolve_context_budget(&config, Some("big-model"));
+        assert_eq!(big_model_budget.max_input_tokens, 850_000);
+        // Unknown/unspecified model falls back to the global window.
+        let fallback_budget = resolve_context_budget(&config, None);
+        assert_eq!(fallback_budget.max_input_tokens, 850_000);
+    }
+
+    #[test]
+    fn models_from_ids_preserves_manually_overridden_context_window() {
+        // Before the fix, a `/models` refresh fully replaced `config.models`
+        // every time, silently discarding a context_window the user (or a
+        // prior refresh) had already set for a model that is still present
+        // in the new list.
+        let existing = vec![LiteModel::Detailed {
+            id: "claude-sonnet-5".to_string(),
+            context_window: "500K".to_string(),
+        }];
+        let refreshed = models_from_ids(&["claude-sonnet-5".to_string()], &existing);
+        match &refreshed[0] {
+            LiteModel::Detailed { context_window, .. } => assert_eq!(context_window, "500K"),
+            LiteModel::Id(_) => panic!("expected Detailed variant"),
+        }
+
+        // A genuinely new model with no prior override still gets the
+        // table-driven default.
+        let refreshed_new = models_from_ids(&["claude-opus-4-6".to_string()], &existing);
+        match &refreshed_new[0] {
+            LiteModel::Detailed { context_window, .. } => assert_eq!(context_window, "1M"),
+            LiteModel::Id(_) => panic!("expected Detailed variant"),
+        }
+    }
+
+    #[test]
+    fn local_proxy_bearer_token_check_accepts_correct_token_and_rejects_others() {
+        let valid = LiteHttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                format!("Bearer {LOCAL_PROXY_CODEX_BEARER_TOKEN}"),
+            )],
+            body: String::new(),
+        };
+        assert!(request_has_valid_local_proxy_token(&valid));
+
+        let missing = LiteHttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![],
+            body: String::new(),
+        };
+        assert!(!request_has_valid_local_proxy_token(&missing));
+
+        let wrong = LiteHttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer someone-elses-key".to_string(),
+            )],
+            body: String::new(),
+        };
+        assert!(!request_has_valid_local_proxy_token(&wrong));
     }
 
     #[test]
