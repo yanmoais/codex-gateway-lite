@@ -17,6 +17,7 @@ publish = false
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures-util = "0.3"
+getrandom = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "system-proxy"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

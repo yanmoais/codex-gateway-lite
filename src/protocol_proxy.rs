@@ -23,7 +23,7 @@ const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// `response.chunk()` forever: the local proxy holds the TCP connection to
 /// Codex open but silent, so Codex's own client-side idle timeout eventually
 /// fires and the session gets torn down with an opaque
-/// "stream disconnected before completion" error that gives BOSS no signal
+/// "stream disconnected before completion" error that gives the user no signal
 /// about what actually stalled. Enforcing our own shorter idle timeout here
 /// lets the proxy fail fast with a clear diagnostic instead.
 pub const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -350,8 +350,10 @@ fn chat_completion_to_response_with_context(
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
-        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let Some(reason) =
+        incomplete_details_reason(choice.get("finish_reason").and_then(Value::as_str))
+    {
+        response["incomplete_details"] = json!({ "reason": reason });
     }
     copy_response_request_fields(&mut response, original_request);
 
@@ -742,7 +744,7 @@ struct RepeatedLogState {
 /// Minimum gap between two printed lines for the same diagnostic `key`.
 /// Chosen to comfortably cover Codex's fast automatic-retry bursts (which
 /// can fire multiple attempts per second) while still surfacing an update
-/// quickly enough that BOSS can tell the retry loop is still alive.
+/// quickly enough that the user can tell the retry loop is still alive.
 const REPEATED_LOG_THROTTLE: Duration = Duration::from_secs(3);
 
 static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState>>> =
@@ -763,7 +765,7 @@ static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState
 /// both cases: it prints the first occurrence immediately, then goes quiet
 /// for the rest of the throttle window regardless of the exact wording, and
 /// on the next print folds in how many occurrences were suppressed in
-/// between so BOSS can still see the retry loop is active.
+/// between so the user can still see the retry loop is active.
 pub fn log_upstream_event_deduped(key: &'static str, message: String) {
     let mut state = REPEATED_LOG_STATE
         .lock()
@@ -1307,6 +1309,12 @@ impl ChatSseState {
     }
 
     fn handle_chat_chunk_into(&mut self, chunk: &Value, output: &mut String) {
+        // Some gateways keep sending chunks (usage frames, keep-alives)
+        // after `[DONE]`. Once the Responses stream is finalized we must
+        // not append more events after `response.completed`/`data: [DONE]`.
+        if self.completed {
+            return;
+        }
         if let Some(id) = chunk.get("id").and_then(Value::as_str) {
             self.response_id = response_id_from_chat_id(Some(id));
         }
@@ -1666,8 +1674,8 @@ impl ChatSseState {
 
         let status = response_status(self.finish_reason.as_deref());
         let mut response = self.base_response(status, self.completed_output_items());
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        if let Some(reason) = incomplete_details_reason(self.finish_reason.as_deref()) {
+            response["incomplete_details"] = json!({ "reason": reason });
         }
         copy_response_request_fields(&mut response, self.original_request.as_ref());
         push_sse(
@@ -3680,8 +3688,20 @@ fn effective_cache_creation_tokens(
 
 fn response_status(finish_reason: Option<&str>) -> &'static str {
     match finish_reason {
-        Some("length") => "incomplete",
+        Some("length") | Some("content_filter") => "incomplete",
         _ => "completed",
+    }
+}
+
+/// Map a Chat Completions `finish_reason` to the Responses
+/// `incomplete_details.reason` value. `content_filter` matters here: without
+/// it a filtered/truncated reply used to be reported as a normal
+/// `completed` response and Codex silently lost the tail of the content.
+fn incomplete_details_reason(finish_reason: Option<&str>) -> Option<&'static str> {
+    match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
     }
 }
 
@@ -4418,6 +4438,16 @@ pub fn apply_context_budget(body: &mut Value, budget: &ContextBudgetConfig) -> C
         };
     }
 
+    // Tool definitions are part of the upstream prompt too (Codex ships a
+    // large tool schema). Every per-phase "are we under budget yet?" check
+    // below must include them, or trimming stops early and the request is
+    // still over the real budget even though the report claims otherwise.
+    let tools_tokens = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| estimate_text_tokens(&serde_json::to_string(tools).unwrap_or_default()))
+        .unwrap_or(0);
+
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return ContextBudgetReport {
             original_estimated_tokens: original,
@@ -4448,10 +4478,11 @@ pub fn apply_context_budget(body: &mut Value, budget: &ContextBudgetConfig) -> C
         report.images_stripped += strip_images_from_message(&mut messages[i]);
     }
 
-    let current = messages
-        .iter()
-        .map(|m| estimate_message_tokens(m, image_est))
-        .sum::<u64>();
+    let current = tools_tokens
+        + messages
+            .iter()
+            .map(|m| estimate_message_tokens(m, image_est))
+            .sum::<u64>();
     if current <= budget.max_input_tokens {
         report.final_estimated_tokens = current;
         return report;
@@ -4468,10 +4499,11 @@ pub fn apply_context_budget(body: &mut Value, budget: &ContextBudgetConfig) -> C
         report.images_stripped += strip_images_from_message(&mut messages[i]);
     }
 
-    let current = messages
-        .iter()
-        .map(|m| estimate_message_tokens(m, image_est))
-        .sum::<u64>();
+    let current = tools_tokens
+        + messages
+            .iter()
+            .map(|m| estimate_message_tokens(m, image_est))
+            .sum::<u64>();
     if current <= budget.max_input_tokens {
         report.final_estimated_tokens = current;
         return report;
@@ -4486,10 +4518,11 @@ pub fn apply_context_budget(body: &mut Value, budget: &ContextBudgetConfig) -> C
     let keep_from = recent_start.max(system_end);
 
     if keep_from > system_end {
-        let mut running = messages
-            .iter()
-            .map(|m| estimate_message_tokens(m, image_est))
-            .sum::<u64>();
+        let mut running = tools_tokens
+            + messages
+                .iter()
+                .map(|m| estimate_message_tokens(m, image_est))
+                .sum::<u64>();
 
         let mut remove_up_to = system_end;
         for i in system_end..keep_from {
@@ -4511,14 +4544,66 @@ pub fn apply_context_budget(body: &mut Value, budget: &ContextBudgetConfig) -> C
             });
             messages.drain(system_end..remove_up_to);
             messages.insert(system_end, marker);
+            remove_orphaned_tool_messages(messages, system_end + 1, &mut report);
         }
     }
 
-    report.final_estimated_tokens = messages
-        .iter()
-        .map(|m| estimate_message_tokens(m, image_est))
-        .sum::<u64>();
+    report.final_estimated_tokens = tools_tokens
+        + messages
+            .iter()
+            .map(|m| estimate_message_tokens(m, image_est))
+            .sum::<u64>();
     report
+}
+
+/// After Phase 3 drops a prefix of old messages, the cut can land in the
+/// middle of a tool-call exchange: the assistant message carrying
+/// `tool_calls` gets removed while its `role: "tool"` replies survive.
+/// OpenAI-style upstreams reject such a request outright ("messages with
+/// role 'tool' must be a response to a preceding message with 'tool_calls'"),
+/// so drop any tool message whose `tool_call_id` no longer has a matching
+/// preceding assistant `tool_calls` entry.
+fn remove_orphaned_tool_messages(
+    messages: &mut Vec<Value>,
+    scan_from: usize,
+    report: &mut ContextBudgetReport,
+) {
+    let mut known_call_ids: BTreeSet<String> = BTreeSet::new();
+    let mut index = scan_from.min(messages.len());
+    // Seed with any tool_calls that survive before the scan window (system
+    // prefix cannot contain them, but stay defensive about the boundary).
+    for message in messages.iter().take(index) {
+        collect_tool_call_ids(message, &mut known_call_ids);
+    }
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if call_id.is_empty() || !known_call_ids.contains(call_id) {
+                messages.remove(index);
+                report.messages_removed += 1;
+                continue;
+            }
+        } else {
+            collect_tool_call_ids(message, &mut known_call_ids);
+        }
+        index += 1;
+    }
+}
+
+fn collect_tool_call_ids(message: &Value, known_call_ids: &mut BTreeSet<String>) {
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                if !id.is_empty() {
+                    known_call_ids.insert(id.to_string());
+                }
+            }
+        }
+    }
 }
 
 // ===== Responses Input Context Budget =====
@@ -4710,6 +4795,15 @@ pub fn apply_responses_context_budget(
         .get("instructions")
         .map(|v| estimate_text_tokens(&instruction_text(v)))
         .unwrap_or(0);
+    // Tool definitions count against the upstream context too; fold them
+    // into the fixed overhead so trimming doesn't stop while the request is
+    // still over the real budget.
+    let tools_tokens = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| estimate_text_tokens(&serde_json::to_string(tools).unwrap_or_default()))
+        .unwrap_or(0);
+    let fixed_tokens = instructions_tokens + tools_tokens;
 
     let input_is_string = body.get("input").and_then(Value::as_str).is_some();
     if input_is_string {
@@ -4718,8 +4812,8 @@ pub fn apply_responses_context_budget(
             .and_then(Value::as_str)
             .map(estimate_text_tokens)
             .unwrap_or(0);
-        report.original_estimated_tokens = instructions_tokens + text_tokens;
-        report.final_estimated_tokens = instructions_tokens + text_tokens;
+        report.original_estimated_tokens = fixed_tokens + text_tokens;
+        report.final_estimated_tokens = fixed_tokens + text_tokens;
         return report;
     }
 
@@ -4731,7 +4825,7 @@ pub fn apply_responses_context_budget(
         .iter()
         .map(|item| estimate_responses_item_tokens(item, image_est))
         .collect();
-    let original = instructions_tokens + item_tokens.iter().sum::<u64>();
+    let original = fixed_tokens + item_tokens.iter().sum::<u64>();
 
     if original <= budget.max_input_tokens {
         report.original_estimated_tokens = original;
@@ -4759,7 +4853,7 @@ pub fn apply_responses_context_budget(
         report.images_stripped += strip_images_from_responses_item(&mut items[i]);
     }
 
-    let current: u64 = instructions_tokens
+    let current: u64 = fixed_tokens
         + items
             .iter()
             .map(|i| estimate_responses_item_tokens(i, image_est))
@@ -4780,7 +4874,7 @@ pub fn apply_responses_context_budget(
         report.images_stripped += strip_images_from_responses_item(&mut items[i]);
     }
 
-    let current: u64 = instructions_tokens
+    let current: u64 = fixed_tokens
         + items
             .iter()
             .map(|i| estimate_responses_item_tokens(i, image_est))
@@ -4793,7 +4887,7 @@ pub fn apply_responses_context_budget(
     // Phase 3: Remove old items, keeping recent turns.
     let keep_from = find_responses_recent_boundary(items, CONTEXT_BUDGET_MIN_RECENT_TURNS);
     if keep_from > 0 {
-        let mut running = instructions_tokens
+        let mut running = fixed_tokens
             + items
                 .iter()
                 .map(|i| estimate_responses_item_tokens(i, image_est))
@@ -4817,15 +4911,55 @@ pub fn apply_responses_context_budget(
             });
             items.drain(0..remove_up_to);
             items.insert(0, marker);
+            remove_orphaned_responses_tool_outputs(items, &mut report);
         }
     }
 
-    report.final_estimated_tokens = instructions_tokens
+    report.final_estimated_tokens = fixed_tokens
         + items
             .iter()
             .map(|i| estimate_responses_item_tokens(i, image_est))
             .sum::<u64>();
     report
+}
+
+/// After budget trimming drops a prefix of old items, the cut can land in
+/// the middle of a tool exchange, leaving a `function_call_output` (or
+/// `custom_tool_call_output`) whose originating `function_call` was removed.
+/// Upstream providers reject such orphaned outputs, so drop any output item
+/// whose `call_id` no longer has a matching call earlier in the array.
+fn remove_orphaned_responses_tool_outputs(
+    items: &mut Vec<Value>,
+    report: &mut ContextBudgetReport,
+) {
+    let mut known_call_ids: BTreeSet<String> = BTreeSet::new();
+    let mut index = 0usize;
+    while index < items.len() {
+        let item = &items[index];
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") | Some("custom_tool_call") => {
+                if let Some(id) = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    if !id.is_empty() {
+                        known_call_ids.insert(id.to_string());
+                    }
+                }
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                if call_id.is_empty() || !known_call_ids.contains(call_id) {
+                    items.remove(index);
+                    report.messages_removed += 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
 }
 
 #[cfg(test)]
@@ -5096,5 +5230,63 @@ mod grok_review_fix_tests {
         // Within budget: also should not panic (and has nothing to assert
         // externally since this only logs to stderr).
         warn_if_still_over_budget("test_event_within_budget", &report, 200);
+    }
+
+    #[test]
+    fn chat_sse_ignores_chunks_after_done() {
+        let mut converter = ChatSseToResponsesConverter::default();
+        let before = converter.push_bytes(
+            b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        );
+        let before_text = String::from_utf8(before).unwrap();
+        assert!(before_text.contains("response.completed"));
+        assert!(before_text.contains("data: [DONE]"));
+
+        // Some gateways keep sending usage/keep-alive chunks after [DONE];
+        // nothing may be appended to the already-finalized stream.
+        let after = converter.push_bytes(
+            b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"late\"}}],\"usage\":{\"prompt_tokens\":1}}\n\n",
+        );
+        assert!(
+            after.is_empty(),
+            "no events may follow response.completed / [DONE], got: {}",
+            String::from_utf8_lossy(&after)
+        );
+        let finish = converter.finish();
+        assert!(finish.is_empty());
+    }
+
+    #[test]
+    fn content_filter_finish_reason_maps_to_incomplete_with_reason() {
+        // Non-streaming path.
+        let chat = serde_json::json!({
+            "id": "chatcmpl-2",
+            "model": "test",
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": { "role": "assistant", "content": "partial" }
+            }]
+        });
+        let response = chat_completion_to_response(chat).unwrap();
+        assert_eq!(response["status"], serde_json::json!("incomplete"));
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            serde_json::json!("content_filter")
+        );
+
+        // Streaming path.
+        let sse = "data: {\"id\":\"chatcmpl-3\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+        let converted = chat_sse_to_responses_sse(sse);
+        let completed_data = converted
+            .lines()
+            .filter(|line| line.starts_with("data: ") && line.contains("response.completed"))
+            .next_back()
+            .expect("completed event present");
+        let payload: Value = serde_json::from_str(&completed_data["data: ".len()..]).unwrap();
+        assert_eq!(payload["response"]["status"], json!("incomplete"));
+        assert_eq!(
+            payload["response"]["incomplete_details"]["reason"],
+            json!("content_filter")
+        );
     }
 }

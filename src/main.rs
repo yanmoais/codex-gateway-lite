@@ -21,10 +21,15 @@ use tokio_tungstenite::tungstenite::Message;
 mod codex_lite;
 mod protocol_proxy;
 
-const LOCAL_PROXY_CODEX_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
+/// Fallback bearer token used only when the random per-install token cannot
+/// be generated or persisted. See `local_proxy_codex_bearer_token`.
+const LOCAL_PROXY_FALLBACK_BEARER_TOKEN: &str = "codex-gateway-lite-local-proxy";
 const DEFAULT_CONTEXT_BUDGET: &str = "off";
 const SUGGESTED_CONTEXT_BUDGET: &str = "200K";
 const PLAN_UI_REINJECT_INTERVAL_SECS: u64 = 30;
+/// Number of consecutive failed CDP probes required before the agent decides
+/// the Codex App was really closed (vs. a transient renderer stall).
+const CDP_CLOSE_CONFIRM_FAILURES: u32 = 3;
 const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
 const PLAN_UI_INITIAL_HISTORY_SEED: bool = true;
 
@@ -654,6 +659,84 @@ fn default_user_codex_home_dir() -> PathBuf {
         .join(".codex")
 }
 
+/// The bearer token this agent writes into Codex's provider config as
+/// `experimental_bearer_token` and then requires on every request hitting
+/// the local proxy at 127.0.0.1:57321.
+///
+/// The token is generated randomly once per install and persisted to
+/// `~/.codex-gateway-lite/proxy-token` (0600 on Unix), so a process that can
+/// only read this public source code — but not the user's home directory —
+/// can no longer ride along on the real upstream key. It is still a
+/// same-user, same-machine guard, not a hard authn boundary.
+fn local_proxy_codex_bearer_token() -> &'static str {
+    static TOKEN: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(load_or_create_local_proxy_token);
+    TOKEN.as_str()
+}
+
+fn local_proxy_token_path() -> PathBuf {
+    user_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex-gateway-lite")
+        .join("proxy-token")
+}
+
+fn load_or_create_local_proxy_token() -> String {
+    let path = local_proxy_token_path();
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if is_plausible_local_proxy_token(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    let Some(token) = generate_local_proxy_token() else {
+        eprintln!("生成随机本地代理 token 失败，退回内置固定 token（防护降级为防误连）");
+        return LOCAL_PROXY_FALLBACK_BEARER_TOKEN.to_string();
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&path, format!("{token}\n")) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+            token
+        }
+        Err(error) => {
+            // Without persistence a fresh token would desync the token in
+            // Codex's config (written by `apply`) from the one a later agent
+            // process validates against, so degrade to the fixed fallback.
+            eprintln!(
+                "持久化本地代理 token 失败（{error}），退回内置固定 token：{}",
+                path.display()
+            );
+            LOCAL_PROXY_FALLBACK_BEARER_TOKEN.to_string()
+        }
+    }
+}
+
+fn is_plausible_local_proxy_token(token: &str) -> bool {
+    token.len() >= 16
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn generate_local_proxy_token() -> Option<String> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes).ok()?;
+    let mut token = String::with_capacity(4 + bytes.len() * 2);
+    token.push_str("cgl-");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    Some(token)
+}
+
 fn resolve_codex_home(codex_home: Option<&Path>) -> PathBuf {
     codex_home
         .map(Path::to_path_buf)
@@ -930,7 +1013,7 @@ fn build_profile(config: &LiteConfig) -> anyhow::Result<RelayProfile> {
     validate_config(config)?;
     let upstream_api_key = resolve_api_key(&config.provider)?;
     let codex_api_key = if provider_uses_local_proxy(config) {
-        LOCAL_PROXY_CODEX_BEARER_TOKEN.to_string()
+        local_proxy_codex_bearer_token().to_string()
     } else {
         upstream_api_key
     };
@@ -1304,7 +1387,7 @@ const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
     // claude-opus-4-6/4-7/4-8). Anthropic's own docs list a smaller
     // standalone context for some of these, but this gateway's deployment
     // is what actually matters here — do not shrink this without a
-    // BOSS-confirmed correction.
+    // user-confirmed correction.
     ("claude-sonnet", "1M"),
     ("claude-opus", "1M"),
     // xAI Grok 4 family: 256K context.
@@ -4677,7 +4760,7 @@ fn request_has_valid_local_proxy_token(request: &LiteHttpRequest) -> bool {
                 .strip_prefix("Bearer ")
                 .map(str::trim)
                 .unwrap_or("")
-                == LOCAL_PROXY_CODEX_BEARER_TOKEN
+                == local_proxy_codex_bearer_token()
         })
         .unwrap_or(false)
 }
@@ -5178,7 +5261,7 @@ fn protocol_proxy_error_response(error: &anyhow::Error) -> protocol_proxy::Proxy
     // from upstream at all: malformed request bodies, connection refused,
     // DNS failures, TLS errors, and header/stream timeouts talking to the
     // upstream provider. Without logging here, a repeated timeout/connection
-    // failure just shows up to BOSS as the pre-request diagnostic lines
+    // failure just shows up to the user as the pre-request diagnostic lines
     // (context trimming / stale-reasoning stripping) repeating on every
     // Codex retry with no visible explanation, since those diagnostics are
     // printed before the request is even sent and say nothing about why the
@@ -5261,6 +5344,7 @@ async fn run_agent(
     let mut active_plan_seed_attempts: HashMap<String, Instant> = HashMap::new();
     let mut cdp_was_ready = false;
     let mut cdp_has_connected = false;
+    let mut cdp_consecutive_failures = 0u32;
     let mut auto_launch_paused_after_close = false;
     let mut inject_immediately_after_connect = false;
 
@@ -5291,20 +5375,37 @@ async fn run_agent(
                 }
                 cdp_was_ready = true;
                 cdp_has_connected = true;
+                cdp_consecutive_failures = 0;
             }
             Err(error) => {
-                if cdp_was_ready {
-                    eprintln!("Codex CDP 连接断开：{error:#}");
-                    if cdp_has_connected {
-                        auto_launch_paused_after_close = true;
-                        eprintln!("检测到 Codex App 已关闭；暂停自动拉起，等待用户手动重新打开");
+                // A single failed probe can just be the renderer being busy
+                // for a moment (heavy GC, modal dialog). Only treat it as
+                // "user closed the app" after several consecutive failures,
+                // otherwise a transient hiccup permanently pauses
+                // auto-relaunch. While the disconnect is still unconfirmed
+                // (`cdp_consecutive_failures > 0`), auto-relaunch is also
+                // suppressed so a just-closed app doesn't get yanked back
+                // open before the pause decision is made.
+                if cdp_was_ready || cdp_consecutive_failures > 0 {
+                    cdp_consecutive_failures = cdp_consecutive_failures.saturating_add(1);
+                    if cdp_consecutive_failures >= CDP_CLOSE_CONFIRM_FAILURES {
+                        eprintln!("Codex CDP 连接断开：{error:#}");
+                        if cdp_has_connected {
+                            auto_launch_paused_after_close = true;
+                            eprintln!(
+                                "检测到 Codex App 已关闭；暂停自动拉起，等待用户手动重新打开"
+                            );
+                        }
+                        cdp_consecutive_failures = 0;
                     }
                 }
                 cdp_was_ready = false;
-                if should_retry_launch_codex(
-                    auto_launch_paused_after_close,
-                    last_launch_attempt.elapsed() >= Duration::from_secs(15),
-                ) {
+                if cdp_consecutive_failures == 0
+                    && should_retry_launch_codex(
+                        auto_launch_paused_after_close,
+                        last_launch_attempt.elapsed() >= Duration::from_secs(15),
+                    )
+                {
                     last_launch_attempt = Instant::now();
                     if let Err(launch_error) =
                         launch_codex(&app_dir, debug_port, codex_home.as_deref()).await
@@ -8477,7 +8578,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     // environment card inside a taller right-rail shell; if we pick that
     // outer shell, contentBottom lands near the bottom of the rail and the
     // dock is pushed far below the real "环境信息" card (exactly the drift
-    // BOSS keeps reporting). Prefer smaller area / higher top first, then
+    // users keep reporting). Prefer smaller area / higher top first, then
     // rightmost, so the actual compact card wins; after that, expand only to
     // a same-width safe card root so the dock does not sit inside the card.
     const candidates = Array.from(document.querySelectorAll("aside,section,div"))
@@ -8540,7 +8641,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     if (!matchedLabel) {
       contentBottom = Math.min(rect.bottom, rect.top + Math.max(120, Math.min(220, rect.height * 0.55)));
     } else {
-      // BOSS 实测：真实卡片里最后一行内容（比如"提交或推送"按钮文字）到卡片
+      // 实测：真实卡片里最后一行内容（比如"提交或推送"按钮文字）到卡片
       // 自己的外边缘之间通常只有 ~12px 的内边距/边框/阴影，跟 placeDock() 后面
       // 再叠加的 12px 悬浮间距几乎完全抵消，dock 贴着卡片边缘几乎零间距，
       // 肉眼看就是"贴着"。这种正常内边距场景（差值不大）直接贴卡片真实外边缘
@@ -8910,7 +9011,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   // this script's very first apply() above already ran once — the native
   // "环境信息" card's own layout can still shift slightly as it settles.
   // Without this, the dock can render its first frame flush against the
-  // card (BOSS-reported "贴着") and only self-correct up to 5s later via
+  // card (user-reported "贴着") and only self-correct up to 5s later via
   // the interval timer below. Re-run apply() a few more times over the
   // next ~1.6s so the dock catches up to the settled layout almost
   // immediately instead of visibly sitting in the wrong spot meanwhile.
@@ -9435,7 +9536,7 @@ CREATE TABLE threads (
 
     #[test]
     fn plan_ui_normalizes_progress_when_all_rows_are_done() {
-        // 复刻 BOSS 截图：卡片头部还停在旧的“第 1 / 3 步”，但下面三行都已经
+        // 复刻实测截图：卡片头部还停在旧的“第 1 / 3 步”，但下面三行都已经
         // 是完成态。此时应该以 rows 为准，把头部修正为“第 3 / 3 步”。
         let result = call_plan_ui_hook(
             "normalizedSnapshotForRows",
@@ -9443,7 +9544,7 @@ CREATE TABLE threads (
                 "threadId": "thread-done",
                 "progress": "第 1 / 3 步",
                 "rows": [
-                    { "text": "对照 Codex++ 会话定位实现", "status": "done" },
+                    { "text": "对照参考实现梳理会话定位", "status": "done" },
                     { "text": "补强本项目跨环境会话数据定位", "status": "done" },
                     { "text": "验证并推送修复", "status": "done" }
                 ]
@@ -9574,7 +9675,7 @@ CREATE TABLE threads (
                     getBoundingClientRect() {
                         return { width: 800, height: 46, left: 224, right: 1024, top: 0, bottom: 46 };
                     },
-                    textContent: "好问题 BOSS～图图来说清楚来源"
+                    textContent: "好问题～这里说清楚来源"
                 };
                 document.querySelectorAll = function (selector) {
                     return String(selector).includes("data-above-composer-portal") ? [] : [];
@@ -9597,7 +9698,7 @@ CREATE TABLE threads (
                 };
                 const hooks = window.__codexGatewayLitePlanUiTestHooks;
                 const current = hooks.currentThreadId();
-                const aliases = hooks.snapshotAliasIdsForThread("visible:好问题 BOSS～图图来说清楚来源");
+                const aliases = hooks.snapshotAliasIdsForThread("visible:好问题～这里说清楚来源");
                 const snapshot = hooks.snapshotForThread(current);
                 return JSON.stringify({
                     current,
@@ -9614,7 +9715,7 @@ CREATE TABLE threads (
         assert_eq!(result["sidebar"], serde_json::json!("local:history-thread"));
         assert_eq!(
             result["title"],
-            serde_json::json!("visible:好问题 BOSS～图图来说清楚来源")
+            serde_json::json!("visible:好问题～这里说清楚来源")
         );
         assert_eq!(
             result["aliases"],
@@ -9902,7 +10003,7 @@ CREATE TABLE threads (
 
     #[test]
     fn plan_ui_right_panel_click_cannot_hide_dock_while_environment_panel_exists() {
-        // BOSS 现场确认：任务卡片必须和 Codex 原生“环境信息”卡片共生。
+        // 现场确认：任务卡片必须和 Codex 原生“环境信息”卡片共生。
         // 只要原生卡片仍然存在且可见，点击右侧其它按钮/空白/展开内容都不能隐藏 dock。
         let mut ctx = plan_ui_test_context();
         let result = eval_json(
@@ -10084,7 +10185,7 @@ CREATE TABLE threads (
 
     #[test]
     fn plan_ui_anchors_dock_under_compact_environment_card_not_tall_shell() {
-        // BOSS 现场：右侧 rail 经常有一个更高的外层壳包住原生“环境信息”卡片。
+        // 现场复现：右侧 rail 经常有一个更高的外层壳包住原生“环境信息”卡片。
         // 旧逻辑按最靠右 / 更靠下的候选挑锚点，会误抓外层壳，contentBottom 被
         // 顶到壳底部，任务卡片就整张下沉到右侧中下部。必须优先贴紧真实卡片。
         let mut ctx = plan_ui_test_context();
@@ -10187,7 +10288,7 @@ CREATE TABLE threads (
                         { text: "定位 CLIProxyAPI 中 Grok function_call 编码路径与 namespace 丢失点", status: "done", iconHtml: "" },
                         { text: "实现 namespace 回填修复并保持 GPT/Claude 路径不变", status: "done", iconHtml: "" },
                         { text: "本地验证修复逻辑，备份并部署到 VPS CLIProxyAPI", status: "done", iconHtml: "" },
-                        { text: "关闭 Grok remap 做端到端验证，向 BOSS 汇报", status: "done", iconHtml: "" }
+                        { text: "关闭 Grok remap 做端到端验证并汇报", status: "done", iconHtml: "" }
                     ],
                     at: Date.now()
                 };
@@ -10215,7 +10316,7 @@ CREATE TABLE threads (
 
     #[test]
     fn plan_ui_leaves_visible_gap_instead_of_sitting_flush_against_card_edge() {
-        // BOSS 实测复现（通过 CDP 直接连正在跑的 Codex App 量出来的真实 DOM
+        // 实测复现（通过 CDP 直接连正在跑的 Codex App 量出来的真实 DOM
         // 坐标）：真实“环境信息”卡片自身 rect.bottom=230.5，但卡片内最后一行
         // 内容（“提交或推送”按钮）文字框的 bottom 只有 218.5 —— 中间 12px 是
         // 卡片自己的底部内边距/边框/阴影。旧逻辑拿 218.5 + 12px 悬浮间距去算
@@ -10481,7 +10582,7 @@ CREATE TABLE threads (
 
     #[test]
     fn plan_ui_initial_injection_schedules_settle_burst_reapplies() {
-        // BOSS 现场：agent 重启后 Codex.app 也整个冷启动，长会话历史还在
+        // 现场复现：agent 重启后 Codex.app 也整个冷启动，长会话历史还在
         // hydrate 的那几百毫秒里，脚本的第一次 apply() 可能贴着还没最终定型的
         // “环境信息”卡片算出一个偏低的位置，看起来任务卡贴着卡片；5 秒定时器
         // 才会纠正过来，这段时间里肉眼就能看到"贴着"。这里改成脚本刚注入时
@@ -10950,7 +11051,7 @@ CREATE TABLE threads (
             std::env::temp_dir().join(format!("codex-gateway-lite-native-thread-test-{unique}"));
         let sqlite_dir = home.join("sqlite");
         fs::create_dir_all(&sqlite_dir).expect("creates sqlite dir");
-        fs::write(home.join("config.toml"), r#"model_provider = "CPA""#)
+        fs::write(home.join("config.toml"), r#"model_provider = "gateway-x""#)
             .expect("writes config provider");
         let sessions_dir = home.join("sessions").join("2026").join("07").join("08");
         fs::create_dir_all(&sessions_dir).expect("creates sessions dir");
@@ -11078,7 +11179,7 @@ CREATE TABLE threads (
         assert_eq!(row.6, None);
         assert_eq!(row.7, "user");
         assert_eq!(row.8, "vscode");
-        assert_eq!(row.9, "CPA");
+        assert_eq!(row.9, "gateway-x");
         assert_eq!(row.10, "main");
         assert_eq!(row.11, 1_700_000_200);
         assert_eq!(row.12, 1_700_000_200_000);
@@ -11095,7 +11196,7 @@ CREATE TABLE threads (
                 .get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("CPA")
+            Some("gateway-x")
         );
         let archived_count = native_db
             .query_row(
@@ -11621,7 +11722,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         // as opposed to a non-2xx HTTP status returned *by* the upstream —
         // were silently turned into a 500 response to Codex with nothing
         // printed to stderr. When Codex then retried the exact same request,
-        // BOSS would only see the pre-request diagnostic lines (context
+        // the user would only see the pre-request diagnostic lines (context
         // trimming / stale-reasoning stripping) repeating forever with no
         // indication of what actually failed.
         let source = include_str!("main.rs");
@@ -12159,7 +12260,8 @@ not-a-pid garbage line without valid pid
         assert!(merged.contains("wire_api = \"responses\""));
         assert!(merged.contains("base_url = \"http://127.0.0.1:57321/v1\""));
         assert!(merged.contains(&format!(
-            "experimental_bearer_token = \"{LOCAL_PROXY_CODEX_BEARER_TOKEN}\""
+            "experimental_bearer_token = \"{}\"",
+            local_proxy_codex_bearer_token()
         )));
         assert!(!merged.contains("https://chat.example/v1"));
         assert!(!merged.contains("secret"));
@@ -12198,7 +12300,8 @@ not-a-pid garbage line without valid pid
         assert!(merged.contains("wire_api = \"responses\""));
         assert!(merged.contains("base_url = \"http://127.0.0.1:57321/v1\""));
         assert!(merged.contains(&format!(
-            "experimental_bearer_token = \"{LOCAL_PROXY_CODEX_BEARER_TOKEN}\""
+            "experimental_bearer_token = \"{}\"",
+            local_proxy_codex_bearer_token()
         )));
         assert!(!merged.contains("https://responses.example/v1"));
         assert!(!merged.contains("secret"));
@@ -12749,6 +12852,108 @@ mod context_budget_tests {
     }
 
     #[test]
+    fn context_budget_counts_tool_definitions_against_budget() {
+        // The messages alone fit in the budget, but tools push the request
+        // over; trimming must keep going instead of stopping early.
+        let budget = protocol_proxy::ContextBudgetConfig {
+            max_input_tokens: 120,
+            image_token_estimate: 800,
+        };
+        let big_tool_description = "x".repeat(400);
+        let mut messages = vec![make_system_msg("Be helpful")];
+        for i in 0..6 {
+            messages.push(make_user_msg(&format!("Old question {i} padding xxxxx")));
+            messages.push(make_assistant_msg(&format!("Old answer {i} padding yyyyy")));
+        }
+        messages.push(make_user_msg("Current question"));
+        let mut body = json!({
+            "messages": messages,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "update_plan",
+                    "description": big_tool_description,
+                    "parameters": { "type": "object" }
+                }
+            }]
+        });
+        let report = protocol_proxy::apply_context_budget(&mut body, &budget);
+        assert!(report.was_trimmed);
+        let tools_tokens = protocol_proxy::estimate_text_tokens(
+            &serde_json::to_string(body.get("tools").unwrap()).unwrap(),
+        );
+        assert!(
+            report.final_estimated_tokens >= tools_tokens,
+            "final estimate must include tool definition tokens"
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m["content"].as_str()).collect();
+        assert!(texts.contains(&"Current question"));
+    }
+
+    #[test]
+    fn context_budget_phase3_drops_orphaned_tool_messages() {
+        // Force Phase 3 to cut right between an assistant tool_calls message
+        // and its tool reply; the surviving orphan `role: "tool"` message
+        // must be dropped, or OpenAI-style upstreams reject the request.
+        let budget = protocol_proxy::ContextBudgetConfig {
+            max_input_tokens: 60,
+            image_token_estimate: 800,
+        };
+        let mut messages = vec![make_system_msg("Be helpful")];
+        messages.push(make_user_msg(
+            "Old question with lots of padding xxxxxxxxxxxxxxx",
+        ));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_old",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": "{\"path\": \"a-very-long-file-path-for-padding.txt\"}" }
+            }]
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_old",
+            "content": "old tool output with padding zzzzzzzzzzzzzzzzzzzz"
+        }));
+        messages.push(make_user_msg("Q2"));
+        messages.push(make_assistant_msg("A2"));
+        messages.push(make_user_msg("Q3"));
+        messages.push(make_assistant_msg("A3"));
+        messages.push(make_user_msg("Current question"));
+
+        let mut body = json!({ "messages": messages });
+        let report = protocol_proxy::apply_context_budget(&mut body, &budget);
+        assert!(report.was_trimmed);
+
+        let msgs = body["messages"].as_array().unwrap();
+        let mut known_ids = std::collections::HashSet::new();
+        for msg in msgs {
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tool_calls {
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        known_ids.insert(id.to_string());
+                    }
+                }
+            }
+            if msg.get("role").and_then(|v| v.as_str()) == Some("tool") {
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert!(
+                    known_ids.contains(call_id),
+                    "tool message {call_id} must follow a surviving tool_calls message"
+                );
+            }
+        }
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m["content"].as_str()).collect();
+        assert!(texts.contains(&"Current question"));
+    }
+
+    #[test]
     fn context_budget_from_context_window_uses_85_percent() {
         let budget = protocol_proxy::ContextBudgetConfig::from_context_window(200_000);
         assert_eq!(budget.max_input_tokens, 170_000);
@@ -12952,7 +13157,7 @@ mod context_budget_tests {
             path: "/v1/responses".to_string(),
             headers: vec![(
                 "authorization".to_string(),
-                format!("Bearer {LOCAL_PROXY_CODEX_BEARER_TOKEN}"),
+                format!("Bearer {}", local_proxy_codex_bearer_token()),
             )],
             body: String::new(),
         };
@@ -13155,6 +13360,99 @@ mod responses_budget_tests {
         let last = items.last().unwrap();
         assert_eq!(last["content"].as_str().unwrap(), "Current question");
         let _ = report;
+    }
+
+    #[test]
+    fn responses_budget_drops_orphaned_tool_outputs_after_trim() {
+        // The trim boundary lands right after a function_call, leaving its
+        // function_call_output orphaned; it must be dropped.
+        let budget = crate::protocol_proxy::ContextBudgetConfig {
+            max_input_tokens: 60,
+            image_token_estimate: 800,
+        };
+        let mut body = json!({
+            "model": "test",
+            "input": [
+                { "role": "user", "content": "old question with plenty of padding xxxxxxxxxxxxxxxxxxxxxxx" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_old",
+                    "name": "read_file",
+                    "arguments": "{\"path\": \"some-long-path-for-padding.txt\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_old",
+                    "output": "old output with padding yyyyyyyyyyyyyyyyyyyyyyyyyyy"
+                },
+                { "role": "user", "content": "Q2" },
+                { "role": "assistant", "content": "A2" },
+                { "role": "user", "content": "Q3" },
+                { "role": "assistant", "content": "A3" },
+                { "role": "user", "content": "Current question" }
+            ]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert!(report.was_trimmed);
+        let items = body["input"].as_array().unwrap();
+        let mut known_ids = std::collections::HashSet::new();
+        for item in items {
+            match item.get("type").and_then(|v| v.as_str()) {
+                Some("function_call") | Some("custom_tool_call") => {
+                    if let Some(id) = item.get("call_id").and_then(|v| v.as_str()) {
+                        known_ids.insert(id.to_string());
+                    }
+                }
+                Some("function_call_output") | Some("custom_tool_call_output") => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    assert!(
+                        known_ids.contains(call_id),
+                        "output {call_id} must have a surviving originating call"
+                    );
+                }
+                _ => {}
+            }
+        }
+        let last = items.last().unwrap();
+        assert_eq!(last["content"].as_str().unwrap(), "Current question");
+    }
+
+    #[test]
+    fn responses_budget_counts_tool_definitions_against_budget() {
+        let budget = crate::protocol_proxy::ContextBudgetConfig {
+            max_input_tokens: 120,
+            image_token_estimate: 800,
+        };
+        let big_tool_description = "x".repeat(400);
+        let mut input = Vec::new();
+        for i in 0..6 {
+            input.push(
+                json!({ "role": "user", "content": format!("Old question {i} padding xxxxx") }),
+            );
+            input.push(
+                json!({ "role": "assistant", "content": format!("Old answer {i} padding yyyyy") }),
+            );
+        }
+        input.push(json!({ "role": "user", "content": "Current question" }));
+        let mut body = json!({
+            "model": "test",
+            "input": input,
+            "tools": [{
+                "type": "function",
+                "name": "update_plan",
+                "description": big_tool_description,
+                "parameters": { "type": "object" }
+            }]
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert!(report.was_trimmed);
+        let tools_tokens = crate::protocol_proxy::estimate_text_tokens(
+            &serde_json::to_string(body.get("tools").unwrap()).unwrap(),
+        );
+        assert!(
+            report.final_estimated_tokens >= tools_tokens,
+            "final estimate must include tool definition tokens"
+        );
     }
 
     #[test]
