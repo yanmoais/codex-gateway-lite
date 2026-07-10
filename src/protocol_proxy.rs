@@ -49,6 +49,7 @@ const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
     Default,
+    AnthropicThinking,
     DeepSeek,
     LowHigh,
     OpenRouter,
@@ -4152,6 +4153,15 @@ fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
         ChatReasoningStyle::ReasoningSplit => {
             result["reasoning_split"] = json!(reasoning_enabled);
         }
+        ChatReasoningStyle::AnthropicThinking => {
+            // Claude's own `thinking` object needs the raw effort string
+            // (for the budget_tokens table), not just the on/off boolean
+            // the other styles use above, and it must not fall through to
+            // the generic `reasoning_effort` mapping below (Claude doesn't
+            // accept that field — see `supports_reasoning_effort`).
+            apply_anthropic_thinking(result, body);
+            return;
+        }
         _ => {}
     }
 
@@ -4181,6 +4191,75 @@ fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
             result["reasoning_effort"] = json!(mapped);
         }
         _ => {}
+    }
+}
+
+/// Budget (in tokens) Anthropic's native `thinking.budget_tokens` uses per
+/// Codex reasoning tier. Codex's effort enum
+/// (none/minimal/low/medium/high/xhigh/max/ultra) has no official mapping to
+/// Anthropic's token budget, so these are hand-picked, doubling from `low`
+/// up to `xhigh` and continuing the curve for the gpt-5.6-sol-only
+/// `max`/`ultra` tiers so picking them on a Claude model still yields a
+/// larger budget than `xhigh` instead of silently no-op'ing.
+fn anthropic_thinking_budget_tokens(effort: &str) -> Option<u64> {
+    match effort {
+        "low" => Some(2048),
+        "medium" => Some(8192),
+        "high" => Some(16384),
+        "xhigh" => Some(32768),
+        "max" => Some(49152),
+        "ultra" => Some(65536),
+        _ => None,
+    }
+}
+
+/// Maps the Responses `reasoning.effort` string onto Anthropic's native
+/// `thinking` object (`{"type":"enabled","budget_tokens":N}` or
+/// `{"type":"disabled"}`) and applies the request-shape constraints
+/// Anthropic enforces whenever thinking is enabled:
+/// - `temperature`/`top_p` must be left at their API defaults (Anthropic
+///   rejects a non-default `temperature` and rejects `top_p` outright while
+///   thinking is on), so both are stripped rather than forwarded as
+///   possibly-invalid values.
+/// - `max_tokens` must be strictly greater than `budget_tokens`, so a
+///   caller-supplied `max_tokens` at or under the budget gets bumped just
+///   above it.
+fn apply_anthropic_thinking(result: &mut Value, body: &Value) {
+    let Some(effort) = body
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+    else {
+        return;
+    };
+
+    let thinking = match effort.as_str() {
+        "none" | "minimal" => json!({ "type": "disabled" }),
+        _ => match anthropic_thinking_budget_tokens(&effort) {
+            Some(budget_tokens) => json!({ "type": "enabled", "budget_tokens": budget_tokens }),
+            // Unrecognized effort value: leave `thinking` untouched rather
+            // than guess at a budget.
+            None => return,
+        },
+    };
+    let enabling = thinking["type"] == "enabled";
+    result["thinking"] = thinking;
+
+    if enabling {
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("temperature");
+            obj.remove("top_p");
+        }
+        if let (Some(max_tokens), Some(budget_tokens)) = (
+            result.get("max_tokens").and_then(Value::as_u64),
+            result
+                .pointer("/thinking/budget_tokens")
+                .and_then(Value::as_u64),
+        ) {
+            if max_tokens <= budget_tokens {
+                result["max_tokens"] = json!(budget_tokens + 1024);
+            }
+        }
     }
 }
 
@@ -4224,6 +4303,9 @@ fn infer_chat_reasoning_style(model: &str) -> ChatReasoningStyle {
     if model.contains("stepfun") || model.contains("step-3.5-flash-2603") {
         return ChatReasoningStyle::LowHigh;
     }
+    if model.contains("claude") || model.contains("anthropic") {
+        return ChatReasoningStyle::AnthropicThinking;
+    }
     ChatReasoningStyle::Default
 }
 
@@ -4257,6 +4339,10 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
             "high" => Some("high"),
             "xhigh" => Some("xhigh"),
             "max" => Some("max"),
+            // gpt-5.6-sol-only tier; falls through to here for any
+            // non-Anthropic style that reaches this table (Claude never
+            // does — it's fully handled by `apply_anthropic_thinking`).
+            "ultra" => Some("ultra"),
             _ => None,
         },
     }

@@ -132,6 +132,35 @@ pub fn parse_model_suffix(raw: &str) -> (String, Option<u64>) {
     (raw.to_string(), None)
 }
 
+/// Preferred model-picker ordering: newest flagship families first (user
+/// preference), matched by prefix against the lowercased slug. Models not
+/// listed keep their upstream relative order after all listed ones, which
+/// naturally sinks embedding/image models to the bottom. Add new flagship
+/// generations to the head of this list as they ship.
+const MODEL_PICKER_PRIORITY: &[&str] = &[
+    "gpt-5.6",
+    "claude-fable-5",
+    "claude-sonnet-5",
+    "grok-4.5",
+    "grok-4.3",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+];
+
+fn model_picker_rank(slug: &str) -> usize {
+    let slug = slug
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .to_ascii_lowercase();
+    MODEL_PICKER_PRIORITY
+        .iter()
+        .position(|prefix| slug.starts_with(prefix))
+        .unwrap_or(MODEL_PICKER_PRIORITY.len())
+}
+
 pub fn collect_catalog_entries(
     model_list: &str,
     model_windows: &HashMap<String, String>,
@@ -175,6 +204,7 @@ pub fn collect_catalog_entries(
         }
     }
 
+    list_entries.sort_by_key(|entry| model_picker_rank(&entry.slug));
     entries.append(&mut list_entries);
     entries
 }
@@ -222,24 +252,7 @@ pub fn build_model_catalog_json(
                 "priority": 1000 + index,
                 "visibility": "list",
                 "supported_in_api": true,
-                "supported_reasoning_levels": [
-                    {
-                        "effort": "low",
-                        "description": "Fast responses with lighter reasoning"
-                    },
-                    {
-                        "effort": "medium",
-                        "description": "Balances speed and reasoning depth for everyday tasks"
-                    },
-                    {
-                        "effort": "high",
-                        "description": "Greater reasoning depth for complex problems"
-                    },
-                    {
-                        "effort": "xhigh",
-                        "description": "Extra high reasoning depth for complex problems"
-                    }
-                ],
+                "supported_reasoning_levels": supported_reasoning_levels_for_model(&entry.slug),
                 "default_reasoning_level": "medium",
                 "default_reasoning_summary": "none",
                 "default_verbosity": "low",
@@ -257,7 +270,13 @@ pub fn build_model_catalog_json(
                     "mode": "tokens",
                     "limit": 10000
                 },
-                "additional_speed_tiers": [],
+                // `additional_speed_tiers` is the deprecated Codex catalog field
+                // for the "Fast" speed pill; Codex's frontend still reads it
+                // even though it's marked deprecated upstream. The intended
+                // replacement (`service_tiers` / `default_service_tier`) has
+                // an unexplored schema, so it's left untouched below and the
+                // legacy field keeps carrying speed-tier info for now.
+                "additional_speed_tiers": additional_speed_tiers_for_model(&entry.slug),
                 "service_tiers": [],
                 "availability_nux": Value::Null,
                 "upgrade": Value::Null
@@ -301,6 +320,97 @@ fn is_anthropic_family_model(slug: &str) -> bool {
         .unwrap_or(slug)
         .to_ascii_lowercase();
     model.contains("claude") || model.contains("anthropic")
+}
+
+fn reasoning_level_entry(effort: &str, description: &str) -> Value {
+    json!({ "effort": effort, "description": description })
+}
+
+/// Default four-tier reasoning ladder shared by every model family except
+/// the ones with bespoke copy below (gpt-5.6-sol's extra max/ultra tiers,
+/// and Claude's thinking-budget phrasing).
+fn default_reasoning_levels() -> Vec<Value> {
+    vec![
+        reasoning_level_entry("low", "Fast responses with lighter reasoning"),
+        reasoning_level_entry(
+            "medium",
+            "Balances speed and reasoning depth for everyday tasks",
+        ),
+        reasoning_level_entry("high", "Greater reasoning depth for complex problems"),
+        reasoning_level_entry("xhigh", "Extra high reasoning depth for complex problems"),
+    ]
+}
+
+/// Per-model-family ladder for the catalog `supported_reasoning_levels`
+/// field. Has to line up with the Codex frontend's own hardcoded per-model
+/// ceilings: gpt-5.6-sol (and its bare `gpt-5.6` alias, which routes to Sol
+/// — see the `MODEL_CONTEXT_WINDOW_TABLE` comment in main.rs) goes up to
+/// `ultra`; gpt-5.6-terra/luna top out at `xhigh` like everything else.
+/// Claude gets thinking-budget-flavored copy because the upstream wire
+/// representation is Anthropic's native `thinking` object rather than a
+/// `reasoning.effort` string (see `apply_chat_reasoning_options` in
+/// protocol_proxy.rs).
+fn supported_reasoning_levels_for_model(slug: &str) -> Vec<Value> {
+    let model = slug
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .to_ascii_lowercase();
+
+    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+        let mut levels = default_reasoning_levels();
+        levels.push(reasoning_level_entry(
+            "max",
+            "Maximum reasoning depth for the hardest problems",
+        ));
+        levels.push(reasoning_level_entry(
+            "ultra",
+            "Ultra reasoning that consumes usage faster",
+        ));
+        return levels;
+    }
+
+    if is_anthropic_family_model(&model) {
+        return vec![
+            reasoning_level_entry("low", "Fast responses with minimal thinking budget"),
+            reasoning_level_entry("medium", "Balanced thinking budget for everyday tasks"),
+            reasoning_level_entry("high", "Deep thinking for complex problems"),
+            reasoning_level_entry("xhigh", "Maximum thinking budget for the hardest problems"),
+        ];
+    }
+
+    default_reasoning_levels()
+}
+
+/// Claude flagship families that get the "Fast" speed pill in Codex's model
+/// picker (`additional_speed_tiers`). Matched by prefix against the
+/// lowercased, provider-stripped slug, so dated/suffixed variants still
+/// match — including a `[1m]` long-context suffix, which `parse_model_suffix`
+/// already strips into `suffix_window` before the slug gets here, but a
+/// prefix match would tolerate it either way.
+const CLAUDE_FAST_TIER_PREFIXES: &[&str] = &[
+    "claude-fable-5",
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+];
+
+fn additional_speed_tiers_for_model(slug: &str) -> Vec<Value> {
+    let model = slug
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .to_ascii_lowercase();
+    if CLAUDE_FAST_TIER_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    {
+        return vec![json!("fast")];
+    }
+    Vec::new()
 }
 
 pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
@@ -932,6 +1042,153 @@ mod tests {
         }
         body.push_str("</dict>\n</plist>\n");
         fs::write(contents_dir.join("Info.plist"), body).expect("write Info.plist");
+    }
+
+    #[test]
+    fn collect_catalog_entries_orders_newest_flagship_families_first() {
+        let model_list = "claude-fable-5\nclaude-opus-4-8\nclaude-opus-4-5-20251101\ngrok-4.3\ngrok-4.20-multi-agent-0309\ngrok-3-mini-fast\ngrok-imagine-image\ngpt-5.6-sol\ngpt-5.6-terra\ntext-embedding-3-small\nclaude-sonnet-5\ngrok-4.5\nclaude-opus-4-7";
+        let entries = collect_catalog_entries(model_list, &HashMap::new(), "");
+        let slugs: Vec<&str> = entries.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "claude-fable-5",
+                "claude-sonnet-5",
+                "grok-4.5",
+                "grok-4.3",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+                // Unlisted models keep upstream relative order at the bottom.
+                "claude-opus-4-5-20251101",
+                "grok-4.20-multi-agent-0309",
+                "grok-3-mini-fast",
+                "grok-imagine-image",
+                "text-embedding-3-small",
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_catalog_entries_keeps_current_model_first_despite_ranking() {
+        let model_list = "gpt-5.6-sol\ngrok-4.3\nclaude-fable-5";
+        let entries = collect_catalog_entries(model_list, &HashMap::new(), "grok-4.3");
+        let slugs: Vec<&str> = entries.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["grok-4.3", "gpt-5.6-sol", "claude-fable-5"]);
+    }
+
+    fn reasoning_efforts(levels: &[Value]) -> Vec<&str> {
+        levels
+            .iter()
+            .map(|level| level["effort"].as_str().expect("effort is a string"))
+            .collect()
+    }
+
+    #[test]
+    fn supported_reasoning_levels_gpt_5_6_sol_gets_six_tiers_with_bespoke_max_ultra_copy() {
+        for slug in ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-sol-2026-07-09"] {
+            let levels = supported_reasoning_levels_for_model(slug);
+            assert_eq!(
+                reasoning_efforts(&levels),
+                vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+                "slug {slug} should expose all six tiers"
+            );
+            assert_eq!(
+                levels[4]["description"].as_str(),
+                Some("Maximum reasoning depth for the hardest problems")
+            );
+            assert_eq!(
+                levels[5]["description"].as_str(),
+                Some("Ultra reasoning that consumes usage faster")
+            );
+        }
+    }
+
+    #[test]
+    fn supported_reasoning_levels_gpt_5_6_terra_and_luna_stay_at_four_tiers() {
+        for slug in ["gpt-5.6-terra", "gpt-5.6-luna"] {
+            let levels = supported_reasoning_levels_for_model(slug);
+            assert_eq!(
+                reasoning_efforts(&levels),
+                vec!["low", "medium", "high", "xhigh"],
+                "slug {slug} should stay capped at xhigh like the official Terra ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_reasoning_levels_claude_family_uses_thinking_budget_copy() {
+        for slug in [
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "openai/claude-fable-5",
+        ] {
+            let levels = supported_reasoning_levels_for_model(slug);
+            assert_eq!(
+                reasoning_efforts(&levels),
+                vec!["low", "medium", "high", "xhigh"]
+            );
+            assert_eq!(
+                levels[0]["description"].as_str(),
+                Some("Fast responses with minimal thinking budget")
+            );
+            assert_eq!(
+                levels[1]["description"].as_str(),
+                Some("Balanced thinking budget for everyday tasks")
+            );
+            assert_eq!(
+                levels[2]["description"].as_str(),
+                Some("Deep thinking for complex problems")
+            );
+            assert_eq!(
+                levels[3]["description"].as_str(),
+                Some("Maximum thinking budget for the hardest problems")
+            );
+        }
+    }
+
+    #[test]
+    fn supported_reasoning_levels_other_models_keep_generic_four_tier_copy() {
+        for slug in ["grok-4.5", "text-embedding-3-small"] {
+            let levels = supported_reasoning_levels_for_model(slug);
+            assert_eq!(
+                reasoning_efforts(&levels),
+                vec!["low", "medium", "high", "xhigh"]
+            );
+            assert_eq!(
+                levels[0]["description"].as_str(),
+                Some("Fast responses with lighter reasoning")
+            );
+        }
+    }
+
+    #[test]
+    fn additional_speed_tiers_claude_flagship_models_get_fast_tier() {
+        for slug in [
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "openai/claude-sonnet-5",
+        ] {
+            assert_eq!(
+                additional_speed_tiers_for_model(slug),
+                vec![json!("fast")],
+                "slug {slug} should expose the fast speed tier"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_speed_tiers_non_flagship_models_stay_empty() {
+        for slug in ["grok-4.5", "claude-opus-4-5-20251101", "gpt-5.6-sol"] {
+            assert!(
+                additional_speed_tiers_for_model(slug).is_empty(),
+                "slug {slug} should not get the fast speed tier"
+            );
+        }
     }
 
     #[test]

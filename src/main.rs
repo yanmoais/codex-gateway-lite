@@ -4414,7 +4414,7 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
   }
 
   function modelReasoningEfforts() {
-    return ["minimal", "low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
 
   function positiveInteger(value) {
@@ -7676,7 +7676,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 48;
+  const SCRIPT_VERSION = 49;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -7703,6 +7703,8 @@ const PLAN_UI_SCRIPT: &str = r#"
     rightPanelDismissedAt: Number(previousState?.rightPanelDismissedAt || 0),
     rightPanelDismissedPanelSignature: previousState?.rightPanelDismissedPanelSignature || "",
     rightRailFollowUntil: 0,
+    dockNode: previousState?.dockNode || null,
+    dockContainer: previousState?.dockContainer || null,
   };
   window.__codexGatewayLitePlanUiState = state;
   if (previousState?.version === SCRIPT_VERSION
@@ -7719,21 +7721,17 @@ const PLAN_UI_SCRIPT: &str = r#"
       style.id = STYLE_ID;
       document.documentElement.appendChild(style);
     }
-    style.textContent = `
+    const styleContent = `
       @keyframes cgl-plan-spin {
         to { transform: rotate(360deg); }
       }
       [${MARK}="dock"] {
-        position: fixed !important;
-        top: var(--cgl-plan-top, 92px) !important;
-        right: var(--cgl-plan-right, 24px) !important;
-        left: auto !important;
-        bottom: auto !important;
-        z-index: 50 !important;
-        width: var(--cgl-plan-width, min(360px, calc(100vw - 48px))) !important;
-        max-width: calc(100vw - 48px) !important;
-        max-height: min(46vh, calc(100vh - var(--cgl-plan-top, 92px) - 24px)) !important;
+        position: static !important;
+        width: auto !important;
+        max-width: 100% !important;
+        margin: 10px 0 !important;
         overflow: auto !important;
+        max-height: min(46vh, 480px) !important;
         box-sizing: border-box !important;
         border: 0.5px solid color-mix(in srgb, CanvasText 14%, transparent) !important;
         border-radius: 12px !important;
@@ -7747,6 +7745,18 @@ const PLAN_UI_SCRIPT: &str = r#"
       }
       [${MARK}="dock"][hidden] {
         display: none !important;
+      }
+      [${MARK}="dock"][data-cgl-plan-mode="floating"] {
+        position: fixed !important;
+        top: var(--cgl-plan-top, 92px) !important;
+        right: var(--cgl-plan-right, 24px) !important;
+        left: auto !important;
+        bottom: auto !important;
+        z-index: 50 !important;
+        width: var(--cgl-plan-width, min(360px, calc(100vw - 48px))) !important;
+        max-width: calc(100vw - 48px) !important;
+        max-height: min(46vh, calc(100vh - var(--cgl-plan-top, 92px) - 24px)) !important;
+        margin: 0 !important;
       }
       [${MARK}="dock"] .cgl-plan-meta {
         display: flex !important;
@@ -7837,7 +7847,7 @@ const PLAN_UI_SCRIPT: &str = r#"
         color: color-mix(in srgb, CanvasText 62%, transparent) !important;
       }
       @media (max-width: 760px) {
-        [${MARK}="dock"] {
+        [${MARK}="dock"][data-cgl-plan-mode="floating"] {
           top: 72px !important;
           right: 12px !important;
           width: min(360px, calc(100vw - 24px)) !important;
@@ -7846,6 +7856,11 @@ const PLAN_UI_SCRIPT: &str = r#"
         }
       }
     `;
+    // Rewriting identical textContent still fires a childList mutation on the
+    // <style> node every apply, which keeps the mutation observer busy.
+    if (style.textContent !== styleContent) {
+      style.textContent = styleContent;
+    }
   }
 
   function text(el) {
@@ -8980,13 +8995,29 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function ensureDock() {
-    let dock = document.getElementById(DOCK_ID);
+    // React 重渲染会把 dock 整个从 DOM 移除，此时 getElementById 会返回 null；
+    // state.dockNode 保住的是同一个节点对象，重新插入即可保留 innerHTML/dataset，
+    // 不会闪一下变空。
+    let dock = state.dockNode || document.getElementById(DOCK_ID);
     if (!dock) {
       dock = document.createElement("div");
       dock.id = DOCK_ID;
       dock.setAttribute(MARK, "dock");
       dock.hidden = true;
-      document.documentElement.appendChild(dock);
+    }
+    state.dockNode = dock;
+    const container = rightRailCardStackContainer();
+    if (container) {
+      const lastChild = container.children && container.children[container.children.length - 1];
+      if (dock.parentElement !== container || lastChild !== dock) {
+        container.appendChild(dock);
+      }
+      dock.dataset.cglPlanMode = "inline";
+    } else {
+      if (dock.parentElement !== document.documentElement) {
+        document.documentElement.appendChild(dock);
+      }
+      dock.dataset.cglPlanMode = "floating";
     }
     return dock;
   }
@@ -9131,6 +9162,36 @@ const PLAN_UI_SCRIPT: &str = r#"
     return { node: panel, rect, contentBottom: Math.min(Math.max(contentBottom, rect.top), rect.bottom) };
   }
 
+  function rightRailCardStackContainer() {
+    // Sticky container: once picked, keep using it until it dies. The dock's
+    // own presence inside the container changes what environmentPanelInfo()
+    // resolves on the next pass, so re-probing every apply makes the pick
+    // oscillate between two ancestors and the dock reparents itself at
+    // frame rate (measured 69 add/remove pairs per second as a visible
+    // left-right jitter of the whole right rail).
+    const sticky = state.dockContainer;
+    if (sticky && sticky.isConnected && visible(sticky)) {
+      const stickyRect = sticky.getBoundingClientRect();
+      if (stickyRect.width >= 220 && stickyRect.width <= 560) return sticky;
+    }
+    state.dockContainer = null;
+    const cardRoot = environmentPanelInfo()?.node || null;
+    if (!cardRoot) return null;
+    const container = cardRoot.parentElement || null;
+    if (!container || container === document.body || container === document.documentElement) return null;
+    // A usable card-stack container is a real Element we can append to;
+    // reject anything managed by us (never true in practice, cheap to check)
+    // and anything without appendChild so a surprising DOM shape falls back
+    // to floating instead of throwing.
+    if (managedNode(container) || typeof container.appendChild !== "function") return null;
+    if (!visible(container)) return null;
+    const rect = container.getBoundingClientRect();
+    if (!(rect.width >= 220 && rect.width <= 560)) return null;
+    if (typeof container.contains === "function" && !container.contains(cardRoot)) return null;
+    state.dockContainer = container;
+    return container;
+  }
+
   function rightRailFallbackPanelInfo() {
     if (blockingOverlayActive()) return null;
     const candidates = Array.from(document.querySelectorAll("aside,section,div"))
@@ -9185,6 +9246,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function placeDock(dock) {
+    if (dock.dataset.cglPlanMode === "inline") return true;
     const anchor = environmentPanelInfo();
     if (!anchor) return false;
     const rect = anchor.rect;
@@ -9413,6 +9475,19 @@ const PLAN_UI_SCRIPT: &str = r#"
     return Array.from(mutations || []).some((mutation) => {
       const target = mutation.target;
       if (!target || target.nodeType !== 1 || managedNode(target)) return false;
+      if (mutation.type === "childList") {
+        // Reparenting our own dock fires childList mutations whose target is
+        // the (native) container — managedNode(target) can't filter those.
+        // If every added/removed node is ours, this mutation is self-inflicted
+        // and must not schedule another apply, or the dock move feeds back
+        // into itself as a frame-rate reparenting loop.
+        const nodes = [];
+        mutation.addedNodes?.forEach?.((node) => nodes.push(node));
+        mutation.removedNodes?.forEach?.((node) => nodes.push(node));
+        if (nodes.length && nodes.every((node) => node.nodeType !== 1 || managedNode(node))) {
+          return false;
+        }
+      }
       const rect = target.getBoundingClientRect?.();
       const nearRightRail = rect
         && rect.width > 16
@@ -9540,6 +9615,7 @@ const PLAN_UI_SCRIPT: &str = r#"
       snapshotForThread,
       directSnapshotForSeed,
       externalSnapshotForThread,
+      rightRailCardStackContainer,
       rightSideExpandedContentRect,
       rightSideExpandedContentSignature,
       rightSideExpandedContentInfoFromPoint,
@@ -11066,6 +11142,237 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_right_rail_card_stack_container_validates_width_and_appendable() {
+        // 纯逻辑覆盖 rightRailCardStackContainer()：环境卡本身固定不变，只切换它
+        // parentElement 指向的候选容器，验证宽度范围、appendChild 可用性、
+        // contains() 校验这几条护栏各自单独生效。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                globalThis.innerWidth = 1800;
+                globalThis.innerHeight = 1070;
+                const envCard = {
+                    nodeType: 1,
+                    id: "env-card",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 300, height: 160, left: 1484, right: 1784, top: 70.5, bottom: 230.5 };
+                    },
+                    textContent: "环境信息 变更 +348 -0 本地 main 提交或推送"
+                };
+                document.querySelectorAll = function (selector) {
+                    if (String(selector).includes("aside") || String(selector).includes("section") || String(selector) === "aside,section,div") {
+                        return [envCard];
+                    }
+                    return [];
+                };
+                document.elementFromPoint = function () { return envCard; };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+
+                function makeContainer(overrides) {
+                    return Object.assign({
+                        nodeType: 1,
+                        id: "container",
+                        parentElement: null,
+                        closest() { return null; },
+                        contains(node) { return node === this || node === envCard; },
+                        getAttribute() { return null; },
+                        appendChild(child) { child.parentElement = this; return child; },
+                        getBoundingClientRect() {
+                            return { width: 320, height: 500, left: 1480, right: 1800, top: 40, bottom: 540 };
+                        },
+                        textContent: ""
+                    }, overrides);
+                }
+
+                envCard.parentElement = makeContainer({ id: "valid" });
+                const validResult = hooks.rightRailCardStackContainer();
+
+                envCard.parentElement = makeContainer({
+                    id: "too-wide",
+                    getBoundingClientRect() {
+                        return { width: 900, height: 500, left: 900, right: 1800, top: 40, bottom: 540 };
+                    }
+                });
+                const tooWideResult = hooks.rightRailCardStackContainer();
+
+                envCard.parentElement = makeContainer({ id: "non-appendable", appendChild: undefined });
+                const nonAppendableResult = hooks.rightRailCardStackContainer();
+
+                envCard.parentElement = makeContainer({
+                    id: "not-containing",
+                    contains(node) { return node === this; }
+                });
+                const notContainingResult = hooks.rightRailCardStackContainer();
+
+                envCard.parentElement = null;
+                const noParentResult = hooks.rightRailCardStackContainer();
+
+                return JSON.stringify({
+                    validId: validResult?.id || null,
+                    tooWideIsNull: tooWideResult === null,
+                    nonAppendableIsNull: nonAppendableResult === null,
+                    notContainingIsNull: notContainingResult === null,
+                    noParentIsNull: noParentResult === null
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["validId"], serde_json::json!("valid"), "{result}");
+        assert_eq!(result["tooWideIsNull"], serde_json::json!(true), "{result}");
+        assert_eq!(result["nonAppendableIsNull"], serde_json::json!(true), "{result}");
+        assert_eq!(result["notContainingIsNull"], serde_json::json!(true), "{result}");
+        assert_eq!(result["noParentIsNull"], serde_json::json!(true), "{result}");
+    }
+
+    #[test]
+    fn plan_ui_mounts_dock_inline_inside_right_rail_card_stack_container() {
+        // 集成覆盖 ensureDock()：容器可用时 dock 挂进容器末尾、data-cgl-plan-mode
+        // 切到 inline、placeDock 不再算悬浮坐标；反复渲染不应该无谓重新
+        // appendChild（否则会跟自身的 MutationObserver 形成反馈循环）；节点被
+        // React 移出容器后，下一次渲染要把同一个节点对象重新插回去，
+        // innerHTML 不丢、不重新生成。
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                globalThis.innerWidth = 1800;
+                globalThis.innerHeight = 1070;
+                const envActions = {
+                    nodeType: 1,
+                    id: "env-actions",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains() { return false; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return []; },
+                    getBoundingClientRect() {
+                        return { width: 268, height: 28, left: 1500, right: 1768, top: 190.5, bottom: 218.5 };
+                    },
+                    textContent: "提交或推送"
+                };
+                const envCard = {
+                    nodeType: 1,
+                    id: "env-card",
+                    parentElement: null,
+                    closest() { return null; },
+                    contains(node) { return node === this || node === envActions; },
+                    getAttribute() { return null; },
+                    querySelectorAll() { return [envActions]; },
+                    getBoundingClientRect() {
+                        return { width: 300, height: 160, left: 1484, right: 1784, top: 70.5, bottom: 230.5 };
+                    },
+                    textContent: "环境信息 变更 +348 -0 本地 main 提交或推送"
+                };
+                let appendCount = 0;
+                const stack = {
+                    nodeType: 1,
+                    id: "right-rail-stack",
+                    parentElement: null,
+                    children: [],
+                    closest() { return null; },
+                    contains(node) { return node === this || node === envCard || node === envActions || this.children.includes(node); },
+                    getAttribute() { return null; },
+                    getBoundingClientRect() {
+                        return { width: 320, height: 860, left: 1480, right: 1800, top: 40, bottom: 900 };
+                    },
+                    appendChild(child) {
+                        appendCount += 1;
+                        const idx = this.children.indexOf(child);
+                        if (idx !== -1) this.children.splice(idx, 1);
+                        this.children.push(child);
+                        child.parentElement = this;
+                        return child;
+                    },
+                    textContent: ""
+                };
+                envCard.parentElement = stack;
+                stack.children.push(envCard);
+                document.querySelectorAll = function (selector) {
+                    if (String(selector).includes("aside") || String(selector).includes("section") || String(selector) === "aside,section,div") {
+                        return [envCard];
+                    }
+                    return [];
+                };
+                document.elementFromPoint = function () { return envCard; };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                const snapshot = {
+                    threadId: "visible:unknown",
+                    progress: "第 1 / 1 步",
+                    rows: [{ text: "验证 dock 挂进右栏卡片栈容器", status: "running", iconHtml: "" }],
+                    at: Date.now()
+                };
+
+                hooks.renderDock(snapshot);
+                const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const firstMode = dock.dataset.cglPlanMode;
+                const firstParentIsStack = dock.parentElement === stack;
+                const firstIsLast = stack.children[stack.children.length - 1] === dock;
+                const firstTop = dock.style.getPropertyValue("--cgl-plan-top");
+                const firstHtml = dock.innerHTML;
+                const appendsAfterFirst = appendCount;
+
+                // 原地重复渲染，不应该产生新的 appendChild（否则会跟自己的
+                // MutationObserver 互相触发，陷入死循环）。
+                hooks.renderDock(snapshot);
+                const appendsAfterSecond = appendCount;
+
+                // 模拟 React 把 dock 从容器里挪走，节点对象本身还活着。
+                const removedIdx = stack.children.indexOf(dock);
+                stack.children.splice(removedIdx, 1);
+                dock.parentElement = null;
+                hooks.renderDock(snapshot);
+                const reinsertedParentIsStack = dock.parentElement === stack;
+                const reinsertedIsLast = stack.children[stack.children.length - 1] === dock;
+                const htmlPreservedAfterReinsert = dock.innerHTML === firstHtml && firstHtml.length > 0;
+                const appendsAfterReinsert = appendCount;
+
+                return JSON.stringify({
+                    firstMode,
+                    firstParentIsStack,
+                    firstIsLast,
+                    firstTop,
+                    appendsAfterFirst,
+                    appendsAfterSecond,
+                    reinsertedParentIsStack,
+                    reinsertedIsLast,
+                    htmlPreservedAfterReinsert,
+                    appendsAfterReinsert
+                });
+            })()"#,
+        );
+
+        assert_eq!(result["firstMode"], serde_json::json!("inline"), "{result}");
+        assert_eq!(result["firstParentIsStack"], serde_json::json!(true), "{result}");
+        assert_eq!(result["firstIsLast"], serde_json::json!(true), "{result}");
+        assert_eq!(result["firstTop"], serde_json::json!(""), "{result}");
+        assert_eq!(result["appendsAfterFirst"], serde_json::json!(1), "{result}");
+        assert_eq!(
+            result["appendsAfterSecond"], result["appendsAfterFirst"],
+            "re-render with no DOM disturbance must not re-append the dock: {result}"
+        );
+        assert_eq!(result["reinsertedParentIsStack"], serde_json::json!(true), "{result}");
+        assert_eq!(result["reinsertedIsLast"], serde_json::json!(true), "{result}");
+        assert_eq!(
+            result["htmlPreservedAfterReinsert"],
+            serde_json::json!(true),
+            "{result}"
+        );
+        let appends_after_second = result["appendsAfterSecond"].as_i64().unwrap_or(-1);
+        let appends_after_reinsert = result["appendsAfterReinsert"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            appends_after_reinsert,
+            appends_after_second + 1,
+            "removal must trigger exactly one re-append, not a loop: {result}"
+        );
+    }
+
+    #[test]
     fn plan_ui_initial_injection_schedules_settle_burst_reapplies() {
         // 现场复现：agent 重启后 Codex.app 也整个冷启动，长会话历史还在
         // hydrate 的那几百毫秒里，脚本的第一次 apply() 可能贴着还没最终定型的
@@ -11906,7 +12213,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 48"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 49"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -11998,7 +12305,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 48"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 49"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
@@ -13062,7 +13369,10 @@ enabled = true
 
     #[test]
     fn chat_completions_reasoning_effort_preserves_selected_tier_for_supported_models() {
-        for effort in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+        // "max"/"ultra" are the gpt-5.6-sol-only top tiers; both must still
+        // fall through the generic (non-Anthropic, non-DeepSeek/LowHigh)
+        // mapping table so a Default-style upstream gets them verbatim.
+        for effort in ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] {
             let converted = protocol_proxy::responses_to_chat_completions(json!({
                 "model": "gpt-5.5",
                 "input": "hi",
@@ -13076,6 +13386,123 @@ enabled = true
                 "selected effort {effort} must be forwarded to upstream"
             );
         }
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_maps_every_reasoning_tier() {
+        let cases: &[(&str, Value)] = &[
+            ("none", json!({ "type": "disabled" })),
+            ("minimal", json!({ "type": "disabled" })),
+            ("low", json!({ "type": "enabled", "budget_tokens": 2048 })),
+            (
+                "medium",
+                json!({ "type": "enabled", "budget_tokens": 8192 }),
+            ),
+            ("high", json!({ "type": "enabled", "budget_tokens": 16384 })),
+            (
+                "xhigh",
+                json!({ "type": "enabled", "budget_tokens": 32768 }),
+            ),
+            ("max", json!({ "type": "enabled", "budget_tokens": 49152 })),
+            (
+                "ultra",
+                json!({ "type": "enabled", "budget_tokens": 65536 }),
+            ),
+        ];
+
+        for (effort, expected_thinking) in cases {
+            let converted = protocol_proxy::responses_to_chat_completions(json!({
+                "model": "claude-sonnet-5",
+                "input": "hi",
+                "reasoning": { "effort": effort }
+            }))
+            .expect("responses request converts");
+
+            assert_eq!(
+                &converted["thinking"], expected_thinking,
+                "effort {effort} should map to {expected_thinking:?}"
+            );
+            assert!(
+                converted.get("reasoning_effort").is_none(),
+                "Claude must not also receive a bare reasoning_effort string for {effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_ignores_unrecognized_effort_values() {
+        let converted = protocol_proxy::responses_to_chat_completions(json!({
+            "model": "claude-opus-4-8",
+            "input": "hi",
+            "reasoning": { "effort": "extreme" }
+        }))
+        .expect("responses request converts");
+
+        assert!(
+            converted.get("thinking").is_none(),
+            "unrecognized effort values must not produce a guessed thinking payload"
+        );
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_strips_temperature_and_top_p_when_enabled() {
+        let converted = protocol_proxy::responses_to_chat_completions(json!({
+            "model": "claude-sonnet-5",
+            "input": "hi",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "reasoning": { "effort": "high" }
+        }))
+        .expect("responses request converts");
+
+        assert_eq!(converted["thinking"]["type"], json!("enabled"));
+        assert!(converted.get("temperature").is_none());
+        assert!(converted.get("top_p").is_none());
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_leaves_temperature_alone_when_disabled() {
+        let converted = protocol_proxy::responses_to_chat_completions(json!({
+            "model": "claude-sonnet-5",
+            "input": "hi",
+            "temperature": 0.7,
+            "reasoning": { "effort": "none" }
+        }))
+        .expect("responses request converts");
+
+        assert_eq!(converted["thinking"], json!({ "type": "disabled" }));
+        assert_eq!(converted["temperature"], json!(0.7));
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_bumps_max_tokens_above_budget() {
+        let converted = protocol_proxy::responses_to_chat_completions(json!({
+            "model": "claude-sonnet-5",
+            "input": "hi",
+            "max_output_tokens": 4000,
+            "reasoning": { "effort": "high" }
+        }))
+        .expect("responses request converts");
+
+        // budget_tokens for "high" is 16384; the requested max_tokens (4000)
+        // sits under that, so Anthropic's max_tokens > budget_tokens rule
+        // forces a bump to budget_tokens + 1024.
+        assert_eq!(converted["thinking"]["budget_tokens"], json!(16384));
+        assert_eq!(converted["max_tokens"], json!(17408));
+    }
+
+    #[test]
+    fn chat_completions_anthropic_thinking_leaves_max_tokens_alone_when_already_above_budget() {
+        let converted = protocol_proxy::responses_to_chat_completions(json!({
+            "model": "claude-sonnet-5",
+            "input": "hi",
+            "max_output_tokens": 50000,
+            "reasoning": { "effort": "high" }
+        }))
+        .expect("responses request converts");
+
+        assert_eq!(converted["thinking"]["budget_tokens"], json!(16384));
+        assert_eq!(converted["max_tokens"], json!(50000));
     }
 
     #[test]
