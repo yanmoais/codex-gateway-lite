@@ -189,6 +189,9 @@ codex-gateway-lite providers [--config <config.json>]
 codex-gateway-lite add-provider [--config <config.json>]
 codex-gateway-lite use-provider <id> [--config <config.json>] [--codex-home <dir>] [--no-apply] [--debug-port 9229] [--no-plan-ui]
 codex-gateway-lite remove-provider <id> [--config <config.json>]
+codex-gateway-lite set-context-budget <200K|off> [--config <config.json>]
+codex-gateway-lite set-aggregate <on|off> [--config <config.json>]
+codex-gateway-lite edit-provider <id> [--config <config.json>]
 codex-gateway-lite where-app [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>]
 ```
 
@@ -260,6 +263,13 @@ cargo run --manifest-path Cargo.toml -- remove-provider old-gateway
 - 每个供应商按自己的 `modelFilter`（前缀匹配，留空=不过滤）只贡献自己分组的模型，避免重复中转站/重复分组的模型互相打架；
 - 所有供应商（含未激活的 `providers[]`）过滤后的模型会合并去重成一份菜单喂给 Codex，同名模型按参与顺序先到先得（顶层供应商优先）；
 - 请求时按模型名自动路由到对应供应商的 Base URL + Key，没有任何供应商认领的模型转发到当前激活（`use-provider` 切换的那个）供应商；`use-provider` 在聚合模式下仍可执行，只是改变的是这个兜底路由目标，而不是退出聚合。
+
+快速命令：只想单独开关聚合，或者只想给某个已保存供应商补/改 `modelFilter`，不需要整套重新配置：
+
+```bash
+codex-gateway-lite set-aggregate on
+codex-gateway-lite edit-provider gw-gpt   # 补 modelFilter，比如只保留 gpt 前缀
+```
 
 ## Account session sync
 

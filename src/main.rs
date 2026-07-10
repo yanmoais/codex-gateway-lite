@@ -227,6 +227,18 @@ enum Command {
         config_path: PathBuf,
         provider_id: String,
     },
+    SetContextBudget {
+        config_path: PathBuf,
+        value: String,
+    },
+    SetAggregate {
+        config_path: PathBuf,
+        value: String,
+    },
+    EditProvider {
+        config_path: PathBuf,
+        provider_id: String,
+    },
     WhereApp {
         app_path: Option<PathBuf>,
     },
@@ -428,6 +440,56 @@ async fn run_cli() -> anyhow::Result<()> {
             write_lite_config(&config_path, &config)?;
             println!("已删除供应商：{requested}");
         }
+        Command::SetContextBudget { config_path, value } => {
+            let mut config = read_lite_config(&config_path)?;
+            let change = apply_context_budget_change(&mut config, &value)?;
+            write_lite_config(&config_path, &config)?;
+            println!("上下文裁剪余量：{} → {}", change.before, change.after);
+            if config.provider.context_budget.trim().is_empty() {
+                if config.provider.protocol == LiteProtocol::Responses {
+                    println!(
+                        "含义：已关闭发送前裁剪；Responses 协议会回到直连上游，不经过本地代理。"
+                    );
+                } else {
+                    println!(
+                        "含义：已关闭显式裁剪余量；Chat Completions 协议仍会经本地代理转换协议，并按 contextWindow 自动推导安全余量。"
+                    );
+                }
+            } else {
+                println!(
+                    "含义：这是发送给上游前预留的安全余量，代理会在发送目标接近 contextWindow 上限时先裁掉旧上下文，而不是让请求直接超限失败。"
+                );
+            }
+            print_config_change_apply_hint();
+        }
+        Command::SetAggregate { config_path, value } => {
+            let mut config = read_lite_config(&config_path)?;
+            let enable = parse_on_off(&value)?;
+            let before = config.aggregate;
+            let needs_provider_warning = apply_aggregate_change(&mut config, enable);
+            write_lite_config(&config_path, &config)?;
+            println!(
+                "聚合模式（aggregate）：{} → {}",
+                on_off_label(before),
+                on_off_label(config.aggregate)
+            );
+            if needs_provider_warning {
+                println!(
+                    "聚合已开启但没有已保存的其他供应商，请用 add-provider 添加并为每家设置 modelFilter"
+                );
+            } else if !config.aggregate {
+                println!(
+                    "已回到单供应商模式：只有 use-provider 当前激活的供应商生效（其它已保存供应商仍保留，可随时 set-aggregate on 重新开启聚合）。"
+                );
+            }
+            print_config_change_apply_hint();
+        }
+        Command::EditProvider {
+            config_path,
+            provider_id,
+        } => {
+            edit_provider_interactive(&config_path, &provider_id)?;
+        }
         Command::WhereApp { app_path } => {
             let app_dir = resolve_codex_app(app_path.as_deref())?;
             println!("{}", app_dir.display());
@@ -613,6 +675,50 @@ fn parse_args() -> anyhow::Result<Command> {
             })?;
             reject_unknown_args(&args)?;
             Ok(Command::RemoveProvider {
+                config_path,
+                provider_id,
+            })
+        }
+        "set-context-budget" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let value = take_string_arg(&mut args, "--value").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!(
+                        "set-context-budget 需要一个值：set-context-budget <200K|off> 或 --value <200K|off>"
+                    )
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::SetContextBudget { config_path, value })
+        }
+        "set-aggregate" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let value = take_string_arg(&mut args, "--value").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!("set-aggregate 需要一个值：set-aggregate <on|off> 或 --value <on|off>")
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::SetAggregate { config_path, value })
+        }
+        "edit-provider" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let provider_id = take_string_arg(&mut args, "--id").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!("edit-provider 需要供应商 ID：edit-provider <id> 或 --id <id>")
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::EditProvider {
                 config_path,
                 provider_id,
             })
@@ -1674,11 +1780,11 @@ fn print_context_budget_notice(config: &LiteConfig) {
     }
     if config.provider.protocol == LiteProtocol::Responses {
         println!(
-            "上下文裁剪余量：未设置；Responses 保持直连，不启动本地代理。如需发送前兜底裁剪，请运行 init --force 并填写 {SUGGESTED_CONTEXT_BUDGET}。"
+            "上下文裁剪余量：未设置；Responses 保持直连，不启动本地代理。启用：codex-gateway-lite set-context-budget {SUGGESTED_CONTEXT_BUDGET}（一条命令即可，无需重跑 init）。"
         );
     } else {
         println!(
-            "上下文裁剪余量：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；如需更大安全余量可显式填写 {SUGGESTED_CONTEXT_BUDGET}。"
+            "上下文裁剪余量：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；如需更大安全余量：codex-gateway-lite set-context-budget {SUGGESTED_CONTEXT_BUDGET}。"
         );
     }
 }
@@ -1708,6 +1814,25 @@ fn prompt_model_filter() -> anyhow::Result<Vec<String>> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// Core of editing a `modelFilter` list in `edit-provider`: blank keeps the
+/// current list unchanged, `-` clears it, anything else replaces it
+/// wholesale (comma-separated, same parsing as `prompt_model_filter`).
+fn resolve_model_filter_edit(raw: &str, current: &[String]) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        current.to_vec()
+    } else if trimmed == "-" {
+        Vec::new()
+    } else {
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 fn write_lite_config(path: &Path, config: &LiteConfig) -> anyhow::Result<()> {
@@ -1982,6 +2107,84 @@ fn prompt(label: &str) -> anyhow::Result<String> {
     let mut input = String::new();
     io::stdin().read_line(&mut input).context("读取输入失败")?;
     Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Core of editing `protocol` in `edit-provider`: "1"/"2" pick a protocol
+/// explicitly; blank or anything else keeps the current one. Unlike
+/// `init`/`add-provider`'s prompt (which defaults an unrecognized answer to
+/// Responses), defaulting to Responses here would silently flip a Chat
+/// Completions provider's protocol on every no-op edit.
+fn resolve_protocol_edit(raw: &str, current: LiteProtocol) -> LiteProtocol {
+    match raw.trim() {
+        "1" => LiteProtocol::Responses,
+        "2" => LiteProtocol::ChatCompletions,
+        _ => current,
+    }
+}
+
+/// Core of editing `contextBudget` in `edit-provider`: blank keeps the
+/// current stored value; anything else is normalized/validated the same
+/// way as `set-context-budget` (see `normalize_context_budget_for_config`),
+/// including accepting `off`/`none` to clear it.
+fn resolve_context_budget_edit(raw: &str, current: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(current.to_string())
+    } else {
+        normalize_context_budget_for_config(trimmed)
+    }
+}
+
+fn protocol_label(protocol: LiteProtocol) -> &'static str {
+    match protocol {
+        LiteProtocol::Responses => "responses",
+        LiteProtocol::ChatCompletions => "chat_completions",
+    }
+}
+
+/// Mask a secret (API key) for a prompt label: only the first few
+/// characters survive, e.g. `sk-live-abc123` -> `sk-***`. Never reproduces
+/// the full secret, unlike echoing `current` straight into a prompt label
+/// the way `prompt_default` would.
+fn mask_secret_for_display(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "未设置".to_string();
+    }
+    let prefix: String = trimmed.chars().take(3).collect();
+    format!("{prefix}***")
+}
+
+/// Like `prompt_default`, but for secrets: the *masked* value is shown in
+/// the label (never the real one), while blank input still keeps the real
+/// current value.
+fn prompt_default_masked(label: &str, current: &str) -> anyhow::Result<String> {
+    let value = prompt(&format!(
+        "{label} [{}，回车保留]",
+        mask_secret_for_display(current)
+    ))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Ok(current.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// Validate a single provider profile's own fields in isolation.
+/// `validate_config` only ever checks the *active* `config.provider` (plus
+/// active-scoped `models`/`contextWindow`), so this covers `edit-provider`
+/// editing a saved (inactive) `config.providers[]` profile, which
+/// `validate_config` never looks at.
+fn validate_provider_fields(provider: &LiteProvider) -> anyhow::Result<()> {
+    if provider.id.trim().is_empty() {
+        bail!("provider.id 不能为空");
+    }
+    if provider.base_url.trim().is_empty() {
+        bail!("provider.baseUrl 不能为空");
+    }
+    validate_context_budget_for_config(&provider.context_budget)?;
+    Ok(())
 }
 
 fn resolve_api_key(provider: &LiteProvider) -> anyhow::Result<String> {
@@ -2337,6 +2540,83 @@ fn format_token_budget(tokens: u64) -> String {
     }
 }
 
+/// Human-readable form of a stored `contextBudget` value for CLI messages:
+/// blank means "unset" (Responses stays direct-connect).
+fn display_context_budget_value(value: &str) -> String {
+    if value.trim().is_empty() {
+        "未设置".to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+/// Outcome of `set-context-budget`: the active provider's `contextBudget`
+/// value before and after, formatted for the CLI's confirmation message.
+#[derive(Debug)]
+struct ContextBudgetChange {
+    before: String,
+    after: String,
+}
+
+/// Core of `set-context-budget`: normalize/validate `raw` (reusing the same
+/// rules as `init`'s interactive prompt — see
+/// `normalize_context_budget_for_config`) and write it into the *active*
+/// provider's `contextBudget`, then re-validate the whole config so an
+/// incompatible combination (e.g. a budget that isn't smaller than
+/// `contextWindow`) is rejected — and rolled back — before it ever reaches
+/// disk. Pure w.r.t. I/O; the caller does `read_lite_config`/
+/// `write_lite_config` around this.
+fn apply_context_budget_change(
+    config: &mut LiteConfig,
+    raw: &str,
+) -> anyhow::Result<ContextBudgetChange> {
+    let before = display_context_budget_value(&config.provider.context_budget);
+    let normalized = normalize_context_budget_for_config(raw)?;
+    let previous = std::mem::replace(&mut config.provider.context_budget, normalized);
+    if let Err(error) = validate_config(config) {
+        config.provider.context_budget = previous;
+        return Err(error);
+    }
+    let after = display_context_budget_value(&config.provider.context_budget);
+    Ok(ContextBudgetChange { before, after })
+}
+
+/// Core of `set-aggregate`: set `config.aggregate` and report whether the
+/// "aggregate on, but nothing to aggregate" situation applies (the same
+/// condition `validate_config` warns about) so the CLI can print a
+/// dedicated hint pointing at `add-provider`.
+fn apply_aggregate_change(config: &mut LiteConfig, enable: bool) -> bool {
+    config.aggregate = enable;
+    enable && config.providers.is_empty()
+}
+
+/// Parse `set-aggregate`'s `<on|off>` argument (plus a few common
+/// synonyms).
+fn parse_on_off(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "y" => Ok(true),
+        "off" | "false" | "0" | "no" | "n" => Ok(false),
+        other => bail!("参数必须是 on 或 off，收到：{other}"),
+    }
+}
+
+fn on_off_label(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
+/// Shared "how does this change take effect" hint for the fine-grained
+/// config-editing commands (`set-context-budget` / `set-aggregate` /
+/// `edit-provider`). `run_agent`'s main loop polls `config.json`'s mtime
+/// every iteration (minimum ~1s regardless of `--interval-ms`, see
+/// `interval` in `run_agent`) and automatically re-applies + soft-reloads
+/// Codex on change, so a running agent needs no extra command to pick this
+/// up.
+fn print_config_change_apply_hint() {
+    println!(
+        "已保存到配置文件；运行中的 agent 会在下一个轮询周期（默认约 1 秒）自动应用并软刷新 Codex，无需重启。若 agent 未运行，下次运行 apply 或启动 agent 时生效。"
+    );
+}
+
 fn sanitize_provider_id(value: &str) -> String {
     let sanitized = value
         .trim()
@@ -2358,6 +2638,124 @@ fn sanitize_provider_id(value: &str) -> String {
 
 fn sanitize_catalog_filename(id: &str) -> String {
     sanitize_provider_id(id)
+}
+
+/// Where `edit-provider <id>` found a matching profile: the active
+/// top-level provider, or an index into `config.providers`. `usize` is
+/// only valid against the same `LiteConfig` it was resolved from.
+#[derive(Debug, Clone, Copy)]
+enum ProviderLocation {
+    Active,
+    Saved(usize),
+}
+
+/// Resolve `edit-provider`'s target profile by case-insensitive sanitized
+/// id — matches either the active top-level provider or a saved
+/// `config.providers[]` entry. On no match, errors listing every known id,
+/// mirroring `switch_active_provider`'s unknown-id error message.
+fn locate_provider(config: &LiteConfig, id: &str) -> anyhow::Result<ProviderLocation> {
+    let requested = sanitize_provider_id(id);
+    if sanitize_provider_id(&config.provider.id).eq_ignore_ascii_case(&requested) {
+        return Ok(ProviderLocation::Active);
+    }
+    if let Some(index) = config.providers.iter().position(|profile| {
+        sanitize_provider_id(&profile.provider.id).eq_ignore_ascii_case(&requested)
+    }) {
+        return Ok(ProviderLocation::Saved(index));
+    }
+    let mut known = vec![sanitize_provider_id(&config.provider.id)];
+    known.extend(
+        config
+            .providers
+            .iter()
+            .map(|profile| sanitize_provider_id(&profile.provider.id)),
+    );
+    bail!(
+        "未找到供应商「{requested}」；当前已保存：{}",
+        known.join(", ")
+    )
+}
+
+fn provider_ref(config: &LiteConfig, location: ProviderLocation) -> &LiteProvider {
+    match location {
+        ProviderLocation::Active => &config.provider,
+        ProviderLocation::Saved(index) => &config.providers[index].provider,
+    }
+}
+
+fn provider_mut(config: &mut LiteConfig, location: ProviderLocation) -> &mut LiteProvider {
+    match location {
+        ProviderLocation::Active => &mut config.provider,
+        ProviderLocation::Saved(index) => &mut config.providers[index].provider,
+    }
+}
+
+/// Interactively edit an existing provider profile's connection/protocol/
+/// filter/budget fields in place. `id` is intentionally not editable here —
+/// changing it would desync the active-pointer/backfill bookkeeping
+/// `switch_active_provider` and `upsert_saved_provider_profile` rely on;
+/// use `remove-provider` + `add-provider` to rename one instead. Matches
+/// the active provider or a saved `config.providers[]` entry by
+/// case-insensitive sanitized id (see `locate_provider`).
+fn edit_provider_interactive(config_path: &Path, provider_id: &str) -> anyhow::Result<()> {
+    let mut config = read_lite_config(config_path)?;
+    let location = locate_provider(&config, provider_id)?;
+    let is_active = matches!(location, ProviderLocation::Active);
+    let current = provider_ref(&config, location).clone();
+    println!(
+        "编辑供应商「{}」{}",
+        sanitize_provider_id(&current.id),
+        if is_active { "（当前激活）" } else { "" }
+    );
+
+    let name_default = if current.name.trim().is_empty() {
+        &current.id
+    } else {
+        &current.name
+    };
+    let name = prompt_default("供应商名称", name_default)?;
+    let base_url = prompt_default("Base URL", &current.base_url)?;
+    let api_key = prompt_default_masked("API Key", &current.api_key)?;
+    println!("供应商协议（当前：{}）：", protocol_label(current.protocol));
+    println!("  1. Responses API — 供应商原生支持 OpenAI Responses 格式，Codex 直连");
+    println!("  2. Chat Completions — 供应商只支持 Chat 格式，由本地代理自动转换");
+    let protocol_choice = prompt("请选择（回车保留当前）")?;
+    let protocol = resolve_protocol_edit(&protocol_choice, current.protocol);
+    let filter_display = if current.model_filter.is_empty() {
+        "不过滤".to_string()
+    } else {
+        current.model_filter.join(", ")
+    };
+    let model_filter_raw = prompt(&format!(
+        "模型过滤前缀（当前：{filter_display}；逗号分隔覆盖，输入 - 清空，回车保留）"
+    ))?;
+    let model_filter = resolve_model_filter_edit(&model_filter_raw, &current.model_filter);
+    let context_budget_raw = prompt(&format!(
+        "本地裁剪余量（当前：{}；回车保留，off 关闭）",
+        display_context_budget_value(&current.context_budget)
+    ))?;
+    let context_budget = resolve_context_budget_edit(&context_budget_raw, &current.context_budget)?;
+
+    {
+        let provider = provider_mut(&mut config, location);
+        provider.name = name;
+        provider.base_url = base_url;
+        provider.api_key = api_key;
+        provider.protocol = protocol;
+        provider.model_filter = model_filter;
+        provider.context_budget = context_budget;
+    }
+
+    if is_active {
+        validate_config(&config)?;
+    } else {
+        validate_provider_fields(provider_ref(&config, location))?;
+    }
+
+    write_lite_config(config_path, &config)?;
+    println!("供应商「{}」已更新", sanitize_provider_id(&current.id));
+    print_config_change_apply_hint();
+    Ok(())
 }
 
 fn print_apply_report(report: &ApplyReport) {
@@ -6104,6 +6502,11 @@ async fn run_agent(
     );
     println!("  debug_port: {debug_port}");
     println!("  interval_ms: {}", interval.as_millis());
+    println!("  aggregate: {}", on_off_label(config.aggregate));
+    println!(
+        "  context_budget: {}",
+        display_context_budget_value(&config.provider.context_budget)
+    );
     if codex_home.is_none() {
         if let Some(env_home) = std::env::var_os("CODEX_HOME") {
             println!(
@@ -9977,6 +10380,9 @@ fn print_help() {
   codex-gateway-lite add-provider [--config <config.json>]
   codex-gateway-lite use-provider <id> [--config <config.json>] [--codex-home <dir>] [--no-apply] [--debug-port 9229] [--no-plan-ui]
   codex-gateway-lite remove-provider <id> [--config <config.json>]
+  codex-gateway-lite set-context-budget <200K|off> [--config <config.json>]
+  codex-gateway-lite set-aggregate <on|off> [--config <config.json>]
+  codex-gateway-lite edit-provider <id> [--config <config.json>]
   codex-gateway-lite where-app [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>]
 
 说明：
@@ -9996,6 +10402,9 @@ fn print_help() {
   add-provider  交互式新增一个供应商档案（API Key 各自独立），保存后用 use-provider 激活
   use-provider  切换激活供应商：当前供应商先回填保存，再把目标供应商写入 Codex 配置并软刷新
   remove-provider  删除一个未激活的已保存供应商
+  set-context-budget  单独调整当前激活供应商的上下文裁剪余量（200K 这类值，或 off 关闭），无需重跑 init
+  set-aggregate  单独开关多供应商聚合模式（aggregate），不改动任何供应商档案
+  edit-provider  交互式编辑已保存或当前激活供应商的连接信息/协议/modelFilter/裁剪余量，id 不可改
   where-app  打印自动识别到的 Codex App 路径
 "#
     );
@@ -14097,6 +14506,254 @@ mod plan_hints_tests {
         assert!(message.contains("gamma"));
         assert!(message.contains("alpha"));
         assert!(message.contains("beta"));
+    }
+
+    // -- set-context-budget / set-aggregate / edit-provider -----------------
+
+    #[test]
+    fn apply_context_budget_change_writes_normalized_value() {
+        let mut config = multi_provider_config();
+        assert_eq!(config.provider.context_budget, "");
+        let change =
+            apply_context_budget_change(&mut config, "200").expect("valid budget accepted");
+        assert_eq!(change.before, "未设置");
+        assert_eq!(change.after, "200K");
+        assert_eq!(config.provider.context_budget, "200K");
+    }
+
+    #[test]
+    fn apply_context_budget_change_off_clears_value() {
+        let mut config = multi_provider_config();
+        apply_context_budget_change(&mut config, "300K").expect("set budget");
+        let change = apply_context_budget_change(&mut config, "off").expect("off accepted");
+        assert_eq!(change.before, "300K");
+        assert_eq!(change.after, "未设置");
+        assert_eq!(config.provider.context_budget, "");
+    }
+
+    #[test]
+    fn apply_context_budget_change_rejects_invalid_value() {
+        let mut config = multi_provider_config();
+        let before = config.clone();
+        let error = apply_context_budget_change(&mut config, "not-a-number")
+            .expect_err("garbage value rejected");
+        assert!(format!("{error:#}").contains("不合法"));
+        assert_eq!(config, before, "rejected value must not mutate config");
+    }
+
+    #[test]
+    fn apply_context_budget_change_rejects_and_rolls_back_when_not_smaller_than_window() {
+        let mut config = multi_provider_config();
+        config.context_window = "200K".to_string();
+        let before = config.provider.context_budget.clone();
+        let error = apply_context_budget_change(&mut config, "200K")
+            .expect_err("budget equal to window must be rejected");
+        assert!(format!("{error:#}").contains("contextWindow"));
+        assert_eq!(
+            config.provider.context_budget, before,
+            "failed validation must roll back the in-memory mutation"
+        );
+    }
+
+    #[test]
+    fn apply_aggregate_change_on_without_saved_providers_warns() {
+        let mut config = multi_provider_config();
+        config.providers.clear();
+        let needs_warning = apply_aggregate_change(&mut config, true);
+        assert!(config.aggregate);
+        assert!(
+            needs_warning,
+            "aggregate on with no saved providers should warn"
+        );
+    }
+
+    #[test]
+    fn apply_aggregate_change_on_with_saved_providers_does_not_warn() {
+        let mut config = multi_provider_config();
+        assert!(!config.providers.is_empty());
+        let needs_warning = apply_aggregate_change(&mut config, true);
+        assert!(config.aggregate);
+        assert!(!needs_warning);
+    }
+
+    #[test]
+    fn apply_aggregate_change_off_clears_flag_without_warning() {
+        let mut config = multi_provider_config();
+        config.aggregate = true;
+        let needs_warning = apply_aggregate_change(&mut config, false);
+        assert!(!config.aggregate);
+        assert!(!needs_warning, "turning aggregate off never warns");
+    }
+
+    #[test]
+    fn parse_on_off_accepts_synonyms_and_rejects_other_values() {
+        assert!(parse_on_off("on").unwrap());
+        assert!(parse_on_off("ON").unwrap());
+        assert!(parse_on_off("yes").unwrap());
+        assert!(!parse_on_off("off").unwrap());
+        assert!(!parse_on_off("OFF").unwrap());
+        assert!(!parse_on_off("no").unwrap());
+        let error = parse_on_off("banana").expect_err("invalid value rejected");
+        assert!(format!("{error:#}").contains("banana"));
+    }
+
+    #[test]
+    fn locate_provider_finds_active_case_insensitively() {
+        let config = multi_provider_config();
+        let location = locate_provider(&config, "ALPHA").expect("finds active provider");
+        assert!(matches!(location, ProviderLocation::Active));
+    }
+
+    #[test]
+    fn locate_provider_finds_saved_profile_case_insensitively() {
+        let config = multi_provider_config();
+        let location = locate_provider(&config, "Beta").expect("finds saved provider");
+        assert!(matches!(location, ProviderLocation::Saved(0)));
+    }
+
+    #[test]
+    fn locate_provider_rejects_unknown_id_and_lists_known_ids() {
+        let config = multi_provider_config();
+        let error = locate_provider(&config, "gamma").expect_err("unknown id fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("gamma"));
+        assert!(message.contains("alpha"));
+        assert!(message.contains("beta"));
+    }
+
+    #[test]
+    fn resolve_model_filter_edit_blank_keeps_dash_clears_csv_replaces() {
+        let current = vec!["claude".to_string()];
+        assert_eq!(resolve_model_filter_edit("", &current), current);
+        assert_eq!(
+            resolve_model_filter_edit("-", &current),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            resolve_model_filter_edit("gpt, o1", &current),
+            vec!["gpt".to_string(), "o1".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_context_budget_edit_blank_keeps_current_else_validates() {
+        assert_eq!(resolve_context_budget_edit("", "200K").unwrap(), "200K");
+        assert_eq!(resolve_context_budget_edit("300K", "200K").unwrap(), "300K");
+        assert_eq!(resolve_context_budget_edit("off", "200K").unwrap(), "");
+        assert!(resolve_context_budget_edit("garbage", "200K").is_err());
+    }
+
+    #[test]
+    fn resolve_protocol_edit_selects_explicitly_or_keeps_current() {
+        assert_eq!(
+            resolve_protocol_edit("1", LiteProtocol::ChatCompletions),
+            LiteProtocol::Responses
+        );
+        assert_eq!(
+            resolve_protocol_edit("2", LiteProtocol::Responses),
+            LiteProtocol::ChatCompletions
+        );
+        assert_eq!(
+            resolve_protocol_edit("", LiteProtocol::ChatCompletions),
+            LiteProtocol::ChatCompletions
+        );
+        assert_eq!(
+            resolve_protocol_edit("nonsense", LiteProtocol::Responses),
+            LiteProtocol::Responses
+        );
+    }
+
+    #[test]
+    fn mask_secret_for_display_never_reveals_full_secret() {
+        assert_eq!(mask_secret_for_display("sk-abcdef123456"), "sk-***");
+        assert_eq!(mask_secret_for_display(""), "未设置");
+        assert_eq!(mask_secret_for_display("ab"), "ab***");
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_empty_id_or_base_url() {
+        let mut provider = LiteProvider {
+            id: String::new(),
+            name: String::new(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            api_key_env: String::new(),
+            mode: LiteMode::MixedApi,
+            protocol: LiteProtocol::Responses,
+            context_budget: String::new(),
+            model_filter: Vec::new(),
+        };
+        assert!(validate_provider_fields(&provider).is_err());
+        provider.id = "gamma".to_string();
+        provider.base_url = String::new();
+        assert!(validate_provider_fields(&provider).is_err());
+        provider.base_url = "https://example.test/v1".to_string();
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    fn unique_temp_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codex-gateway-lite-{label}-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn set_context_budget_command_round_trips_through_config_file() {
+        let path = unique_temp_config_path("set-context-budget");
+        write_lite_config(&path, &multi_provider_config()).expect("seed config written");
+
+        let mut config = read_lite_config(&path).expect("config reads back");
+        apply_context_budget_change(&mut config, "150K").expect("valid budget accepted");
+        write_lite_config(&path, &config).expect("updated config written");
+
+        let reloaded = read_lite_config(&path).expect("reloaded config reads back");
+        assert_eq!(reloaded.provider.context_budget, "150K");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_aggregate_command_round_trips_through_config_file() {
+        let path = unique_temp_config_path("set-aggregate");
+        write_lite_config(&path, &multi_provider_config()).expect("seed config written");
+
+        let mut config = read_lite_config(&path).expect("config reads back");
+        assert!(!config.aggregate);
+        apply_aggregate_change(&mut config, true);
+        write_lite_config(&path, &config).expect("updated config written");
+
+        let reloaded = read_lite_config(&path).expect("reloaded config reads back");
+        assert!(reloaded.aggregate);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edit_provider_command_round_trips_saved_profile_through_config_file() {
+        let path = unique_temp_config_path("edit-provider");
+        write_lite_config(&path, &multi_provider_config()).expect("seed config written");
+
+        let mut config = read_lite_config(&path).expect("config reads back");
+        let location = locate_provider(&config, "beta").expect("finds saved provider");
+        assert!(matches!(location, ProviderLocation::Saved(0)));
+        {
+            let provider = provider_mut(&mut config, location);
+            provider.base_url = "https://beta-2.example/v1".to_string();
+            provider.model_filter = vec!["gpt".to_string()];
+            provider.context_budget = "120K".to_string();
+        }
+        validate_provider_fields(provider_ref(&config, location)).expect("edited profile valid");
+        write_lite_config(&path, &config).expect("updated config written");
+
+        let reloaded = read_lite_config(&path).expect("reloaded config reads back");
+        let beta = &reloaded.providers[0].provider;
+        assert_eq!(beta.base_url, "https://beta-2.example/v1");
+        assert_eq!(beta.model_filter, vec!["gpt".to_string()]);
+        assert_eq!(beta.context_budget, "120K");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
