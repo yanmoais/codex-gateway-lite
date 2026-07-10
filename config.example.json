@@ -12,5 +12,6 @@
   "models": [],
   "contextWindow": "1M",
   "autoCompactTokenLimit": "",
-  "commonConfig": ""
+  "commonConfig": "",
+  "planHints": true
 }

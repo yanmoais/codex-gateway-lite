@@ -635,6 +635,14 @@ try {
   Run-Lite @("init", "--config", $ConfigFile)
 
   Write-Section "3/3 启动 agent 并拉起 Codex App"
+  Write-Info "常用配置速查（改完无需重跑 init，agent 运行中会自动生效）："
+  Write-Info "  set-context-budget <200K|off>  单独调整上下文裁剪余量"
+  Write-Info "  set-aggregate <on|off>  单独开关多供应商聚合模式"
+  Write-Info "  set-plan-hints <on|off>  单独开关第三方模型的任务清单指引"
+  Write-Info "  add-provider  新增供应商，可选 modelFilter 限定它贡献的模型前缀"
+  Write-Info "  edit-provider <id>  编辑已保存供应商的连接信息/协议/modelFilter/裁剪余量"
+  Write-Info "  use-provider <id>  切换当前激活的供应商"
+
   $script:AgentStarted = $true
   if ($AppPath) {
     Run-Lite @("agent", "--config", $ConfigFile, "--app", $AppPath, "--debug-port", $DebugPort)

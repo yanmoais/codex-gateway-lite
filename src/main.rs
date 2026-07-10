@@ -33,6 +33,10 @@ const CDP_CLOSE_CONFIRM_FAILURES: u32 = 3;
 const PLAN_UI_ACTIVE_HISTORY_SEED_RETRY_SECS: u64 = 30;
 const PLAN_UI_INITIAL_HISTORY_SEED: bool = true;
 
+fn default_plan_hints() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LiteConfig {
@@ -47,7 +51,7 @@ struct LiteConfig {
     auto_compact_token_limit: String,
     #[serde(default)]
     common_config: String,
-    #[serde(default)]
+    #[serde(default = "default_plan_hints")]
     plan_hints: bool,
     /// Saved provider profiles for multi-provider switching. The top-level
     /// `provider`/`model`/`models`/... fields are always the *active*
@@ -232,6 +236,10 @@ enum Command {
         value: String,
     },
     SetAggregate {
+        config_path: PathBuf,
+        value: String,
+    },
+    SetPlanHints {
         config_path: PathBuf,
         value: String,
     },
@@ -484,6 +492,28 @@ async fn run_cli() -> anyhow::Result<()> {
             }
             print_config_change_apply_hint();
         }
+        Command::SetPlanHints { config_path, value } => {
+            let mut config = read_lite_config(&config_path)?;
+            let enable = parse_on_off(&value)?;
+            let before = config.plan_hints;
+            config.plan_hints = enable;
+            write_lite_config(&config_path, &config)?;
+            println!(
+                "任务清单指引（planHints）：{} → {}",
+                on_off_label(before),
+                on_off_label(config.plan_hints)
+            );
+            if config.plan_hints {
+                println!(
+                    "第三方模型会在多步骤任务中收到主动调用 update_plan 的指引；agent 检测到配置变化后会自动重写 model catalog。"
+                );
+            } else {
+                println!(
+                    "已关闭额外任务清单指引；模型仍能看到 update_plan 工具，但可能不会主动调用。"
+                );
+            }
+            print_config_change_apply_hint();
+        }
         Command::EditProvider {
             config_path,
             provider_id,
@@ -706,6 +736,19 @@ fn parse_args() -> anyhow::Result<Command> {
             })?;
             reject_unknown_args(&args)?;
             Ok(Command::SetAggregate { config_path, value })
+        }
+        "set-plan-hints" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let value = take_string_arg(&mut args, "--value").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!("set-plan-hints 需要一个值：set-plan-hints <on|off> 或 --value <on|off>")
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::SetPlanHints { config_path, value })
         }
         "edit-provider" => {
             let config_path = take_optional_path_arg(&mut args, "--config")?
@@ -1565,6 +1608,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
                 Ok(()) => {
                     println!("配置已存在，开始同步供应商模型列表：{}", path.display());
                     print_context_budget_notice(&config);
+                    print_plan_hints_notice(&config);
                     match refresh_config_models(path).await {
                         Ok(count) => println!("供应商模型列表已同步：{count} 个模型"),
                         Err(error) => eprintln!("供应商模型列表同步失败，保留现有配置：{error:#}"),
@@ -1603,7 +1647,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
     println!("  开启后，模型 catalog 的 base_instructions 会追加一段指引，");
     println!("  告诉第三方模型在多步骤任务中主动调用 update_plan 显示进度面板。");
     println!("  内容写在本地 ~/.codex/model-catalogs/ 明文文件中，可随时查看和修改。");
-    let plan_hints_choice = prompt_default("是否开启 planHints (y/n)", "n")?;
+    let plan_hints_choice = prompt_default("是否开启 planHints (y/n)", "y")?;
     let plan_hints = matches!(plan_hints_choice.trim(), "y" | "Y" | "yes" | "Yes" | "YES");
 
     let provider = LiteProvider {
@@ -1785,6 +1829,16 @@ fn print_context_budget_notice(config: &LiteConfig) {
     } else {
         println!(
             "上下文裁剪余量：未设置；Chat Completions 本地代理会按 contextWindow 自动推导预算；如需更大安全余量：codex-gateway-lite set-context-budget {SUGGESTED_CONTEXT_BUDGET}。"
+        );
+    }
+}
+
+fn print_plan_hints_notice(config: &LiteConfig) {
+    if config.plan_hints {
+        println!("任务清单指引：已开启；第三方模型会收到主动调用 update_plan 的多步骤任务提示。");
+    } else {
+        println!(
+            "任务清单指引：已关闭；第三方模型可能不会主动创建任务卡片。启用：codex-gateway-lite set-plan-hints on"
         );
     }
 }
@@ -6665,6 +6719,7 @@ async fn run_agent(
     println!("  debug_port: {debug_port}");
     println!("  interval_ms: {}", interval.as_millis());
     println!("  aggregate: {}", on_off_label(config.aggregate));
+    println!("  plan_hints: {}", on_off_label(config.plan_hints));
     println!(
         "  context_budget: {}",
         display_context_budget_value(&config.provider.context_budget)
@@ -10717,6 +10772,7 @@ fn print_help() {
   codex-gateway-lite remove-provider <id> [--config <config.json>]
   codex-gateway-lite set-context-budget <200K|off> [--config <config.json>]
   codex-gateway-lite set-aggregate <on|off> [--config <config.json>]
+  codex-gateway-lite set-plan-hints <on|off> [--config <config.json>]
   codex-gateway-lite edit-provider <id> [--config <config.json>]
   codex-gateway-lite where-app [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>]
 
@@ -10739,6 +10795,7 @@ fn print_help() {
   remove-provider  删除一个未激活的已保存供应商
   set-context-budget  单独调整当前激活供应商的上下文裁剪余量（200K 这类值，或 off 关闭），无需重跑 init
   set-aggregate  单独开关多供应商聚合模式（aggregate），不改动任何供应商档案
+  set-plan-hints  单独开关第三方模型的 update_plan 任务清单指引；首次配置默认开启
   edit-provider  交互式编辑已保存或当前激活供应商的连接信息/协议/modelFilter/裁剪余量，id 不可改
   where-app  打印自动识别到的 Codex App 路径
 "#
@@ -13765,6 +13822,24 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Test-InteractiveLiteCommand"));
         assert!(windows_script.contains("@(\"agent\", \"init\")"));
         assert!(windows_script.contains("if (Test-InteractiveLiteCommand $ArgsList)"));
+        for hint in [
+            "常用配置速查（改完无需重跑 init，agent 运行中会自动生效）",
+            "set-context-budget <200K|off>",
+            "set-aggregate <on|off>",
+            "set-plan-hints <on|off>",
+            "add-provider",
+            "edit-provider <id>",
+            "use-provider <id>",
+        ] {
+            assert!(
+                macos_script.contains(hint),
+                "macOS bootstrap is missing the shared config hint: {hint}"
+            );
+            assert!(
+                windows_script.contains(hint),
+                "Windows bootstrap is missing the shared config hint: {hint}"
+            );
+        }
         assert!(windows_script.contains("Project dir: $RepoRoot"));
         assert!(windows_script.contains("Config file: $ConfigFile"));
         assert!(!windows_script.contains("项目目录：$RepoRoot"));
@@ -14888,7 +14963,7 @@ mod plan_hints_tests {
     }
 
     #[test]
-    fn plan_hints_config_defaults_to_false() {
+    fn plan_hints_config_defaults_to_true_for_first_use() {
         let json = r#"{
             "provider": {
                 "id": "test",
@@ -14897,7 +14972,17 @@ mod plan_hints_tests {
             }
         }"#;
         let config: LiteConfig = serde_json::from_str(json).expect("config parses");
-        assert!(!config.plan_hints);
+        assert!(config.plan_hints);
+        let entries = vec![codex_lite::ModelCatalogEntry {
+            slug: "test-model".to_string(),
+            display_name: "test-model".to_string(),
+            suffix_window: None,
+        }];
+        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, config.plan_hints);
+        assert!(
+            catalog_json.contains("update_plan"),
+            "first-use config should generate task-plan guidance"
+        );
     }
 
     #[test]
@@ -14912,6 +14997,20 @@ mod plan_hints_tests {
         }"#;
         let config: LiteConfig = serde_json::from_str(json).expect("config parses");
         assert!(config.plan_hints);
+    }
+
+    #[test]
+    fn plan_hints_config_respects_explicit_false() {
+        let json = r#"{
+            "provider": {
+                "id": "test",
+                "baseUrl": "https://example.test/v1",
+                "apiKey": "sk-test"
+            },
+            "planHints": false
+        }"#;
+        let config: LiteConfig = serde_json::from_str(json).expect("config parses");
+        assert!(!config.plan_hints);
     }
 
     fn multi_provider_config() -> LiteConfig {
@@ -15209,6 +15308,22 @@ mod plan_hints_tests {
 
         let reloaded = read_lite_config(&path).expect("reloaded config reads back");
         assert!(reloaded.aggregate);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_plan_hints_command_round_trips_through_config_file() {
+        let path = unique_temp_config_path("set-plan-hints");
+        let mut seed = multi_provider_config();
+        seed.plan_hints = false;
+        write_lite_config(&path, &seed).expect("seed config written");
+
+        let mut config = read_lite_config(&path).expect("config reads back");
+        config.plan_hints = parse_on_off("on").expect("on accepted");
+        write_lite_config(&path, &config).expect("updated config written");
+
+        let reloaded = read_lite_config(&path).expect("reloaded config reads back");
+        assert!(reloaded.plan_hints);
         let _ = fs::remove_file(&path);
     }
 

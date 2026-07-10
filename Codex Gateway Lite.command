@@ -305,6 +305,7 @@ main() {
   info "常用配置速查（改完无需重跑 init，agent 运行中会自动生效）："
   info "  set-context-budget <200K|off>  单独调整上下文裁剪余量"
   info "  set-aggregate <on|off>  单独开关多供应商聚合模式"
+  info "  set-plan-hints <on|off>  单独开关第三方模型的任务清单指引"
   info "  add-provider  新增供应商，可选 modelFilter 限定它贡献的模型前缀"
   info "  edit-provider <id>  编辑已保存供应商的连接信息/协议/modelFilter/裁剪余量"
   info "  use-provider <id>  切换当前激活的供应商"
