@@ -9437,10 +9437,70 @@ const PLAN_UI_SCRIPT: &str = r#"
     const raw = text(panel);
     const deltas = animatedDeltaTokens(panel);
     if (deltas.length) {
-      const fileCount = raw.match(/\d+\s*个文件已更改/)?.[0] || "";
+      const changedCount = raw.match(/\d+\s*个文件已更改/)?.[0] || "";
+      const editedCount = raw.match(/已编辑\s*(\d+)\s*个文件/)?.[1] || "";
+      const englishCount = raw.match(/edited\s*(\d+)\s*files?/i)?.[1] || "";
+      const fileCount = changedCount
+        || (editedCount ? `${editedCount}个文件已更改` : "")
+        || (englishCount ? `${englishCount} files changed` : "");
       return [fileCount, ...deltas].filter(Boolean).join(" ");
     }
     return extractFileChangeDetail(raw);
+  }
+
+  function editCardDetail(card) {
+    if (!card) return "";
+    const raw = text(card);
+    if (!/(?:已编辑\s*\d+\s*个文件|edited\s*\d+\s*files?)/i.test(raw)) return "";
+    const detail = fileChangeDetailFromPanel(card);
+    return /[+]\d[\d,]*\s+-\d[\d,]*/.test(detail) ? detail : "";
+  }
+
+  function editCardDetailFromTurn(turn) {
+    if (!turn?.querySelectorAll) return "";
+    const candidates = [turn, ...Array.from(turn.querySelectorAll("article,section,div,button"))]
+      .map((node) => ({ node, value: text(node) }))
+      .filter((entry) => /(?:已编辑\s*\d+\s*个文件|edited\s*\d+\s*files?)/i.test(entry.value))
+      .filter((entry) => entry.value.length <= 320)
+      .sort((a, b) => a.value.length - b.value.length);
+    for (const candidate of candidates) {
+      const detail = editCardDetail(candidate.node);
+      if (detail) return detail;
+    }
+    return "";
+  }
+
+  function taskEditChangeDetail(snapshot, root = currentThreadRoot()) {
+    if (!root?.querySelectorAll) return "";
+    const turns = Array.from(root.querySelectorAll("[data-turn-key]"));
+    if (!turns.length) return "";
+    const sourceTurnId = String(snapshot?.sourceTurnId || "");
+    const matchingTurns = sourceTurnId
+      ? turns.filter((turn) => {
+          const key = String(turn?.getAttribute?.("data-turn-key") || "");
+          return key && (key === sourceTurnId || key.includes(sourceTurnId) || sourceTurnId.includes(key));
+        })
+      : [];
+    const candidates = matchingTurns.length ? matchingTurns : turns.slice().reverse();
+    for (const turn of candidates) {
+      const detail = editCardDetailFromTurn(turn);
+      if (detail) return detail;
+    }
+    return "";
+  }
+
+  function preferredSnapshotChangeDetail(taskDetail, snapshotDetail, environmentDetail, liveNativeSource) {
+    return String(taskDetail || "").trim()
+      || String(snapshotDetail || "").trim()
+      || (liveNativeSource ? String(environmentDetail || "").trim() : "");
+  }
+
+  function snapshotWithTaskEditDetail(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return snapshot;
+    const detail = taskEditChangeDetail(snapshot);
+    if (!detail || detail === snapshot.detail) return snapshot;
+    const next = { ...snapshot, detail };
+    return { ...next, metaParts: metaPartsFromSnapshot(next) };
   }
 
   function nearbyPillDetail(pill, progress) {
@@ -9879,7 +9939,16 @@ const PLAN_UI_SCRIPT: &str = r#"
   function renderSnapshotForRows(snapshot, rows) {
     const normalized = normalizedSnapshotForRows(snapshot, rows);
     if (!normalized || typeof normalized !== "object") return normalized;
-    const detail = environmentChangeDetail() || normalized.detail || "";
+    const source = String(normalized.source || "");
+    const liveNativeSource = nativePills().length > 0
+      || !rowsSettled(rows)
+      || (!normalized.sourceTurnId && !/(?:stored|history|rollout|source-gone)/i.test(source));
+    const detail = preferredSnapshotChangeDetail(
+      taskEditChangeDetail(normalized),
+      normalized.detail,
+      environmentChangeDetail(),
+      liveNativeSource
+    );
     const next = { ...normalized, detail };
     return { ...next, metaParts: metaPartsFromSnapshot(next) };
   }
@@ -10380,7 +10449,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     installStyle();
     cleanupLegacyMarks();
     const threadId = currentThreadId();
-    const snapshot = readSnapshot();
+    const snapshot = snapshotWithTaskEditDetail(readSnapshot());
     if (snapshot) {
       state.lastSourceSeenAt = Date.now();
       state.lastSnapshot = snapshot;
@@ -10614,6 +10683,11 @@ const PLAN_UI_SCRIPT: &str = r#"
       extractFileChangeDetail,
       animatedDeltaTokens,
       fileChangeDetailFromPanel,
+      editCardDetail,
+      editCardDetailFromTurn,
+      taskEditChangeDetail,
+      preferredSnapshotChangeDetail,
+      snapshotWithTaskEditDetail,
     };
   }
   return true;
@@ -11706,6 +11780,73 @@ CREATE TABLE threads (
             serde_json::json!("1个文件已更改 +370 -78")
         );
         assert_eq!(result["rawRejected"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn plan_ui_restores_edit_delta_from_the_matching_historical_turn() {
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                const roller = (ariaLabel, rawText) => ({
+                    textContent: rawText,
+                    getAttribute(name) {
+                        return name === "aria-label" ? ariaLabel : null;
+                    }
+                });
+                const card = (files, added, deleted) => ({
+                    textContent: `已编辑 ${files} 个文件 +01234567890123456789 -0123456789 撤销 审核`,
+                    getAttribute() { return null; },
+                    querySelectorAll() {
+                        return [
+                            roller(String(added), "+01234567890123456789"),
+                            roller(String(deleted), "-0123456789")
+                        ];
+                    }
+                });
+                const turn = (id, editCard) => ({
+                    getAttribute(name) {
+                        return name === "data-turn-key" ? id : null;
+                    },
+                    querySelectorAll() { return [editCard]; }
+                });
+                const oldTurn = turn("turn-old", card(2, 142, 26));
+                const latestTurn = turn("turn-latest", card(3, 544, 115));
+                const root = {
+                    querySelectorAll(selector) {
+                        return selector === "[data-turn-key]" ? [oldTurn, latestTurn] : [];
+                    }
+                };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                const historical = {
+                    threadId: "local:history",
+                    sourceTurnId: "turn-old",
+                    progress: "第 4 / 4 步",
+                    detail: "",
+                    rows: [{ text: "完成历史任务", status: "done" }]
+                };
+                const restored = hooks.taskEditChangeDetail(historical, root);
+                const latestFallback = hooks.taskEditChangeDetail({ ...historical, sourceTurnId: "" }, root);
+                return JSON.stringify({
+                    restored,
+                    latestFallback,
+                    preferred: hooks.preferredSnapshotChangeDetail(restored, "", "3个文件已更改 +544 -115", false)
+                });
+            })()"#,
+        );
+
+        assert_eq!(
+            result["restored"],
+            serde_json::json!("2个文件已更改 +142 -26")
+        );
+        assert_eq!(
+            result["latestFallback"],
+            serde_json::json!("3个文件已更改 +544 -115")
+        );
+        assert_eq!(
+            result["preferred"],
+            serde_json::json!("2个文件已更改 +142 -26")
+        );
     }
 
     #[test]
