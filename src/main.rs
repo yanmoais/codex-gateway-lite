@@ -8658,13 +8658,15 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STYLE_ID = "codex-gateway-lite-plan-ui-style";
   const MARK = "data-codex-gateway-lite-plan-ui";
   const DOCK_ID = "codex-gateway-lite-plan-ui-dock";
+  const SPACER_ID = "codex-gateway-lite-plan-ui-spacer";
+  const SPACER_ATTR = "data-codex-gateway-lite-plan-ui-spacer";
   const SOURCE_ATTR = "data-codex-gateway-lite-native-pill";
   const SNAPSHOT_KEY = "__codexGatewayLitePlanUiExternalSnapshot";
   const EXTERNAL_SNAPSHOTS_KEY = "__codexGatewayLitePlanUiExternalSnapshots";
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 50;
+  const SCRIPT_VERSION = 53;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8692,6 +8694,7 @@ const PLAN_UI_SCRIPT: &str = r#"
     rightPanelDismissedPanelSignature: previousState?.rightPanelDismissedPanelSignature || "",
     rightRailFollowUntil: 0,
     dockNode: previousState?.dockNode || null,
+    spacerNode: previousState?.spacerNode || null,
     dockContainer: previousState?.dockContainer || null,
   };
   window.__codexGatewayLitePlanUiState = state;
@@ -8749,8 +8752,24 @@ const PLAN_UI_SCRIPT: &str = r#"
       [${MARK}="dock"][data-cgl-plan-mode="inline"] {
         align-self: stretch !important;
         flex: 0 0 auto !important;
-        margin-block-start: auto !important;
+        margin-block-start: 0 !important;
         margin-block-end: 10px !important;
+      }
+      [${SPACER_ATTR}="true"] {
+        display: block !important;
+        width: 100% !important;
+        height: 20px !important;
+        min-height: 20px !important;
+        flex: 0 0 20px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        background: transparent !important;
+        pointer-events: none !important;
+      }
+      [${SPACER_ATTR}="true"][hidden],
+      [${SPACER_ATTR}="true"]:has(+ [${MARK}="dock"][hidden]) {
+        display: none !important;
       }
       [${MARK}="dock"] .cgl-plan-meta {
         display: flex !important;
@@ -9001,7 +9020,10 @@ const PLAN_UI_SCRIPT: &str = r#"
   }
 
   function managedNode(el) {
-    return !!el?.closest?.(`[${MARK}="dock"]`);
+    return !!(
+      el?.getAttribute?.(SPACER_ATTR) === "true"
+      || el?.closest?.(`[${MARK}="dock"], [${SPACER_ATTR}="true"]`)
+    );
   }
 
   function elementFromEventTarget(target) {
@@ -10119,12 +10141,29 @@ const PLAN_UI_SCRIPT: &str = r#"
     state.dockNode = dock;
     const container = rightRailCardStackContainer();
     if (container) {
+      let spacer = state.spacerNode || document.getElementById(SPACER_ID);
+      if (!spacer) {
+        spacer = document.createElement("div");
+        spacer.id = SPACER_ID;
+        spacer.setAttribute(SPACER_ATTR, "true");
+        spacer.setAttribute("aria-hidden", "true");
+      }
+      state.spacerNode = spacer;
       const lastChild = container.children && container.children[container.children.length - 1];
+      const beforeLast = container.children && container.children[container.children.length - 2];
+      const spacerInPlace = spacer.parentElement === container
+        && ((lastChild === dock && beforeLast === spacer)
+          || (dock.parentElement !== container && lastChild === spacer));
+      if (!spacerInPlace) {
+        container.appendChild(spacer);
+      }
       if (dock.parentElement !== container || lastChild !== dock) {
         container.appendChild(dock);
       }
+      spacer.hidden = false;
       dock.dataset.cglPlanMode = "inline";
     } else {
+      if (state.spacerNode) state.spacerNode.hidden = true;
       if (dock.parentElement !== document.documentElement) {
         document.documentElement.appendChild(dock);
       }
@@ -12552,8 +12591,11 @@ CREATE TABLE threads (
 
                 hooks.renderDock(snapshot);
                 const dock = document.getElementById("codex-gateway-lite-plan-ui-dock");
+                const spacer = window.__codexGatewayLitePlanUiState.spacerNode;
                 const firstMode = dock.dataset.cglPlanMode;
                 const firstParentIsStack = dock.parentElement === stack;
+                const spacerParentIsStack = spacer.parentElement === stack;
+                const spacerBeforeDock = stack.children[stack.children.length - 2] === spacer;
                 const firstIsLast = stack.children[stack.children.length - 1] === dock;
                 const firstTop = dock.style.getPropertyValue("--cgl-plan-top");
                 const firstHtml = dock.innerHTML;
@@ -12577,6 +12619,8 @@ CREATE TABLE threads (
                 return JSON.stringify({
                     firstMode,
                     firstParentIsStack,
+                    spacerParentIsStack,
+                    spacerBeforeDock,
                     firstIsLast,
                     firstTop,
                     appendsAfterFirst,
@@ -12595,11 +12639,21 @@ CREATE TABLE threads (
             serde_json::json!(true),
             "{result}"
         );
+        assert_eq!(
+            result["spacerParentIsStack"],
+            serde_json::json!(true),
+            "{result}"
+        );
+        assert_eq!(
+            result["spacerBeforeDock"],
+            serde_json::json!(true),
+            "{result}"
+        );
         assert_eq!(result["firstIsLast"], serde_json::json!(true), "{result}");
         assert_eq!(result["firstTop"], serde_json::json!(""), "{result}");
         assert_eq!(
             result["appendsAfterFirst"],
-            serde_json::json!(1),
+            serde_json::json!(2),
             "{result}"
         );
         assert_eq!(
@@ -13480,7 +13534,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 50"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 53"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -13518,7 +13572,9 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("topLayerOwns"));
         assert!(PLAN_UI_SCRIPT.contains("cgl-plan-spinner"));
         assert!(PLAN_UI_SCRIPT.contains("[data-cgl-plan-mode=\"inline\"]"));
-        assert!(PLAN_UI_SCRIPT.contains("margin-block-start: auto"));
+        assert!(PLAN_UI_SCRIPT.contains("data-codex-gateway-lite-plan-ui-spacer"));
+        assert!(PLAN_UI_SCRIPT.contains("flex: 0 0 20px"));
+        assert!(!PLAN_UI_SCRIPT.contains("inlineDockStartGap"));
         assert!(PLAN_UI_SCRIPT.contains("max-height: min(46vh, 480px)"));
         assert!(PLAN_UI_SCRIPT.contains("transform-box: fill-box"));
         assert!(PLAN_UI_SCRIPT.contains(".cgl-plan-icon .animate-spin"));
@@ -13575,7 +13631,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 50"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 53"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
