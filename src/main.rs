@@ -8664,7 +8664,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   const STORAGE_KEY = "codex-gateway-lite-plan-ui-snapshots-v1";
   const STORAGE_LIMIT = 200;
   const STATE_LIMIT = 80;
-  const SCRIPT_VERSION = 49;
+  const SCRIPT_VERSION = 50;
   const progressPattern = /第\s*\d+\s*\/\s*\d+\s*步/;
   const COMPLETE_SETTLE_MS = 1_500;
   const STALE_RUNNING_SETTLE_MS = 8_000;
@@ -8745,6 +8745,12 @@ const PLAN_UI_SCRIPT: &str = r#"
         max-width: calc(100vw - 48px) !important;
         max-height: min(46vh, calc(100vh - var(--cgl-plan-top, 92px) - 24px)) !important;
         margin: 0 !important;
+      }
+      [${MARK}="dock"][data-cgl-plan-mode="inline"] {
+        align-self: stretch !important;
+        flex: 0 0 auto !important;
+        margin-block-start: auto !important;
+        margin-block-end: 10px !important;
       }
       [${MARK}="dock"] .cgl-plan-meta {
         display: flex !important;
@@ -13474,7 +13480,7 @@ model_catalog_json = "model-catalogs/gateway.json"
 
     #[test]
     fn plan_ui_script_uses_stable_dock_and_snapshot_instead_of_hover_rebinding() {
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 49"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 50"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-dock"));
         assert!(PLAN_UI_SCRIPT.contains("codex-gateway-lite-plan-ui-snapshots-v1"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiExternalSnapshots"));
@@ -13511,6 +13517,9 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("blockingOverlayActive"));
         assert!(PLAN_UI_SCRIPT.contains("topLayerOwns"));
         assert!(PLAN_UI_SCRIPT.contains("cgl-plan-spinner"));
+        assert!(PLAN_UI_SCRIPT.contains("[data-cgl-plan-mode=\"inline\"]"));
+        assert!(PLAN_UI_SCRIPT.contains("margin-block-start: auto"));
+        assert!(PLAN_UI_SCRIPT.contains("max-height: min(46vh, 480px)"));
         assert!(PLAN_UI_SCRIPT.contains("transform-box: fill-box"));
         assert!(PLAN_UI_SCRIPT.contains(".cgl-plan-icon .animate-spin"));
         assert!(PLAN_UI_SCRIPT.contains("safeIconHtml(row.iconHtml) || iconForStatus"));
@@ -13566,7 +13575,7 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(PLAN_UI_SCRIPT.contains("STALE_RUNNING_SETTLE_MS"));
         assert!(PLAN_UI_SCRIPT.contains("__codexGatewayLitePlanUiTimer"));
         assert!(PLAN_UI_SCRIPT.contains("window.setInterval(scheduleApply, 5000)"));
-        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 49"));
+        assert!(PLAN_UI_SCRIPT.contains("const SCRIPT_VERSION = 50"));
         assert!(PLAN_UI_SCRIPT.contains("function scheduleApplyImmediate()"));
         assert!(PLAN_UI_SCRIPT.contains("function mutationTouchesRightRail(mutations)"));
         assert!(
