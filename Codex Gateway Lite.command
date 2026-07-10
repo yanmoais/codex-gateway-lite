@@ -175,12 +175,25 @@ ensure_cargo_deps() {
   ok "Rust 依赖已就绪"
 }
 
+# 新版官方 app 复用 ChatGPT.app 这个名字（bundle id 仍是 com.openai.codex）；
+# 纯聊天版 ChatGPT（com.openai.chat）不能当 Codex App。用 bundle id 或内嵌的
+# Codex Framework 佐证，与 Rust 侧 resolve_codex_app_dir 的判定保持一致。
+chatgpt_bundle_is_codex() {
+  local app_dir="$1" bundle_id
+  [[ -d "$app_dir" ]] || return 1
+  bundle_id="$(defaults read "$app_dir/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)"
+  [[ "$bundle_id" == "com.openai.codex" || "$bundle_id" == com.openai.codex.* ]] && return 0
+  [[ -d "$app_dir/Contents/Frameworks/Codex Framework.framework" ]]
+}
+
 codex_app_exists() {
   [[ -n "$APP_PATH" && -e "$APP_PATH" ]] && return 0
   [[ -d "/Applications/Codex.app" ]] && return 0
   [[ -d "$HOME/Applications/Codex.app" ]] && return 0
   [[ -d "/Applications/OpenAI Codex.app" ]] && return 0
   [[ -d "$HOME/Applications/OpenAI Codex.app" ]] && return 0
+  chatgpt_bundle_is_codex "/Applications/ChatGPT.app" && return 0
+  chatgpt_bundle_is_codex "$HOME/Applications/ChatGPT.app" && return 0
   return 1
 }
 
@@ -200,15 +213,15 @@ install_codex_app() {
   mkdir -p "$mount"
   download_file "$url" "$dmg" "Codex App DMG"
   hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" >/dev/null
-  app="$(find "$mount" -maxdepth 2 -name 'Codex.app' -type d -print -quit)"
-  [[ -n "$app" ]] || { hdiutil detach "$mount" >/dev/null || true; fail "DMG 中未找到 Codex.app。"; }
+  app="$(find "$mount" -maxdepth 2 \( -name 'Codex.app' -o -name 'ChatGPT.app' \) -type d -print -quit)"
+  [[ -n "$app" ]] || { hdiutil detach "$mount" >/dev/null || true; fail "DMG 中未找到 Codex.app / ChatGPT.app。"; }
   if [[ -w "/Applications" ]]; then
     target_parent="/Applications"
   else
     target_parent="$HOME/Applications"
     mkdir -p "$target_parent"
   fi
-  target_app="$target_parent/Codex.app"
+  target_app="$target_parent/$(basename "$app")"
   [[ -e "$target_app" ]] && fail "$target_app 已存在但自动识别失败，请手动检查后重试。"
   ditto "$app" "$target_app"
   hdiutil detach "$mount" >/dev/null || true

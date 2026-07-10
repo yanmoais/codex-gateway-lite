@@ -49,6 +49,29 @@ struct LiteConfig {
     common_config: String,
     #[serde(default)]
     plan_hints: bool,
+    /// Saved provider profiles for multi-provider switching. The top-level
+    /// `provider`/`model`/`models`/... fields are always the *active*
+    /// working copy; entries here are inactive snapshots keyed by
+    /// `provider.id`. `use-provider` backfills the active copy into this
+    /// list before promoting the requested profile to the top level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    providers: Vec<LiteProviderProfile>,
+}
+
+/// A saved (inactive) provider profile: the same shape as the top-level
+/// active fields so switching is a straight swap.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiteProviderProfile {
+    provider: LiteProvider,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    models: Vec<LiteModel>,
+    #[serde(default)]
+    context_window: String,
+    #[serde(default)]
+    auto_compact_token_limit: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -124,6 +147,9 @@ enum Command {
         debug_port: u16,
         plan_ui: bool,
     },
+    InjectModelUi {
+        debug_port: u16,
+    },
     InjectPlanUi {
         debug_port: u16,
     },
@@ -161,6 +187,24 @@ enum Command {
     Init {
         config_path: PathBuf,
         force: bool,
+    },
+    Providers {
+        config_path: PathBuf,
+    },
+    AddProvider {
+        config_path: PathBuf,
+    },
+    UseProvider {
+        config_path: PathBuf,
+        provider_id: String,
+        codex_home: Option<PathBuf>,
+        no_apply: bool,
+        debug_port: u16,
+        plan_ui: bool,
+    },
+    RemoveProvider {
+        config_path: PathBuf,
+        provider_id: String,
     },
     WhereApp {
         app_path: Option<PathBuf>,
@@ -210,6 +254,9 @@ async fn run_cli() -> anyhow::Result<()> {
             if plan_ui {
                 wait_and_inject_plan_ui(debug_port, None).await?;
             }
+        }
+        Command::InjectModelUi { debug_port } => {
+            wait_and_inject_lite_model_whitelist(debug_port, None).await?;
         }
         Command::InjectPlanUi { debug_port } => {
             wait_and_inject_plan_ui(debug_port, None).await?;
@@ -286,6 +333,75 @@ async fn run_cli() -> anyhow::Result<()> {
         Command::Init { config_path, force } => {
             init_config(&config_path, force).await?;
         }
+        Command::Providers { config_path } => {
+            let config = read_lite_config(&config_path)?;
+            print_provider_list(&config);
+        }
+        Command::AddProvider { config_path } => {
+            add_provider_interactive(&config_path).await?;
+        }
+        Command::UseProvider {
+            config_path,
+            provider_id,
+            codex_home,
+            no_apply,
+            debug_port,
+            plan_ui,
+        } => {
+            let mut config = read_lite_config(&config_path)?;
+            switch_active_provider(&mut config, &provider_id)?;
+            validate_config(&config)?;
+            write_lite_config(&config_path, &config)?;
+            println!(
+                "已切换激活供应商：{}",
+                sanitize_provider_id(&config.provider.id)
+            );
+            if no_apply {
+                println!("已按 --no-apply 跳过写入 Codex 配置；运行中的 agent 会自动应用。");
+            } else {
+                maybe_refresh_config_models(&config_path).await;
+                let config = read_lite_config(&config_path)?;
+                let report = apply_config(&config, codex_home.as_deref(), config.plan_hints)?;
+                print_apply_report(&report);
+                if soft_reload_codex(debug_port).await.is_ok() {
+                    if let Err(error) =
+                        wait_and_inject_lite_model_whitelist(debug_port, codex_home.as_deref())
+                            .await
+                    {
+                        eprintln!("Lite 模型白名单注入失败：{error:#}");
+                    } else if plan_ui {
+                        if let Err(error) =
+                            wait_and_inject_plan_ui(debug_port, codex_home.as_deref()).await
+                        {
+                            eprintln!("任务清单 UI 注入失败：{error:#}");
+                        }
+                    }
+                } else {
+                    println!("Codex App 未在运行或 CDP 不可达；配置已写入，下次启动生效。");
+                }
+            }
+        }
+        Command::RemoveProvider {
+            config_path,
+            provider_id,
+        } => {
+            let mut config = read_lite_config(&config_path)?;
+            let requested = sanitize_provider_id(&provider_id);
+            if sanitize_provider_id(&config.provider.id) == requested {
+                bail!(
+                    "供应商「{requested}」当前处于激活状态；请先 use-provider 切换到其它供应商再删除"
+                );
+            }
+            let before = config.providers.len();
+            config
+                .providers
+                .retain(|profile| sanitize_provider_id(&profile.provider.id) != requested);
+            if config.providers.len() == before {
+                bail!("未找到已保存的供应商「{requested}」");
+            }
+            write_lite_config(&config_path, &config)?;
+            println!("已删除供应商：{requested}");
+        }
         Command::WhereApp { app_path } => {
             let app_dir = resolve_codex_app(app_path.as_deref())?;
             println!("{}", app_dir.display());
@@ -333,6 +449,11 @@ fn parse_args() -> anyhow::Result<Command> {
                 debug_port,
                 plan_ui,
             })
+        }
+        "inject-model-ui" => {
+            let debug_port = take_u16_arg(&mut args, "--debug-port", 9229)?;
+            reject_unknown_args(&args)?;
+            Ok(Command::InjectModelUi { debug_port })
         }
         "inject-plan-ui" => {
             let debug_port = take_u16_arg(&mut args, "--debug-port", 9229)?;
@@ -418,6 +539,58 @@ fn parse_args() -> anyhow::Result<Command> {
             reject_unknown_args(&args)?;
             Ok(Command::Init { config_path, force })
         }
+        "providers" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            reject_unknown_args(&args)?;
+            Ok(Command::Providers { config_path })
+        }
+        "add-provider" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            reject_unknown_args(&args)?;
+            Ok(Command::AddProvider { config_path })
+        }
+        "use-provider" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let codex_home = take_optional_path_arg(&mut args, "--codex-home")?;
+            let no_apply = take_flag(&mut args, "--no-apply");
+            let debug_port = take_u16_arg(&mut args, "--debug-port", 9229)?;
+            let plan_ui = !take_flag(&mut args, "--no-plan-ui");
+            let provider_id = take_string_arg(&mut args, "--id").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!("use-provider 需要供应商 ID：use-provider <id> 或 --id <id>")
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::UseProvider {
+                config_path,
+                provider_id,
+                codex_home,
+                no_apply,
+                debug_port,
+                plan_ui,
+            })
+        }
+        "remove-provider" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let provider_id = take_string_arg(&mut args, "--id").or_else(|_| {
+                if args.len() == 1 && !args[0].starts_with('-') {
+                    Ok(args.remove(0))
+                } else {
+                    bail!("remove-provider 需要供应商 ID：remove-provider <id> 或 --id <id>")
+                }
+            })?;
+            reject_unknown_args(&args)?;
+            Ok(Command::RemoveProvider {
+                config_path,
+                provider_id,
+            })
+        }
         "where-app" => {
             let app_path = take_optional_path_arg(&mut args, "--app")?;
             reject_unknown_args(&args)?;
@@ -492,6 +665,116 @@ fn read_lite_config(path: &Path) -> anyhow::Result<LiteConfig> {
         fs::read_to_string(path).with_context(|| format!("读取配置失败：{}", path.display()))?;
     serde_json::from_str(&contents)
         .with_context(|| format!("配置不是合法 JSON：{}", path.display()))
+}
+
+/// Snapshot the current active provider fields into a saved profile.
+fn active_provider_profile_snapshot(config: &LiteConfig) -> LiteProviderProfile {
+    LiteProviderProfile {
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        models: config.models.clone(),
+        context_window: config.context_window.clone(),
+        auto_compact_token_limit: config.auto_compact_token_limit.clone(),
+    }
+}
+
+/// Promote a saved profile to the active top-level fields.
+fn promote_provider_profile(config: &mut LiteConfig, profile: LiteProviderProfile) {
+    config.provider = profile.provider;
+    config.model = profile.model;
+    config.models = profile.models;
+    config.context_window = profile.context_window;
+    config.auto_compact_token_limit = profile.auto_compact_token_limit;
+}
+
+/// Switch the active provider to `provider_id`. The current active provider
+/// is backfilled into `config.providers` first (backfill-before-switch,
+/// so no in-flight edits are lost). Saved
+/// profiles are keyed by sanitized provider id.
+fn switch_active_provider(config: &mut LiteConfig, provider_id: &str) -> anyhow::Result<()> {
+    let requested = sanitize_provider_id(provider_id);
+    let active_id = sanitize_provider_id(&config.provider.id);
+    if requested == active_id {
+        return Ok(());
+    }
+    let index = config
+        .providers
+        .iter()
+        .position(|profile| sanitize_provider_id(&profile.provider.id) == requested)
+        .ok_or_else(|| {
+            let mut known = vec![active_id.clone()];
+            known.extend(
+                config
+                    .providers
+                    .iter()
+                    .map(|profile| sanitize_provider_id(&profile.provider.id)),
+            );
+            anyhow::anyhow!(
+                "未找到供应商「{requested}」；当前已保存：{}",
+                known.join(", ")
+            )
+        })?;
+    let next = config.providers.remove(index);
+    let previous = active_provider_profile_snapshot(config);
+    promote_provider_profile(config, next);
+    // Backfill previous active profile, replacing any stale copy with the
+    // same id.
+    config
+        .providers
+        .retain(|profile| sanitize_provider_id(&profile.provider.id) != active_id);
+    config.providers.push(previous);
+    config
+        .providers
+        .sort_by(|left, right| left.provider.id.cmp(&right.provider.id));
+    Ok(())
+}
+
+/// Insert or replace a saved provider profile without activating it.
+fn upsert_saved_provider_profile(config: &mut LiteConfig, profile: LiteProviderProfile) {
+    let id = sanitize_provider_id(&profile.provider.id);
+    config
+        .providers
+        .retain(|existing| sanitize_provider_id(&existing.provider.id) != id);
+    config.providers.push(profile);
+    config
+        .providers
+        .sort_by(|left, right| left.provider.id.cmp(&right.provider.id));
+}
+
+fn provider_summary_line(id: &str, profile_provider: &LiteProvider, active: bool) -> String {
+    let marker = if active { "*" } else { " " };
+    let name = if profile_provider.name.trim().is_empty() {
+        id
+    } else {
+        profile_provider.name.trim()
+    };
+    let protocol = match profile_provider.protocol {
+        LiteProtocol::Responses => "responses",
+        LiteProtocol::ChatCompletions => "chat_completions",
+    };
+    format!("{marker} {id}  ({name}, {protocol})")
+}
+
+fn print_provider_list(config: &LiteConfig) {
+    println!("供应商列表（* 为当前激活）：");
+    println!(
+        "{}",
+        provider_summary_line(
+            &sanitize_provider_id(&config.provider.id),
+            &config.provider,
+            true
+        )
+    );
+    for profile in &config.providers {
+        println!(
+            "{}",
+            provider_summary_line(
+                &sanitize_provider_id(&profile.provider.id),
+                &profile.provider,
+                false
+            )
+        );
+    }
 }
 
 fn default_user_config_path() -> PathBuf {
@@ -1199,10 +1482,74 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
         auto_compact_token_limit: String::new(),
         common_config,
         plan_hints,
+        providers: Vec::new(),
     };
 
     write_lite_config(path, &config)?;
     println!("配置已写入：{}", path.display());
+    Ok(())
+}
+
+/// Interactively collect a new provider profile and save it (inactive) into
+/// `config.providers`. Reuses the same prompts as `init`, but never touches
+/// the currently active provider.
+async fn add_provider_interactive(config_path: &Path) -> anyhow::Result<()> {
+    let mut config = read_lite_config(config_path)?;
+    println!("新增供应商（保存后需 use-provider 切换激活）");
+    let provider_id = prompt_required("供应商 ID")?;
+    let requested = sanitize_provider_id(&provider_id);
+    if sanitize_provider_id(&config.provider.id) == requested
+        || config
+            .providers
+            .iter()
+            .any(|profile| sanitize_provider_id(&profile.provider.id) == requested)
+    {
+        bail!("供应商「{requested}」已存在；请换一个 ID，或先 remove-provider 删除旧配置");
+    }
+    let provider_name = prompt_default("供应商名称", &provider_id)?;
+    let base_url = prompt_required("Base URL，例如 https://api.example.com/v1")?;
+    let api_key = prompt_required("API Key（会保存到用户目录私有配置文件，不写入 Git）")?;
+    println!("供应商协议：");
+    println!("  1. Responses API — 供应商原生支持 OpenAI Responses 格式，Codex 直连");
+    println!("  2. Chat Completions — 供应商只支持 Chat 格式，由本地代理自动转换");
+    let protocol_choice = prompt_default("请选择", "1")?;
+    let protocol = match protocol_choice.trim() {
+        "2" => LiteProtocol::ChatCompletions,
+        _ => LiteProtocol::Responses,
+    };
+    let context_budget = prompt_context_budget()?;
+    let provider = LiteProvider {
+        id: provider_id,
+        name: provider_name,
+        base_url,
+        api_key,
+        api_key_env: String::new(),
+        mode: LiteMode::MixedApi,
+        protocol,
+        context_budget,
+    };
+    println!("正在从供应商拉取模型列表...");
+    let model_ids = fetch_provider_model_ids(&provider).await?;
+    if model_ids.is_empty() {
+        bail!("供应商 /models 没有返回任何模型");
+    }
+    let models = models_from_ids(&model_ids, &[]);
+    println!("已拉取 {} 个模型。", models.len());
+    let default_model = choose_default_model(&model_ids)?;
+    println!("默认模型：{}", default_model);
+    upsert_saved_provider_profile(
+        &mut config,
+        LiteProviderProfile {
+            provider,
+            model: default_model,
+            models,
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+        },
+    );
+    write_lite_config(config_path, &config)?;
+    println!("供应商已保存：{requested}");
+    println!("切换激活：codex-gateway-lite use-provider {requested}");
     Ok(())
 }
 
@@ -1373,8 +1720,15 @@ fn models_from_ids(ids: &[String], existing_models: &[LiteModel]) -> Vec<LiteMod
 /// - Anthropic: https://docs.anthropic.com/en/docs/about-claude/models
 /// - xAI: https://docs.x.ai/docs/models
 ///
-/// Last reviewed: 2026-07-08.
+/// Last reviewed: 2026-07-10.
 const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
+    // OpenAI GPT-5.6 family (GA 2026-07-09): gpt-5.6-sol / gpt-5.6-terra /
+    // gpt-5.6-luna plus the bare `gpt-5.6` alias (routes to Sol). All three
+    // tiers share the same official 1,050,000-token context window and 128K
+    // max output per the vendor model pages, so a single prefix entry covers
+    // the family. `parse_window_token` only takes integers with a K/M
+    // suffix, so 1.05M is spelled 1050K here.
+    ("gpt-5.6", "1050K"),
     // OpenAI GPT-4.1 family officially supports up to ~1M input tokens.
     ("gpt-4.1", "1M"),
     ("chatgpt-4.1", "1M"),
@@ -1834,6 +2188,15 @@ fn sync_local_thread_catalog_for_provider(
         .or_else(|| codex_home_model_provider(home));
     if let Some(provider) = active_model_provider.as_deref() {
         normalize_rollout_session_meta_providers(home, &selected, provider)?;
+        match sync_threads_model_provider_globally(home, provider) {
+            Ok(rows) if rows > 0 => {
+                println!("已把 {rows} 条历史会话的 model_provider 同步为 {provider}");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("同步历史会话 model_provider 失败，继续启动：{error:#}");
+            }
+        }
     }
 
     for db_path in local_thread_catalog_db_paths(home) {
@@ -2288,6 +2651,42 @@ ON CONFLICT(host_id, thread_id) DO UPDATE SET
     Ok((inserted, updated))
 }
 
+/// Bulk-rewrite `threads.model_provider` to the active provider across all
+/// Codex thread databases (current `sqlite/*.sqlite3` and legacy
+/// `state_5.sqlite`).
+///
+/// This is the SQLite half of the account-session sync: threads created
+/// while logged in with the official account carry `model_provider =
+/// "openai"` (or a previous provider id) and Codex App hides them from the
+/// sidebar when a different provider is active. Only rows that differ are
+/// touched, so a repeat run is a no-op.
+fn sync_threads_model_provider_globally(
+    home: &Path,
+    active_model_provider: &str,
+) -> anyhow::Result<usize> {
+    let Some(active_model_provider) = non_empty_string(active_model_provider) else {
+        return Ok(0);
+    };
+    let mut total = 0usize;
+    for db_path in thread_state_db_paths(home) {
+        if !db_path.exists() || !sqlite_has_table(&db_path, "threads") {
+            continue;
+        }
+        let conn = Connection::open(&db_path)
+            .with_context(|| format!("打开 Codex threads 数据库失败：{}", db_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        let columns = sqlite_table_columns(&conn, "threads")?;
+        if !columns.contains("model_provider") {
+            continue;
+        }
+        total += conn.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+            [&active_model_provider],
+        )?;
+    }
+    Ok(total)
+}
+
 fn sync_native_threads_table(
     home: &Path,
     entries: &[ThreadCatalogEntry],
@@ -2575,34 +2974,82 @@ fn current_unix_timestamp_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Directories under the Codex home that hold rollout files. Includes
+/// archived sessions so account-login-era conversations also follow the
+/// active API provider.
+const ROLLOUT_SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
+
+/// Rewrite `session_meta.payload.model_provider` to the active provider in
+/// every rollout file under the home's session directories.
+///
+/// This is a full-disk scan rather than an index-driven walk on purpose:
+/// sessions created while logged in with the official account may never
+/// appear in the API-provider thread index, but Codex App filters the
+/// sidebar by `model_provider`, so without rewriting them here those
+/// conversations silently vanish whenever the user switches to an API-key
+/// provider.
 fn normalize_rollout_session_meta_providers(
     home: &Path,
-    entries: &[ThreadCatalogEntry],
+    _entries: &[ThreadCatalogEntry],
     active_model_provider: &str,
 ) -> anyhow::Result<usize> {
     let Some(active_model_provider) = non_empty_string(active_model_provider) else {
         return Ok(0);
     };
     let mut changed = 0;
-    let mut seen = HashSet::new();
-    for entry in entries.iter().filter(|entry| !entry.archived) {
-        let Some(raw_path) = entry.rollout_path.as_deref().and_then(non_empty_string) else {
-            continue;
-        };
-        if !seen.insert(raw_path.clone()) {
-            continue;
-        }
-        let path = PathBuf::from(strip_windows_extended_prefix(&raw_path));
-        if !rollout_path_belongs_to_home_sessions(home, &path) {
-            continue;
-        }
-        if normalize_rollout_session_meta_provider(&path, &active_model_provider)? {
-            changed += 1;
+    for path in collect_home_rollout_files(home) {
+        match normalize_rollout_session_meta_provider(&path, &active_model_provider) {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            // A locked or torn file must not abort the whole sync; skip it
+            // and let the next apply pick it up.
+            Err(error) => {
+                eprintln!(
+                    "同步 rollout 供应商失败，已跳过：{}：{error:#}",
+                    path.display()
+                );
+            }
         }
     }
     Ok(changed)
 }
 
+fn collect_home_rollout_files(home: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dirname in ROLLOUT_SESSION_DIRS {
+        let root = home.join(dirname);
+        if root.exists() {
+            collect_rollout_files_recursive(&root, &mut files);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn collect_rollout_files_recursive(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_files_recursive(&path, files);
+        } else if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            files.push(path);
+        }
+    }
+}
+
+/// Rewrite every `session_meta` line in a single rollout file so its
+/// `model_provider` matches the active provider. A rollout can carry more
+/// than one `session_meta` record (e.g. resumed/forked sessions append a new
+/// meta line); Codex reads the latest one, so rewriting only the first line
+/// is not enough. Preserves the file's mtime so recency-based ordering in
+/// the sidebar does not get shuffled by the sync itself.
 fn normalize_rollout_session_meta_provider(
     path: &Path,
     active_model_provider: &str,
@@ -2615,39 +3062,44 @@ fn normalize_rollout_session_meta_provider(
                 .with_context(|| format!("读取 Codex rollout 失败：{}", path.display()));
         }
     };
-    let (first_line, rest) = match text.split_once('\n') {
-        Some((first, rest)) => (first.trim_end_matches('\r'), Some(rest)),
-        None => (text.trim_end_matches('\r'), None),
-    };
-    if first_line.trim().is_empty() {
+    let mut rewritten = String::with_capacity(text.len());
+    let mut rewrite_needed = false;
+    for segment in text.split_inclusive('\n') {
+        let (line, line_ending) = match segment.strip_suffix("\r\n") {
+            Some(line) => (line, "\r\n"),
+            None => match segment.strip_suffix('\n') {
+                Some(line) => (line, "\n"),
+                None => (segment, ""),
+            },
+        };
+        let mut next_line = None;
+        if !line.trim().is_empty() {
+            if let Ok(mut value) = serde_json::from_str::<Value>(line) {
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                        let current = payload.get("model_provider").and_then(Value::as_str);
+                        if current != Some(active_model_provider) {
+                            payload.insert(
+                                "model_provider".to_string(),
+                                Value::String(active_model_provider.to_string()),
+                            );
+                            next_line = Some(serde_json::to_string(&value)?);
+                            rewrite_needed = true;
+                        }
+                    }
+                }
+            }
+        }
+        match next_line {
+            Some(next_line) => rewritten.push_str(&next_line),
+            None => rewritten.push_str(line),
+        }
+        rewritten.push_str(line_ending);
+    }
+    if !rewrite_needed {
         return Ok(false);
     }
-    let mut value: Value = match serde_json::from_str(first_line) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return Ok(false);
-    }
-    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
-        return Ok(false);
-    };
-    if payload
-        .get("model_provider")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == active_model_provider)
-    {
-        return Ok(false);
-    }
-    payload.insert(
-        "model_provider".to_string(),
-        Value::String(active_model_provider.to_string()),
-    );
-    let mut rewritten = serde_json::to_string(&value)?;
-    rewritten.push('\n');
-    if let Some(rest) = rest {
-        rewritten.push_str(rest);
-    }
+    let original_mtime = fs::metadata(path).and_then(|meta| meta.modified()).ok();
     let temp_path = path.with_extension(format!(
         "{}.tmp",
         path.extension().and_then(OsStr::to_str).unwrap_or("jsonl")
@@ -2656,21 +3108,12 @@ fn normalize_rollout_session_meta_provider(
         .with_context(|| format!("写入临时 rollout 失败：{}", temp_path.display()))?;
     fs::rename(&temp_path, path)
         .with_context(|| format!("替换 Codex rollout 失败：{}", path.display()))?;
+    if let Some(mtime) = original_mtime {
+        if let Ok(file) = fs::File::options().write(true).open(path) {
+            let _ = file.set_times(fs::FileTimes::new().set_modified(mtime));
+        }
+    }
     Ok(true)
-}
-
-fn rollout_path_belongs_to_home_sessions(home: &Path, path: &Path) -> bool {
-    let Ok(home) = home.canonicalize() else {
-        return false;
-    };
-    let Ok(path) = path.canonicalize() else {
-        return false;
-    };
-    path.starts_with(home.join("sessions"))
-}
-
-fn strip_windows_extended_prefix(value: &str) -> String {
-    value.strip_prefix(r"\\?\").unwrap_or(value).to_string()
 }
 
 fn codex_home_model_provider(home: &Path) -> Option<String> {
@@ -3793,8 +4236,11 @@ fn normalize_lite_catalog_model_entry(model: &Value, name: &str) -> Value {
             "modelAutoCompactTokenLimit",
             "defaultReasoningEffort",
             "default_reasoning_effort",
+            "defaultReasoningLevel",
+            "default_reasoning_level",
             "supportedReasoningEfforts",
             "supported_reasoning_efforts",
+            "supportedReasoningLevels",
             "supported_reasoning_levels",
             "support_verbosity",
             "supports_reasoning_summaries",
@@ -3867,7 +4313,7 @@ fn unique_model_ids(values: Vec<String>) -> Vec<String> {
 
 const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
 (() => {
-  const SCRIPT_VERSION = 8;
+  const SCRIPT_VERSION = 10;
   const REQUEST_GUARD = "__codex_gateway_lite_model_list_only__";
   const SEND_REQUEST_PATCH_MARK = `codex-gateway-lite-send-request-v${SCRIPT_VERSION}`;
   const catalog = __LITE_MODEL_CATALOG__;
@@ -3988,6 +4434,9 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
       if (item && typeof item === "object" && typeof item.reasoning_effort === "string") {
         return { reasoningEffort: item.reasoning_effort, description: item.description || `${item.reasoning_effort} effort` };
       }
+      if (item && typeof item === "object" && typeof item.effort === "string") {
+        return { reasoningEffort: item.effort, description: item.description || `${item.effort} effort` };
+      }
       return null;
     }).filter(Boolean);
     return efforts.length ? efforts : null;
@@ -4033,10 +4482,16 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
     const displayName = String(entry.displayName || entry.display_name || modelName).trim();
     metadata.displayName = displayName || modelName;
     metadata.display_name = displayName || modelName;
-    const reasoningEfforts = normalizedReasoningEfforts(entry.supportedReasoningEfforts || entry.supported_reasoning_efforts);
+    const reasoningEfforts = normalizedReasoningEfforts(
+      entry.supportedReasoningEfforts
+      || entry.supported_reasoning_efforts
+      || entry.supportedReasoningLevels
+      || entry.supported_reasoning_levels
+    );
     if (reasoningEfforts) metadata.supportedReasoningEfforts = reasoningEfforts;
-    if (typeof entry.defaultReasoningEffort !== "string" && typeof entry.default_reasoning_effort === "string") {
-      metadata.defaultReasoningEffort = entry.default_reasoning_effort;
+    if (typeof entry.defaultReasoningEffort !== "string") {
+      const defaultReasoningEffort = entry.default_reasoning_effort || entry.defaultReasoningLevel || entry.default_reasoning_level;
+      if (typeof defaultReasoningEffort === "string") metadata.defaultReasoningEffort = defaultReasoningEffort;
     }
     return metadata;
   }
@@ -4101,8 +4556,12 @@ const LITE_MODEL_WHITELIST_SCRIPT: &str = r##"
       "maxContextWindow",
       "supportedReasoningEfforts",
       "supported_reasoning_efforts",
+      "supportedReasoningLevels",
+      "supported_reasoning_levels",
       "defaultReasoningEffort",
       "default_reasoning_effort",
+      "defaultReasoningLevel",
+      "default_reasoning_level",
     ].some((key) => hasOwn(value, key));
   }
 
@@ -5314,7 +5773,7 @@ async fn run_agent(
     }
     let interval = Duration::from_millis(interval_ms.max(1000));
     let app_dir = resolve_codex_app(app_path.as_deref()).with_context(|| {
-        "识别 Codex App 路径失败；请运行 where-app，或通过 CODEX_GATEWAY_LITE_APP / --app 指定 Codex.exe"
+        "识别 Codex App 路径失败；请运行 where-app，或通过 CODEX_GATEWAY_LITE_APP / --app 指定 Codex.app / ChatGPT.app / Codex.exe"
     })?;
     println!("Codex Gateway Lite agent 已启动");
     println!("  config: {}", config_path.display());
@@ -5633,7 +6092,9 @@ fn file_modified(path: &Path) -> anyhow::Result<SystemTime> {
 
 fn resolve_codex_app(app_path: Option<&Path>) -> anyhow::Result<PathBuf> {
     codex_lite::resolve_codex_app_dir(app_path).ok_or_else(|| {
-        anyhow::anyhow!("未找到 Codex App；请用 --app 指定 Codex.app 或 Codex.exe 所在路径")
+        anyhow::anyhow!(
+            "未找到 Codex App；请用 --app 指定 Codex.app / ChatGPT.app 或 Codex.exe 所在路径"
+        )
     })
 }
 
@@ -5849,7 +6310,21 @@ fn spawn_codex_app_macos(
 
 #[cfg(target_os = "macos")]
 fn macos_codex_executable(app_dir: &Path) -> PathBuf {
-    app_dir.join("Contents").join("MacOS").join("Codex")
+    let macos_dir = app_dir.join("Contents").join("MacOS");
+    if let Some(name) = codex_lite::macos_app_executable_name(app_dir) {
+        let candidate = macos_dir.join(&name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // 老版本主可执行文件叫 Codex；新版（ChatGPT.app 壳、bundle id 不变）叫 ChatGPT。
+    for name in ["Codex", "ChatGPT"] {
+        let candidate = macos_dir.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    macos_dir.join("Codex")
 }
 
 #[cfg(target_os = "macos")]
@@ -6108,7 +6583,7 @@ fn codex_app_command_matches_profile(
     codex_home: &Path,
     user_data_dir: &Path,
 ) -> bool {
-    command.contains("/Contents/MacOS/Codex")
+    (command.contains("/Contents/MacOS/Codex") || command.contains("/Contents/MacOS/ChatGPT"))
         && command.contains(&format!("--remote-debugging-port={debug_port}"))
         && command.contains(&format!("--user-data-dir={}", user_data_dir.display()))
         && (!macos_codex_home_requires_env(codex_home)
@@ -9093,20 +9568,26 @@ fn print_help() {
   codex-gateway-lite apply --config <config.json> [--codex-home <dir>] [--reload] [--debug-port 9229] [--no-plan-ui]
   codex-gateway-lite doctor --config <config.json>
   codex-gateway-lite reload [--debug-port 9229] [--no-plan-ui]
+  codex-gateway-lite inject-model-ui [--debug-port 9229]
   codex-gateway-lite inject-plan-ui [--debug-port 9229]
   codex-gateway-lite watch --config <config.json> [--codex-home <dir>] [--debug-port 9229] [--interval-ms 1200]
-  codex-gateway-lite agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
-  codex-gateway-lite launch [--config <config.json>] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--no-plan-ui]
-  codex-gateway-lite install-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
+  codex-gateway-lite agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
+  codex-gateway-lite launch [--config <config.json>] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--no-plan-ui]
+  codex-gateway-lite install-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
   codex-gateway-lite stop-agent
   codex-gateway-lite uninstall-agent
   codex-gateway-lite init [--config ~/.codex-gateway-lite/config.json] [--force]
-  codex-gateway-lite where-app [--app <Codex.app|Codex.exe|app dir>]
+  codex-gateway-lite providers [--config <config.json>]
+  codex-gateway-lite add-provider [--config <config.json>]
+  codex-gateway-lite use-provider <id> [--config <config.json>] [--codex-home <dir>] [--no-apply] [--debug-port 9229] [--no-plan-ui]
+  codex-gateway-lite remove-provider <id> [--config <config.json>]
+  codex-gateway-lite where-app [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>]
 
 说明：
   apply   保留现有 ~/.codex/config.toml，合并 commonConfig，并更新模型/provider/catalog 相关字段
   doctor  用 /v1/models 验证 gateway 可访问性，不打印 API Key
   reload  通过 Codex CDP 端口触发 renderer 软刷新
+  inject-model-ui  不刷新页面，直接向当前 Codex renderer 注入 Lite 模型列表和档位补丁
   inject-plan-ui  不刷新页面，直接向当前 Codex renderer 注入任务清单常驻修正
   watch   监听配置变更，自动 apply + reload
   agent   常驻模式：启动 Codex、按需启动本地协议代理、监听配置、保活 CDP、持续重注入任务清单 UI
@@ -9115,6 +9596,10 @@ fn print_help() {
   stop-agent  停止当前用户会话里的 LaunchAgent/Scheduled Task 和旧 agent 进程，并清理 agent lock
   uninstall-agent  macOS 卸载 LaunchAgent；Windows 删除 Scheduled Task
   init    首次交互式配置 Base URL/API Key，自动同步 1M 模型列表，并从默认 Codex home 抽取公共配置
+  providers  列出已保存的供应商，* 标记当前激活项
+  add-provider  交互式新增一个供应商档案（API Key 各自独立），保存后用 use-provider 激活
+  use-provider  切换激活供应商：当前供应商先回填保存，再把目标供应商写入 Codex 配置并软刷新
+  remove-provider  删除一个未激活的已保存供应商
   where-app  打印自动识别到的 Codex App 路径
 "#
     );
@@ -11381,7 +11866,10 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("patchOutboundModelRequestMessage"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("appServerPatchUnavailable = false"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("appServerPatchUnavailable = true"));
-        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("const SCRIPT_VERSION = 8"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("const SCRIPT_VERSION = 10"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("entry.supported_reasoning_levels"));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("typeof item.effort === \"string\""));
+        assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("entry.default_reasoning_level"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("state.observer?.disconnect?.()"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("window.clearTimeout(state.refreshTimer)"));
         assert!(LITE_MODEL_WHITELIST_SCRIPT.contains("restoreAppServerModelRequestPatches(state)"));
@@ -11956,6 +12444,18 @@ not-a-pid garbage line without valid pid
         assert!(stale_codex_app_pids(ps_output, marker).is_empty());
     }
 
+    #[test]
+    fn stale_codex_app_pids_matches_chatgpt_bundle_main_executable() {
+        let marker = "/Applications/ChatGPT.app/Contents/MacOS/";
+        let ps_output = "\
+  57422 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9229
+  57431 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150.0.7871.101/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer
+  57440 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150.0.7871.101/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service) --type=gpu-process
+";
+        let pids = stale_codex_app_pids(ps_output, marker);
+        assert_eq!(pids, vec![57422]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_codex_profile_name_tracks_codex_home() {
@@ -11976,11 +12476,18 @@ not-a-pid garbage line without valid pid
         let codex_home = Path::new("/Users/demo/.codex-gateway");
         let user_data_dir = Path::new("/Users/demo/Library/Application Support/Codex-Gateway");
         let matching = "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9229 --user-data-dir=/Users/demo/Library/Application Support/Codex-Gateway CODEX_HOME=/Users/demo/.codex-gateway";
+        let matching_chatgpt_bundle = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9229 --user-data-dir=/Users/demo/Library/Application Support/Codex-Gateway CODEX_HOME=/Users/demo/.codex-gateway";
         let missing_profile =
             "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9229";
 
         assert!(codex_app_command_matches_profile(
             matching,
+            9229,
+            codex_home,
+            user_data_dir
+        ));
+        assert!(codex_app_command_matches_profile(
+            matching_chatgpt_bundle,
             9229,
             codex_home,
             user_data_dir
@@ -12162,6 +12669,9 @@ not-a-pid garbage line without valid pid
             models: models_from_ids(
                 &[
                     "gpt-5.5".to_string(),
+                    "gpt-5.6-sol".to_string(),
+                    "gpt-5.6-terra".to_string(),
+                    "gpt-5.6-luna".to_string(),
                     "openai/chatgpt-4o-latest".to_string(),
                     "claude-fable-5".to_string(),
                 ],
@@ -12171,11 +12681,24 @@ not-a-pid garbage line without valid pid
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
         let (models, windows) = split_models(&config);
 
         assert!(models.lines().any(|line| line == "gpt-5.5"));
         assert_eq!(windows.get("gpt-5.5").map(String::as_str), Some("258400"));
+        assert_eq!(
+            windows.get("gpt-5.6-sol").map(String::as_str),
+            Some("1050K")
+        );
+        assert_eq!(
+            windows.get("gpt-5.6-terra").map(String::as_str),
+            Some("1050K")
+        );
+        assert_eq!(
+            windows.get("gpt-5.6-luna").map(String::as_str),
+            Some("1050K")
+        );
         assert_eq!(
             windows.get("openai/chatgpt-4o-latest").map(String::as_str),
             Some("258400")
@@ -12188,6 +12711,21 @@ not-a-pid garbage line without valid pid
 
     #[test]
     fn default_context_window_uses_known_vendor_family_table() {
+        assert_eq!(default_context_window_for_model_id("gpt-5.6"), "1050K");
+        assert_eq!(default_context_window_for_model_id("gpt-5.6-sol"), "1050K");
+        assert_eq!(
+            default_context_window_for_model_id("gpt-5.6-terra"),
+            "1050K"
+        );
+        assert_eq!(
+            default_context_window_for_model_id("gpt-5.6-luna"),
+            "1050K"
+        );
+        assert_eq!(
+            default_context_window_for_model_id("openai/gpt-5.6-sol"),
+            "1050K"
+        );
+        // GPT-5.5 and earlier keep the Codex-effective GPT-family fallback.
         assert_eq!(default_context_window_for_model_id("gpt-5.5"), "258400");
         assert_eq!(
             default_context_window_for_model_id("openai/chatgpt-4o-latest"),
@@ -12246,6 +12784,7 @@ not-a-pid garbage line without valid pid
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
 
         let profile = build_profile(&config).expect("profile builds");
@@ -12286,6 +12825,7 @@ not-a-pid garbage line without valid pid
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
 
         let profile = build_profile(&config).expect("profile builds");
@@ -12440,6 +12980,7 @@ enabled = true
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
 
         assert!(
@@ -12516,6 +13057,24 @@ enabled = true
             .expect("responses request converts");
 
             assert_eq!(converted["tool_choice"], value);
+        }
+    }
+
+    #[test]
+    fn chat_completions_reasoning_effort_preserves_selected_tier_for_supported_models() {
+        for effort in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+            let converted = protocol_proxy::responses_to_chat_completions(json!({
+                "model": "gpt-5.5",
+                "input": "hi",
+                "reasoning": { "effort": effort }
+            }))
+            .expect("responses request converts");
+
+            assert_eq!(
+                converted["reasoning_effort"],
+                json!(effort),
+                "selected effort {effort} must be forwarded to upstream"
+            );
         }
     }
 
@@ -12597,6 +13156,7 @@ trusted_hash = "abc"
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
         let profile = build_profile(&config).expect("profile builds");
         let merged = merge_lite_profile_into_config(existing, &profile).expect("config merges");
@@ -12696,6 +13256,236 @@ mod plan_hints_tests {
         }"#;
         let config: LiteConfig = serde_json::from_str(json).expect("config parses");
         assert!(config.plan_hints);
+    }
+
+    fn multi_provider_config() -> LiteConfig {
+        let json = r#"{
+            "provider": {
+                "id": "alpha",
+                "name": "Alpha",
+                "baseUrl": "https://alpha.example/v1",
+                "apiKey": "sk-alpha",
+                "protocol": "responses"
+            },
+            "model": "alpha-model",
+            "models": ["alpha-model"],
+            "contextWindow": "1M",
+            "providers": [
+                {
+                    "provider": {
+                        "id": "beta",
+                        "name": "Beta",
+                        "baseUrl": "https://beta.example/v1",
+                        "apiKey": "sk-beta",
+                        "protocol": "chat_completions"
+                    },
+                    "model": "beta-model",
+                    "models": ["beta-model"],
+                    "contextWindow": "200K"
+                }
+            ]
+        }"#;
+        serde_json::from_str(json).expect("multi-provider config parses")
+    }
+
+    #[test]
+    fn switch_active_provider_swaps_and_backfills() {
+        let mut config = multi_provider_config();
+        switch_active_provider(&mut config, "beta").expect("switch succeeds");
+
+        // Beta promoted to active with all its fields.
+        assert_eq!(config.provider.id, "beta");
+        assert_eq!(config.provider.api_key, "sk-beta");
+        assert_eq!(config.provider.protocol, LiteProtocol::ChatCompletions);
+        assert_eq!(config.model, "beta-model");
+        assert_eq!(config.context_window, "200K");
+
+        // Alpha backfilled as a saved profile, nothing lost.
+        assert_eq!(config.providers.len(), 1);
+        let saved = &config.providers[0];
+        assert_eq!(saved.provider.id, "alpha");
+        assert_eq!(saved.provider.api_key, "sk-alpha");
+        assert_eq!(saved.model, "alpha-model");
+        assert_eq!(saved.context_window, "1M");
+
+        // Switching back restores the original active provider.
+        switch_active_provider(&mut config, "alpha").expect("switch back succeeds");
+        assert_eq!(config.provider.id, "alpha");
+        assert_eq!(config.model, "alpha-model");
+        assert_eq!(config.providers[0].provider.id, "beta");
+    }
+
+    #[test]
+    fn switch_active_provider_to_current_is_noop() {
+        let mut config = multi_provider_config();
+        let before = config.clone();
+        switch_active_provider(&mut config, "alpha").expect("noop switch succeeds");
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn switch_active_provider_rejects_unknown_id() {
+        let mut config = multi_provider_config();
+        let error = switch_active_provider(&mut config, "gamma").expect_err("unknown id fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("gamma"));
+        assert!(message.contains("alpha"));
+        assert!(message.contains("beta"));
+    }
+
+    #[test]
+    fn config_without_providers_serializes_without_field() {
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "solo".to_string(),
+                name: String::new(),
+                base_url: "https://solo.example/v1".to_string(),
+                api_key: "sk-solo".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::Responses,
+                context_budget: String::new(),
+            },
+            model: "m".to_string(),
+            models: vec![LiteModel::Id("m".to_string())],
+            context_window: String::new(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+            providers: Vec::new(),
+        };
+        let text = serde_json::to_string(&config).expect("serializes");
+        assert!(
+            !text.contains("\"providers\""),
+            "empty providers list should stay invisible for single-provider configs"
+        );
+    }
+
+    #[test]
+    fn upsert_saved_provider_profile_replaces_same_id() {
+        let mut config = multi_provider_config();
+        let mut replacement = config.providers[0].clone();
+        replacement.provider.api_key = "sk-beta-2".to_string();
+        upsert_saved_provider_profile(&mut config, replacement);
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].provider.api_key, "sk-beta-2");
+    }
+
+    #[test]
+    fn normalize_rollout_rewrites_all_session_meta_lines_and_keeps_mtime() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("cgl-rollout-sync-test-{unique}"));
+        let sessions = home.join("sessions").join("2026").join("07");
+        let archived = home.join("archived_sessions").join("2026").join("06");
+        fs::create_dir_all(&sessions).expect("creates sessions dir");
+        fs::create_dir_all(&archived).expect("creates archived dir");
+
+        // Account-login era rollout with two session_meta lines (resumed
+        // session) plus an unrelated event line that must stay untouched.
+        let live_path = sessions.join("rollout-live.jsonl");
+        fs::write(
+            &live_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"t1","model_provider":"openai","cwd":"/tmp"}}"#, "\n",
+                r#"{"type":"event_msg","payload":{"text":"hello"}}"#, "\n",
+                r#"{"type":"session_meta","payload":{"id":"t1","model_provider":"openai","cwd":"/tmp"}}"#, "\n",
+            ),
+        )
+        .expect("writes live rollout");
+        let archived_path = archived.join("rollout-archived.jsonl");
+        fs::write(
+            &archived_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"t2","model_provider":"old-gw","cwd":"/tmp"}}"#, "\n",
+            ),
+        )
+        .expect("writes archived rollout");
+        let mtime_before = fs::metadata(&live_path)
+            .and_then(|m| m.modified())
+            .expect("reads mtime");
+
+        let changed =
+            normalize_rollout_session_meta_providers(&home, &[], "gateway").expect("sync runs");
+        assert_eq!(changed, 2, "both rollout files should be rewritten");
+
+        let live_text = fs::read_to_string(&live_path).expect("reads live rollout");
+        let meta_lines: Vec<&str> = live_text
+            .lines()
+            .filter(|line| line.contains("session_meta"))
+            .collect();
+        assert_eq!(meta_lines.len(), 2);
+        for line in meta_lines {
+            assert!(
+                line.contains("\"model_provider\":\"gateway\""),
+                "every session_meta line must carry the active provider: {line}"
+            );
+        }
+        assert!(live_text.contains("event_msg"), "other lines untouched");
+        let archived_text = fs::read_to_string(&archived_path).expect("reads archived rollout");
+        assert!(archived_text.contains("\"model_provider\":\"gateway\""));
+        let mtime_after = fs::metadata(&live_path)
+            .and_then(|m| m.modified())
+            .expect("reads mtime after");
+        assert_eq!(mtime_before, mtime_after, "mtime preserved");
+
+        // Second run is a no-op.
+        let changed_again =
+            normalize_rollout_session_meta_providers(&home, &[], "gateway").expect("re-runs");
+        assert_eq!(changed_again, 0);
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn sync_threads_model_provider_globally_updates_all_dbs() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("cgl-provider-sync-db-test-{unique}"));
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).expect("creates sqlite dir");
+
+        for (path, provider) in [
+            (home.join("state_5.sqlite"), "openai"),
+            (sqlite_dir.join("codex.sqlite3"), "old-gw"),
+        ] {
+            let conn = Connection::open(&path).expect("opens db");
+            conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT);")
+                .expect("creates threads table");
+            conn.execute(
+                "INSERT INTO threads (id, model_provider) VALUES ('a', ?1), ('b', 'gateway')",
+                [provider],
+            )
+            .expect("inserts rows");
+        }
+
+        let updated = sync_threads_model_provider_globally(&home, "gateway").expect("sync runs");
+        assert_eq!(updated, 2, "one differing row per database");
+
+        for path in [
+            home.join("state_5.sqlite"),
+            sqlite_dir.join("codex.sqlite3"),
+        ] {
+            let conn = Connection::open(&path).expect("re-opens db");
+            let mismatched: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider,'') <> 'gateway'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("counts rows");
+            assert_eq!(mismatched, 0, "{} fully synced", path.display());
+        }
+
+        let updated_again =
+            sync_threads_model_provider_globally(&home, "gateway").expect("re-runs");
+        assert_eq!(updated_again, 0);
+
+        fs::remove_dir_all(&home).ok();
     }
 }
 
@@ -12978,6 +13768,7 @@ mod context_budget_tests {
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: true,
+            providers: Vec::new(),
         };
         let budget = resolve_context_budget(&config, None);
         assert_eq!(budget.max_input_tokens, 800_000);
@@ -13015,6 +13806,7 @@ mod context_budget_tests {
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
         assert!(!provider_uses_local_proxy(&config));
         assert_eq!(normalize_context_budget_for_config("off").unwrap(), "");
@@ -13040,6 +13832,7 @@ mod context_budget_tests {
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: true,
+            providers: Vec::new(),
         };
         let budget = resolve_context_budget(&config, None);
         // 85% of 200K = 170K
@@ -13077,6 +13870,7 @@ mod context_budget_tests {
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
         let error = validate_config(&config).expect_err("reserve >= window must fail validation");
         assert!(error.to_string().contains("contextBudget"));
@@ -13113,6 +13907,7 @@ mod context_budget_tests {
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
             plan_hints: false,
+            providers: Vec::new(),
         };
         // No explicit contextBudget reserve configured, so the budget is
         // derived as 85% of whichever window applies.

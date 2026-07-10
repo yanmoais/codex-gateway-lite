@@ -179,13 +179,17 @@ codex-gateway-lite doctor --config <config.json>
 codex-gateway-lite reload [--debug-port 9229] [--no-plan-ui]
 codex-gateway-lite inject-plan-ui [--debug-port 9229]
 codex-gateway-lite watch --config <config.json> [--codex-home <dir>] [--debug-port 9229] [--interval-ms 1200]
-codex-gateway-lite agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
-codex-gateway-lite launch [--config <config.json>] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--no-plan-ui]
-codex-gateway-lite install-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
+codex-gateway-lite agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
+codex-gateway-lite launch [--config <config.json>] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--no-plan-ui]
+codex-gateway-lite install-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
 codex-gateway-lite stop-agent
 codex-gateway-lite uninstall-agent
 codex-gateway-lite init [--config ~/.codex-gateway-lite/config.json] [--force]
-codex-gateway-lite where-app [--app <Codex.app|Codex.exe|app dir>]
+codex-gateway-lite providers [--config <config.json>]
+codex-gateway-lite add-provider [--config <config.json>]
+codex-gateway-lite use-provider <id> [--config <config.json>] [--codex-home <dir>] [--no-apply] [--debug-port 9229] [--no-plan-ui]
+codex-gateway-lite remove-provider <id> [--config <config.json>]
+codex-gateway-lite where-app [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>]
 ```
 
 常用命令：
@@ -205,7 +209,30 @@ cargo run --manifest-path Cargo.toml -- stop-agent
 
 # 卸载登录保活
 cargo run --manifest-path Cargo.toml -- uninstall-agent
+
+# 多供应商：列出 / 新增 / 切换 / 删除
+cargo run --manifest-path Cargo.toml -- providers
+cargo run --manifest-path Cargo.toml -- add-provider
+cargo run --manifest-path Cargo.toml -- use-provider my-gateway
+cargo run --manifest-path Cargo.toml -- remove-provider old-gateway
 ```
+
+## Multiple providers
+
+配置文件支持保存多套供应商档案（各自独立的 Base URL、API Key、协议、模型列表和上下文窗口）：
+
+- 顶层 `provider`/`model`/`models`/`contextWindow` 始终是**当前激活**的供应商；
+- `providers` 数组保存未激活的档案，`use-provider <id>` 切换时先把当前激活档案回填进列表，再把目标档案提升到顶层；
+- 切换后自动重新 apply Codex 配置并软刷新（`--no-apply` 可跳过，交给运行中的 agent 处理）；
+- API Key 只保存在用户目录私有配置文件里，不进入 Codex config 或 Git。
+
+## Account session sync
+
+从官方账号登录切换到 API Key 供应商时，旧会话的 `model_provider` 还停留在 `openai`，Codex App 侧栏按当前 provider 过滤会导致这些会话消失。每次 apply（含 agent 启动、配置变更、use-provider）会自动做全量会话同步：
+
+- 扫描 `sessions/` 与 `archived_sessions/` 下所有 rollout 文件，把每一条 `session_meta` 的 `model_provider` 改写为当前激活供应商（保留文件 mtime，不打乱侧栏排序）；
+- 把所有 thread 数据库（`sqlite/*.sqlite3` 与旧版 `state_5.sqlite`）里 `threads.model_provider` 批量同步为当前供应商；
+- 已同步过的文件和行不会重复改写，重复运行是无操作。
 
 ## Agent behavior
 

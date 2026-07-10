@@ -606,12 +606,42 @@ fn find_macos_codex_app_default() -> Option<PathBuf> {
     }
     for root in roots {
         for candidate in macos_app_candidates(&root) {
-            if candidate.is_dir() {
+            if candidate.is_dir() && macos_candidate_is_codex_app(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// 新版官方 app 复用了 `ChatGPT.app` 这个 bundle 名（CFBundleIdentifier 仍是
+/// `com.openai.codex`），而纯聊天版 ChatGPT（`com.openai.chat`）也叫这个名字，
+/// 不能当 Codex App 用。所以对 `ChatGPT.app` 这个名字要求 bundle id 或内嵌的
+/// Codex Framework 佐证；其余名字保持原有的按名即中行为。
+#[cfg(target_os = "macos")]
+fn macos_candidate_is_codex_app(app_dir: &Path) -> bool {
+    let is_chatgpt_name = app_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("ChatGPT.app"));
+    if !is_chatgpt_name {
+        return true;
+    }
+    macos_bundle_identifier_is_codex(app_dir)
+        || app_dir
+            .join("Contents")
+            .join("Frameworks")
+            .join("Codex Framework.framework")
+            .is_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_identifier_is_codex(app_dir: &Path) -> bool {
+    let Ok(plist) = fs::read_to_string(app_dir.join("Contents").join("Info.plist")) else {
+        return false;
+    };
+    plist_string_value(&plist, "CFBundleIdentifier")
+        .is_some_and(|id| id == "com.openai.codex" || id.starts_with("com.openai.codex."))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -767,6 +797,11 @@ fn macos_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| plist_string_value(&plist, "CFBundleVersion"))
 }
 
+pub fn macos_app_executable_name(app_dir: &Path) -> Option<String> {
+    let plist = fs::read_to_string(app_dir.join("Contents").join("Info.plist")).ok()?;
+    plist_string_value(&plist, "CFBundleExecutable")
+}
+
 fn plist_string_value(plist: &str, key: &str) -> Option<String> {
     let (_, after_key) = plist.split_once(&format!("<key>{key}</key>"))?;
     let (_, after_string_open) = after_key.split_once("<string>")?;
@@ -784,10 +819,15 @@ fn macos_app_candidates(root: &Path) -> Vec<PathBuf> {
     if root.extension() == Some(OsStr::new("app")) {
         return vec![root.to_path_buf()];
     }
-    ["Codex.app", "OpenAI Codex.app", "OpenAI.Codex.app"]
-        .into_iter()
-        .map(|name| root.join(name))
-        .collect()
+    [
+        "Codex.app",
+        "OpenAI Codex.app",
+        "OpenAI.Codex.app",
+        "ChatGPT.app",
+    ]
+    .into_iter()
+    .map(|name| root.join(name))
+    .collect()
 }
 
 #[cfg(any(windows, test))]
@@ -864,4 +904,97 @@ fn home_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("codex-gateway-lite-tests")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn write_info_plist(app_dir: &Path, entries: &[(&str, &str)]) {
+        let contents_dir = app_dir.join("Contents");
+        fs::create_dir_all(&contents_dir).expect("create Contents dir");
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n",
+        );
+        for (key, value) in entries {
+            body.push_str(&format!(
+                "  <key>{key}</key>\n  <string>{value}</string>\n"
+            ));
+        }
+        body.push_str("</dict>\n</plist>\n");
+        fs::write(contents_dir.join("Info.plist"), body).expect("write Info.plist");
+    }
+
+    #[test]
+    fn macos_app_executable_name_reads_bundle_executable() {
+        let root = scratch_dir("executable-name");
+        let app_dir = root.join("ChatGPT.app");
+        write_info_plist(
+            &app_dir,
+            &[
+                ("CFBundleIdentifier", "com.openai.codex"),
+                ("CFBundleExecutable", "ChatGPT"),
+            ],
+        );
+        assert_eq!(
+            macos_app_executable_name(&app_dir).as_deref(),
+            Some("ChatGPT")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_candidate_accepts_legacy_codex_bundle_names_without_plist() {
+        let root = scratch_dir("legacy-names");
+        let app_dir = root.join("Codex.app");
+        fs::create_dir_all(&app_dir).expect("create app dir");
+        assert!(macos_candidate_is_codex_app(&app_dir));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_candidate_accepts_chatgpt_bundle_with_codex_identifier() {
+        let root = scratch_dir("chatgpt-codex-id");
+        let app_dir = root.join("ChatGPT.app");
+        write_info_plist(&app_dir, &[("CFBundleIdentifier", "com.openai.codex")]);
+        assert!(macos_candidate_is_codex_app(&app_dir));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_candidate_rejects_plain_chatgpt_chat_app() {
+        let root = scratch_dir("chatgpt-chat-id");
+        let app_dir = root.join("ChatGPT.app");
+        write_info_plist(&app_dir, &[("CFBundleIdentifier", "com.openai.chat")]);
+        assert!(!macos_candidate_is_codex_app(&app_dir));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_candidate_accepts_chatgpt_bundle_with_codex_framework() {
+        let root = scratch_dir("chatgpt-framework");
+        let app_dir = root.join("ChatGPT.app");
+        fs::create_dir_all(
+            app_dir
+                .join("Contents")
+                .join("Frameworks")
+                .join("Codex Framework.framework"),
+        )
+        .expect("create framework dir");
+        assert!(macos_candidate_is_codex_app(&app_dir));
+        let _ = fs::remove_dir_all(&root);
+    }
 }
