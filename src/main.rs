@@ -5982,15 +5982,45 @@ async fn handle_streaming_responses_proxy(
     let request_model = request_json.get("model").and_then(Value::as_str);
     let upstream_config = protocol_proxy_upstream_from_config(&config, request_model)?;
 
-    let upstream = match protocol_proxy::open_responses_proxy_request(
-        &request.body,
-        &upstream_config,
-        user_agent,
-    )
-    .await
+    // Slow-upstream handling: wait a short soft window for upstream response
+    // headers; past it, commit an SSE response to Codex and keep the
+    // connection warm with keepalive comments while continuing to wait.
+    // Codex otherwise receives zero bytes for the whole header wait (up to
+    // 120s for streams) and its own idle timeout tears the turn down with
+    // "idle timeout waiting for SSE".
+    let mut sse_header_sent = false;
+    let open_fut =
+        protocol_proxy::open_responses_proxy_request(&request.body, &upstream_config, user_agent);
+    tokio::pin!(open_fut);
+    let open_result = match tokio::time::timeout(UPSTREAM_HEADER_SOFT_WAIT, open_fut.as_mut()).await
     {
+        Ok(result) => result,
+        Err(_) => {
+            stream.write_all(sse_response_header_bytes()).await?;
+            sse_header_sent = true;
+            match await_with_client_keepalive(open_fut.as_mut(), &mut stream).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Codex hung up while we were still waiting upstream.
+                    stream.shutdown().await.ok();
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let mut upstream = match open_result {
         Ok(u) => u,
         Err(error) => {
+            if sse_header_sent {
+                let frame = protocol_proxy::responses_passthrough_failure_sse(
+                    &format!("上游请求失败: {error:#}"),
+                    "upstream_error",
+                );
+                write_http_chunk(&mut stream, &frame).await.ok();
+                stream.write_all(b"0\r\n\r\n").await.ok();
+                stream.shutdown().await.ok();
+                return Ok(());
+            }
             let response = protocol_proxy_error_response(&error);
             stream
                 .write_all(&lite_http_response_bytes(
@@ -6004,6 +6034,48 @@ async fn handle_streaming_responses_proxy(
         }
     };
 
+    // Image-bearing requests can be 400-rejected by upstream content filters
+    // for reasons unrelated to size (verified: same-shape request with a
+    // benign same-resolution image passes). Retry exactly once with every
+    // historical image replaced by a text placeholder so the turn survives
+    // as text-only instead of looping Codex-side retries against a
+    // deterministic 400.
+    if upstream.status_code == 400 {
+        let mut retry_json = request_json.clone();
+        let stripped = protocol_proxy::strip_all_input_images(&mut retry_json);
+        if stripped > 0 {
+            protocol_proxy::log_upstream_event_deduped(
+                "responses_image_reject_retry",
+                format!(
+                    "上游拒绝了带图请求（HTTP 400），已移除 {stripped} 张历史图片后自动重试一次（可能是上游图片内容审核或体积限制）"
+                ),
+            );
+            let retry_body = retry_json.to_string();
+            let retry_fut = protocol_proxy::open_responses_proxy_request(
+                &retry_body,
+                &upstream_config,
+                user_agent,
+            );
+            tokio::pin!(retry_fut);
+            let retry_result = if sse_header_sent {
+                match await_with_client_keepalive(retry_fut.as_mut(), &mut stream).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stream.shutdown().await.ok();
+                        return Ok(());
+                    }
+                }
+            } else {
+                retry_fut.await
+            };
+            if let Ok(retry_upstream) = retry_result {
+                if retry_upstream.is_success() {
+                    upstream = retry_upstream;
+                }
+            }
+        }
+    }
+
     let can_passthrough_responses_stream = upstream.is_stream
         && upstream.is_success()
         && upstream.wire_api == protocol_proxy::UpstreamWireApi::Responses;
@@ -6012,26 +6084,25 @@ async fn handle_streaming_responses_proxy(
         && upstream.wire_api == protocol_proxy::UpstreamWireApi::ChatCompletions;
 
     if can_passthrough_responses_stream {
-        let content_type = if upstream.content_type.trim().is_empty() {
-            "text/event-stream; charset=utf-8".to_string()
-        } else {
-            upstream.content_type.clone()
-        };
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n"
-        );
-        stream.write_all(header.as_bytes()).await?;
+        if !sse_header_sent {
+            let content_type = if upstream.content_type.trim().is_empty() {
+                "text/event-stream; charset=utf-8".to_string()
+            } else {
+                upstream.content_type.clone()
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).await?;
+        }
         let mut response = upstream.response;
         loop {
-            match tokio::time::timeout(
-                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => write_http_chunk(&mut stream, &chunk).await?,
-                Ok(Ok(None)) => break,
-                Ok(Err(error)) => {
+            match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
+                Ok(UpstreamChunkPoll::Chunk(chunk)) => {
+                    write_http_chunk(&mut stream, &chunk).await?
+                }
+                Ok(UpstreamChunkPoll::End) => break,
+                Ok(UpstreamChunkPoll::ReadError(error)) => {
                     let message = format!("Responses 上游流中断: {error}");
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_interrupted",
@@ -6044,7 +6115,7 @@ async fn handle_streaming_responses_proxy(
                     write_http_chunk(&mut stream, &error_frame).await.ok();
                     break;
                 }
-                Err(_) => {
+                Ok(UpstreamChunkPoll::IdleTimeout) => {
                     let message = format!(
                         "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
                         protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
@@ -6060,32 +6131,30 @@ async fn handle_streaming_responses_proxy(
                     write_http_chunk(&mut stream, &error_frame).await.ok();
                     break;
                 }
+                // Writing the keepalive failed: Codex hung up mid-wait.
+                Err(_) => break,
             }
         }
         stream.write_all(b"0\r\n\r\n").await?;
     } else if can_stream {
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n";
-        stream.write_all(header.as_bytes()).await?;
+        if !sse_header_sent {
+            stream.write_all(sse_response_header_bytes()).await?;
+        }
 
         let mut converter =
             protocol_proxy::ChatSseToResponsesConverter::with_request(&request_json);
         let mut response = upstream.response;
 
         loop {
-            match tokio::time::timeout(
-                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => {
+            match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
+                Ok(UpstreamChunkPoll::Chunk(chunk)) => {
                     let converted = converter.push_bytes(&chunk);
                     if !converted.is_empty() {
                         write_http_chunk(&mut stream, &converted).await?;
                     }
                 }
-                Ok(Ok(None)) => break,
-                Ok(Err(error)) => {
+                Ok(UpstreamChunkPoll::End) => break,
+                Ok(UpstreamChunkPoll::ReadError(error)) => {
                     let error_data = converter.fail(
                         format!("上游流中断: {error}"),
                         Some("upstream_error".to_string()),
@@ -6095,7 +6164,7 @@ async fn handle_streaming_responses_proxy(
                     }
                     break;
                 }
-                Err(_) => {
+                Ok(UpstreamChunkPoll::IdleTimeout) => {
                     let error_data = converter.fail(
                         format!(
                             "上游流超过 {} 秒没有新数据，主动断开",
@@ -6108,6 +6177,8 @@ async fn handle_streaming_responses_proxy(
                     }
                     break;
                 }
+                // Writing the keepalive failed: Codex hung up mid-wait.
+                Err(_) => break,
             }
         }
 
@@ -6117,16 +6188,32 @@ async fn handle_streaming_responses_proxy(
         }
         stream.write_all(b"0\r\n\r\n").await?;
     } else {
+        let status_code = upstream.status_code;
         let response = protocol_proxy::handle_responses_upstream(upstream, &request_json)
             .await
             .unwrap_or_else(|error| protocol_proxy_error_response(&error));
-        stream
-            .write_all(&lite_http_response_bytes(
-                &response.status,
-                &response.content_type,
-                &response.body,
-            ))
-            .await?;
+        if sse_header_sent {
+            // The SSE response was already committed during the slow-open
+            // wait; deliver whatever the upstream ultimately said in-band.
+            let detail: String = String::from_utf8_lossy(&response.body)
+                .chars()
+                .take(300)
+                .collect();
+            let frame = protocol_proxy::responses_passthrough_failure_sse(
+                &format!("上游返回 HTTP {status_code}: {detail}"),
+                "upstream_error",
+            );
+            write_http_chunk(&mut stream, &frame).await.ok();
+            stream.write_all(b"0\r\n\r\n").await.ok();
+        } else {
+            stream
+                .write_all(&lite_http_response_bytes(
+                    &response.status,
+                    &response.content_type,
+                    &response.body,
+                ))
+                .await?;
+        }
     }
 
     stream.shutdown().await.ok();
@@ -6143,6 +6230,81 @@ async fn write_http_chunk(stream: &mut TcpStream, data: &[u8]) -> anyhow::Result
     stream.write_all(b"\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Interval between SSE keepalive comments sent to Codex while the upstream
+/// is silent. Must divide `UPSTREAM_STREAM_IDLE_TIMEOUT` evenly so the
+/// accumulated idle time lands exactly on the limit.
+const CLIENT_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// SSE comment frame (lines starting with `:` are ignored by SSE parsers per
+/// spec) — carries no data but resets Codex's client-side idle timer, so a
+/// slow upstream no longer triggers "idle timeout waiting for SSE" reconnect
+/// loops on the Codex side while the proxy is still healthily waiting.
+const SSE_KEEPALIVE_FRAME: &[u8] = b": cgl-keepalive\n\n";
+
+enum UpstreamChunkPoll {
+    Chunk(Vec<u8>),
+    End,
+    ReadError(reqwest::Error),
+    IdleTimeout,
+}
+
+/// How long to wait for upstream response headers before committing an SSE
+/// response to Codex and switching to keepalive comments. Large-context
+/// third-party requests can sit in upstream queues well past Codex's own
+/// client-side idle timeout; once that fires Codex tears the turn down with
+/// "idle timeout waiting for SSE" and retries from scratch. Committing early
+/// keeps the connection warm; real upstream failures after this point are
+/// delivered in-band as a `response.failed` SSE frame instead of an HTTP
+/// status code.
+const UPSTREAM_HEADER_SOFT_WAIT: Duration = Duration::from_secs(15);
+
+fn sse_response_header_bytes() -> &'static [u8] {
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n"
+}
+
+/// Await `fut` while emitting SSE keepalive comments to the (already
+/// committed) client stream every `CLIENT_SSE_KEEPALIVE_INTERVAL`. Returns
+/// `Err` only when a keepalive write fails (the client hung up).
+async fn await_with_client_keepalive<F, T>(
+    mut fut: std::pin::Pin<&mut F>,
+    stream: &mut TcpStream,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    loop {
+        match tokio::time::timeout(CLIENT_SSE_KEEPALIVE_INTERVAL, &mut fut).await {
+            Ok(result) => return Ok(result),
+            Err(_) => write_http_chunk(stream, SSE_KEEPALIVE_FRAME).await?,
+        }
+    }
+}
+
+/// Wait for the next upstream chunk, emitting an SSE keepalive comment to the
+/// Codex client every `CLIENT_SSE_KEEPALIVE_INTERVAL` of upstream silence.
+/// Returns `Err` only when writing to the client fails (Codex went away);
+/// upstream outcomes are reported through `UpstreamChunkPoll`, with
+/// `IdleTimeout` once total silence reaches `UPSTREAM_STREAM_IDLE_TIMEOUT`.
+async fn poll_upstream_chunk_with_keepalive(
+    response: &mut reqwest::Response,
+    stream: &mut TcpStream,
+) -> anyhow::Result<UpstreamChunkPoll> {
+    let mut idle = Duration::ZERO;
+    loop {
+        match tokio::time::timeout(CLIENT_SSE_KEEPALIVE_INTERVAL, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => return Ok(UpstreamChunkPoll::Chunk(chunk.to_vec())),
+            Ok(Ok(None)) => return Ok(UpstreamChunkPoll::End),
+            Ok(Err(error)) => return Ok(UpstreamChunkPoll::ReadError(error)),
+            Err(_) => {
+                idle += CLIENT_SSE_KEEPALIVE_INTERVAL;
+                if idle >= protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT {
+                    return Ok(UpstreamChunkPoll::IdleTimeout);
+                }
+                write_http_chunk(stream, SSE_KEEPALIVE_FRAME).await?;
+            }
+        }
+    }
 }
 
 async fn route_protocol_proxy_request(
@@ -6528,6 +6690,7 @@ async fn run_agent(
     let mut cdp_has_connected = false;
     let mut cdp_consecutive_failures = 0u32;
     let mut auto_launch_paused_after_close = false;
+    let mut cdp_unresponsive_while_process_running = false;
     let mut inject_immediately_after_connect = false;
 
     if let Err(error) = launch_codex(&app_dir, debug_port, codex_home.as_deref()).await {
@@ -6538,12 +6701,13 @@ async fn run_agent(
         match cdp_ready(debug_port).await {
             Ok(()) => {
                 if !cdp_was_ready {
-                    if auto_launch_paused_after_close {
+                    if auto_launch_paused_after_close || cdp_unresponsive_while_process_running {
                         println!("Codex CDP 已重新连接；继续注入 Lite 补丁");
                     } else {
                         println!("Codex CDP 已连接");
                     }
                     auto_launch_paused_after_close = false;
+                    cdp_unresponsive_while_process_running = false;
                     inject_immediately_after_connect = true;
                     // Codex App 重启后 renderer 是全新的 JS 上下文，之前注入的模型白名单
                     // 和任务清单 UI 全部失效；把计时器往回拨，确保下面的判断立刻触发一次
@@ -6568,21 +6732,38 @@ async fn run_agent(
                 // (`cdp_consecutive_failures > 0`), auto-relaunch is also
                 // suppressed so a just-closed app doesn't get yanked back
                 // open before the pause decision is made.
-                if cdp_was_ready || cdp_consecutive_failures > 0 {
+                if cdp_was_ready
+                    || cdp_consecutive_failures > 0
+                    || cdp_unresponsive_while_process_running
+                {
                     cdp_consecutive_failures = cdp_consecutive_failures.saturating_add(1);
                     if cdp_consecutive_failures >= CDP_CLOSE_CONFIRM_FAILURES {
                         eprintln!("Codex CDP 连接断开：{error:#}");
                         if cdp_has_connected {
-                            auto_launch_paused_after_close = true;
-                            eprintln!(
-                                "检测到 Codex App 已关闭；暂停自动拉起，等待用户手动重新打开"
-                            );
+                            let app_process_running =
+                                codex_app_process_still_running_after_cdp_loss();
+                            if !should_pause_after_cdp_loss(cdp_has_connected, app_process_running)
+                            {
+                                if !cdp_unresponsive_while_process_running {
+                                    eprintln!(
+                                        "Codex App 进程仍在运行；按 CDP 暂时无响应处理，继续等待恢复"
+                                    );
+                                }
+                                cdp_unresponsive_while_process_running = true;
+                            } else {
+                                auto_launch_paused_after_close = true;
+                                cdp_unresponsive_while_process_running = false;
+                                eprintln!(
+                                    "检测到 Codex App 已关闭；暂停自动拉起，等待用户手动重新打开"
+                                );
+                            }
                         }
                         cdp_consecutive_failures = 0;
                     }
                 }
                 cdp_was_ready = false;
                 if cdp_consecutive_failures == 0
+                    && !cdp_unresponsive_while_process_running
                     && should_retry_launch_codex(
                         auto_launch_paused_after_close,
                         last_launch_attempt.elapsed() >= Duration::from_secs(15),
@@ -6724,6 +6905,26 @@ async fn run_agent(
 
 fn should_retry_launch_codex(auto_launch_paused_after_close: bool, retry_due: bool) -> bool {
     !auto_launch_paused_after_close && retry_due
+}
+
+fn should_pause_after_cdp_loss(cdp_has_connected: bool, app_process_running: bool) -> bool {
+    cdp_has_connected && !app_process_running
+}
+
+fn codex_app_process_still_running_after_cdp_loss() -> bool {
+    #[cfg(windows)]
+    {
+        // A failed process query is not evidence that the Store/MSIX app exited.
+        // Be conservative so a transient CIM/PowerShell failure cannot turn a
+        // recoverable CDP stall into an incorrect "app closed" decision.
+        windows_codex_app_process_snapshot()
+            .map(|pids| !pids.is_empty())
+            .unwrap_or(true)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 async fn apply_config_from_path(
@@ -7140,6 +7341,11 @@ fn terminate_windows_codex_app_processes() -> usize {
 
 #[cfg(windows)]
 fn windows_codex_app_process_pids() -> Vec<u32> {
+    windows_codex_app_process_snapshot().unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn windows_codex_app_process_snapshot() -> Option<Vec<u32>> {
     let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 Get-CimInstance Win32_Process |
@@ -7161,12 +7367,16 @@ Get-CimInstance Win32_Process |
         ])
         .output();
     let Ok(output) = output else {
-        return Vec::new();
+        return None;
     };
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
-    codex_app_pids_from_windows_process_json(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    if !text.trim().is_empty() && serde_json::from_str::<Value>(&text).is_err() {
+        return None;
+    }
+    Some(codex_app_pids_from_windows_process_json(&text))
 }
 
 #[cfg(any(windows, test))]
@@ -9182,7 +9392,55 @@ const PLAN_UI_SCRIPT: &str = r#"
     const normalized = String(value || "").replace(/\s+/g, " ").trim();
     const match = normalized.match(/(?:^|[·•\s])(\d+\s*个文件已更改(?:\s*[+-]\d[\d,]*){0,4}|[+-]\d[\d,]*(?:\s*[+-]\d[\d,]*){0,3})(?:$|\s)/);
     if (!match) return "";
-    return match[1].replace(/\s+/g, " ").trim();
+    const detail = match[1].replace(/\s+/g, " ").trim();
+    // Animated digit reels keep every 0-9 glyph in the DOM and move only the
+    // active one into view. textContent therefore looks like
+    // "+01234567890123456789" even though the accessible value is "+370".
+    if (/0123456789/.test(detail)) return "";
+    return detail;
+  }
+
+  function animatedDeltaTokens(root) {
+    if (!root?.querySelectorAll) return [];
+    const nodes = [root, ...Array.from(root.querySelectorAll(
+      "[aria-label],[data-value],[data-number-value],[data-number-flow-value],number-flow"
+    ))];
+    const tokens = [];
+    const seen = new Set();
+    for (const node of nodes) {
+      const rawText = String(node?.textContent || "").replace(/\s+/g, " ").trim();
+      const values = [
+        node?.getAttribute?.("aria-label"),
+        node?.getAttribute?.("data-value"),
+        node?.getAttribute?.("data-number-value"),
+        node?.getAttribute?.("data-number-flow-value"),
+      ];
+      for (const value of values) {
+        const normalized = String(value || "").replace(/\s+/g, "").trim();
+        const match = normalized.match(/^([+-]?)(\d[\d,]*)$/);
+        if (!match) continue;
+        const sign = match[1] || rawText.match(/[+-]/)?.[0] || "";
+        if (!sign) continue;
+        const token = `${sign}${match[2]}`;
+        if (seen.has(token)) continue;
+        seen.add(token);
+        tokens.push(token);
+      }
+    }
+    const positive = tokens.find((token) => token.startsWith("+"));
+    const negative = tokens.find((token) => token.startsWith("-"));
+    return [positive, negative].filter(Boolean);
+  }
+
+  function fileChangeDetailFromPanel(panel) {
+    if (!panel) return "";
+    const raw = text(panel);
+    const deltas = animatedDeltaTokens(panel);
+    if (deltas.length) {
+      const fileCount = raw.match(/\d+\s*个文件已更改/)?.[0] || "";
+      return [fileCount, ...deltas].filter(Boolean).join(" ");
+    }
+    return extractFileChangeDetail(raw);
   }
 
   function nearbyPillDetail(pill, progress) {
@@ -9615,7 +9873,7 @@ const PLAN_UI_SCRIPT: &str = r#"
   function environmentChangeDetail() {
     const panel = environmentPanelInfo()?.node;
     if (!panel) return "";
-    return extractFileChangeDetail(text(panel));
+    return fileChangeDetailFromPanel(panel);
   }
 
   function renderSnapshotForRows(snapshot, rows) {
@@ -10353,6 +10611,9 @@ const PLAN_UI_SCRIPT: &str = r#"
       eventTouchesRightRail,
       mutationTouchesRightRail,
       scheduleApplyForMutations,
+      extractFileChangeDetail,
+      animatedDeltaTokens,
+      fileChangeDetailFromPanel,
     };
   }
   return true;
@@ -11412,6 +11673,42 @@ CREATE TABLE threads (
     }
 
     #[test]
+    fn plan_ui_reads_accessible_values_instead_of_animated_digit_reels() {
+        let mut ctx = plan_ui_test_context();
+        let result = eval_json(
+            &mut ctx,
+            r#"(() => {
+                const roller = (ariaLabel, rawText) => ({
+                    textContent: rawText,
+                    getAttribute(name) {
+                        return name === "aria-label" ? ariaLabel : null;
+                    }
+                });
+                const panel = {
+                    textContent: "环境信息 变更 1个文件已更改 +01234567890123456789 -0123456789 本地 main 提交或推送",
+                    querySelectorAll() {
+                        return [
+                            roller("370", "+01234567890123456789"),
+                            roller("78", "-0123456789")
+                        ];
+                    }
+                };
+                const hooks = window.__codexGatewayLitePlanUiTestHooks;
+                return JSON.stringify({
+                    detail: hooks.fileChangeDetailFromPanel(panel),
+                    rawRejected: hooks.extractFileChangeDetail(panel.textContent)
+                });
+            })()"#,
+        );
+
+        assert_eq!(
+            result["detail"],
+            serde_json::json!("1个文件已更改 +370 -78")
+        );
+        assert_eq!(result["rawRejected"], serde_json::json!(""));
+    }
+
+    #[test]
     fn plan_ui_keeps_dock_visible_when_right_panel_exists_without_click() {
         // 历史会话打开时，Codex 右侧可能已有“输出/来源”面板；这个面板只是被动存在，
         // 不应该被当成用户点击右侧展开内容，否则任务卡片会先出现、下一轮重渲染又消失。
@@ -11954,9 +12251,21 @@ CREATE TABLE threads (
 
         assert_eq!(result["validId"], serde_json::json!("valid"), "{result}");
         assert_eq!(result["tooWideIsNull"], serde_json::json!(true), "{result}");
-        assert_eq!(result["nonAppendableIsNull"], serde_json::json!(true), "{result}");
-        assert_eq!(result["notContainingIsNull"], serde_json::json!(true), "{result}");
-        assert_eq!(result["noParentIsNull"], serde_json::json!(true), "{result}");
+        assert_eq!(
+            result["nonAppendableIsNull"],
+            serde_json::json!(true),
+            "{result}"
+        );
+        assert_eq!(
+            result["notContainingIsNull"],
+            serde_json::json!(true),
+            "{result}"
+        );
+        assert_eq!(
+            result["noParentIsNull"],
+            serde_json::json!(true),
+            "{result}"
+        );
     }
 
     #[test]
@@ -12077,16 +12386,32 @@ CREATE TABLE threads (
         );
 
         assert_eq!(result["firstMode"], serde_json::json!("inline"), "{result}");
-        assert_eq!(result["firstParentIsStack"], serde_json::json!(true), "{result}");
+        assert_eq!(
+            result["firstParentIsStack"],
+            serde_json::json!(true),
+            "{result}"
+        );
         assert_eq!(result["firstIsLast"], serde_json::json!(true), "{result}");
         assert_eq!(result["firstTop"], serde_json::json!(""), "{result}");
-        assert_eq!(result["appendsAfterFirst"], serde_json::json!(1), "{result}");
+        assert_eq!(
+            result["appendsAfterFirst"],
+            serde_json::json!(1),
+            "{result}"
+        );
         assert_eq!(
             result["appendsAfterSecond"], result["appendsAfterFirst"],
             "re-render with no DOM disturbance must not re-append the dock: {result}"
         );
-        assert_eq!(result["reinsertedParentIsStack"], serde_json::json!(true), "{result}");
-        assert_eq!(result["reinsertedIsLast"], serde_json::json!(true), "{result}");
+        assert_eq!(
+            result["reinsertedParentIsStack"],
+            serde_json::json!(true),
+            "{result}"
+        );
+        assert_eq!(
+            result["reinsertedIsLast"],
+            serde_json::json!(true),
+            "{result}"
+        );
         assert_eq!(
             result["htmlPreservedAfterReinsert"],
             serde_json::json!(true),
@@ -13231,21 +13556,26 @@ model_catalog_json = "model-catalogs/gateway.json"
         // proxy fail fast with a clear, logged reason instead.
         let source = include_str!("main.rs");
         let occurrences = source
-            .matches(
-                "tokio::time::timeout(
-                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT,
-                response.chunk(),
-            )",
-            )
+            .matches("poll_upstream_chunk_with_keepalive(&mut response, &mut stream)")
             .count();
         // 2 real call sites (Responses passthrough + Chat Completions SSE
         // conversion) plus 1 self-match from this test's own source string,
         // since `include_str!("main.rs")` reads this test file too.
         assert_eq!(
             occurrences, 3,
-            "expected both the Responses passthrough and Chat Completions SSE loops to enforce the idle timeout"
+            "expected both the Responses passthrough and Chat Completions SSE loops to poll via the keepalive-aware helper"
         );
+        // The helper itself must enforce the total idle limit and emit SSE
+        // keepalive comments while waiting, so Codex's client-side idle
+        // timer keeps getting reset during slow upstream generations.
+        assert!(source.contains("idle >= protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT"));
+        assert!(source.contains(": cgl-keepalive"));
         assert!(source.contains("上游流超过 {} 秒没有新数据，主动断开"));
+        // The header-wait phase must also be covered: past the soft wait the
+        // proxy commits the SSE response and keeps the client warm while the
+        // upstream is still working on its response headers.
+        assert!(source.contains("timeout(UPSTREAM_HEADER_SOFT_WAIT, open_fut.as_mut())"));
+        assert!(source.contains("await_with_client_keepalive(open_fut.as_mut(), &mut stream)"));
     }
 
     #[test]
@@ -13310,6 +13640,12 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("function Publish-UserEnvironmentChange"));
         assert!(windows_script.contains("SetEnvironmentVariable(\"NO_PROXY\", $merged, \"User\")"));
         assert!(windows_script.contains("SetEnvironmentVariable(\"no_proxy\", $merged, \"User\")"));
+        assert!(windows_script.contains("$ProxyBypassMaxLength = 8192"));
+        assert!(windows_script.contains("function Merge-BypassList"));
+        assert!(windows_script.contains("$seen.ContainsKey($key)"));
+        assert!(windows_script.contains("$candidateLength -gt $MaxLength"));
+        assert!(windows_script.contains("用户级 NO_PROXY 过长或无法写入"));
+        assert!(windows_script.contains("检测到重复或超长的 NO_PROXY"));
         assert!(
             windows_script
                 .contains("本地代理绕过已设置：localhost / 127.0.0.1 / ::1（当前进程 + 用户环境）")
@@ -13328,6 +13664,13 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(should_retry_launch_codex(false, true));
         assert!(!should_retry_launch_codex(false, false));
         assert!(!should_retry_launch_codex(true, true));
+    }
+
+    #[test]
+    fn live_windows_codex_process_prevents_false_closed_app_decision() {
+        assert!(!should_pause_after_cdp_loss(true, true));
+        assert!(should_pause_after_cdp_loss(true, false));
+        assert!(!should_pause_after_cdp_loss(false, false));
     }
 
     #[test]
@@ -13764,10 +14107,7 @@ not-a-pid garbage line without valid pid
             default_context_window_for_model_id("gpt-5.6-terra"),
             "1050K"
         );
-        assert_eq!(
-            default_context_window_for_model_id("gpt-5.6-luna"),
-            "1050K"
-        );
+        assert_eq!(default_context_window_for_model_id("gpt-5.6-luna"), "1050K");
         assert_eq!(
             default_context_window_for_model_id("openai/gpt-5.6-sol"),
             "1050K"

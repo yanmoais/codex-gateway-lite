@@ -5203,12 +5203,8 @@ fn input_image_part_bytes(part: &Value) -> usize {
 /// these images untouched entirely (a `max_input_tokens` of 0 means
 /// unlimited, and even when enabled, a flat per-image token estimate rarely
 /// reflects the real base64 size).
-fn enforce_input_image_budget(body: &mut Value) -> usize {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return 0;
-    };
-
-    // (item_index, field the part's array lives under, part_index, bytes)
+// (item_index, field the part's array lives under, part_index, bytes)
+fn collect_input_image_slots(items: &[Value]) -> Vec<(usize, &'static str, usize, usize)> {
     let mut slots: Vec<(usize, &'static str, usize, usize)> = Vec::new();
     for (item_index, item) in items.iter().enumerate() {
         if let Some(parts) = item.get("content").and_then(Value::as_array) {
@@ -5234,7 +5230,49 @@ fn enforce_input_image_budget(body: &mut Value) -> usize {
             }
         }
     }
+    slots
+}
 
+fn replace_image_slot_with_placeholder(
+    items: &mut [Value],
+    item_index: usize,
+    field: &'static str,
+    part_index: usize,
+) {
+    if let Some(target) = items[item_index]
+        .get_mut(field)
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.get_mut(part_index))
+    {
+        *target = json!({
+            "type": "input_text",
+            "text": INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT
+        });
+    }
+}
+
+/// Replace every `input_image` part in the request with a text placeholder.
+/// Last-resort fallback when the upstream rejects an image-bearing request
+/// with HTTP 400 regardless of size (observed: an upstream content filter
+/// 400s specific images while an equally-sized benign image sails through),
+/// so the turn can still complete as text-only instead of dying on retry.
+pub fn strip_all_input_images(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let slots = collect_input_image_slots(items);
+    for (item_index, field, part_index, _) in &slots {
+        replace_image_slot_with_placeholder(items, *item_index, field, *part_index);
+    }
+    slots.len()
+}
+
+fn enforce_input_image_budget(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let slots = collect_input_image_slots(items);
     if slots.is_empty() {
         return 0;
     }
@@ -5253,16 +5291,7 @@ fn enforce_input_image_budget(body: &mut Value) -> usize {
 
     let replaced = to_replace.len();
     for (item_index, field, part_index) in to_replace {
-        if let Some(target) = items[item_index]
-            .get_mut(field)
-            .and_then(Value::as_array_mut)
-            .and_then(|parts| parts.get_mut(part_index))
-        {
-            *target = json!({
-                "type": "input_text",
-                "text": INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT
-            });
-        }
+        replace_image_slot_with_placeholder(items, item_index, field, part_index);
     }
     replaced
 }
@@ -5626,6 +5655,45 @@ mod input_image_budget_tests {
             "call_id": call_id,
             "output": [{ "type": "input_image", "image_url": image_url }]
         })
+    }
+
+    #[test]
+    fn strip_all_input_images_replaces_every_image_regardless_of_budget() {
+        let small = data_url(1024);
+        let mut body = json!({
+            "model": "test-model",
+            "input": [
+                message_with_image("user", &small),
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "keep me" }] },
+                function_call_output_with_image("call_1", &small),
+            ]
+        });
+
+        let stripped = strip_all_input_images(&mut body);
+
+        assert_eq!(stripped, 2, "both images stripped even though under budget");
+        let serialized = body.to_string();
+        assert!(!serialized.contains("data:image"));
+        assert!(serialized.contains("keep me"));
+        assert_eq!(
+            serialized
+                .matches(INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn strip_all_input_images_is_noop_without_images() {
+        let mut body = json!({
+            "model": "test-model",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ]
+        });
+        let original = body.clone();
+        assert_eq!(strip_all_input_images(&mut body), 0);
+        assert_eq!(body, original);
     }
 
     #[test]

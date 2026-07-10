@@ -16,6 +16,8 @@ $CratesIndexUrl = "https://index.crates.io/config.json"
 $CodexStoreProductId = "9PLM9XGG6VKS"
 $CodexStoreUrl = "https://apps.microsoft.com/detail/9PLM9XGG6VKS"
 $CodexInstallerUrl = "https://get.microsoft.com/installer/download/9PLM9XGG6VKS?cid=website_cta_psi"
+$ProxyBypassMaxLength = 8192
+$script:ProxyBypassWasTrimmed = $false
 
 function Write-Header {
   Clear-Host
@@ -60,13 +62,23 @@ function Ensure-CargoBinUserPath {
   }
 }
 
-function Merge-BypassList([string]$Existing, [string[]]$Required) {
+function Merge-BypassList([string[]]$ExistingValues, [string[]]$Required, [int]$MaxLength = 8192) {
   $items = @()
-  if ($Existing) {
-    $items += @($Existing -split '[,;]' | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { $_.Trim() })
-  }
-  foreach ($item in $Required) {
-    if (-not ($items | Where-Object { $_ -ieq $item } | Select-Object -First 1)) {
+  $seen = @{}
+  $orderedValues = @($Required) + @($ExistingValues)
+  foreach ($value in $orderedValues) {
+    if (-not $value) { continue }
+    foreach ($rawItem in @($value -split '[,;]')) {
+      $item = $rawItem.Trim()
+      if (-not $item) { continue }
+      $key = $item.ToLowerInvariant()
+      if ($seen.ContainsKey($key)) { continue }
+      $candidateLength = if ($items.Count -eq 0) { $item.Length } else { ($items -join ',').Length + 1 + $item.Length }
+      if ($candidateLength -gt $MaxLength) {
+        $script:ProxyBypassWasTrimmed = $true
+        continue
+      }
+      $seen[$key] = $true
       $items += $item
     }
   }
@@ -110,27 +122,38 @@ public static class CodexGatewayLiteNativeMethods {
 
 function Ensure-LocalProxyBypass {
   $required = @('localhost', '127.0.0.1', '::1')
-  $existingValues = @(
-    $env:NO_PROXY,
-    $env:no_proxy,
-    [Environment]::GetEnvironmentVariable("NO_PROXY", "User"),
-    [Environment]::GetEnvironmentVariable("no_proxy", "User")
-  ) | Where-Object { $_ -and $_.Trim().Length -gt 0 }
-  $existing = ($existingValues -join ',')
-  $merged = Merge-BypassList $existing $required
-  $env:NO_PROXY = $merged
-  $env:no_proxy = $merged
-  $changed = $false
-  if ([Environment]::GetEnvironmentVariable("NO_PROXY", "User") -ne $merged) {
-    [Environment]::SetEnvironmentVariable("NO_PROXY", $merged, "User")
-    $changed = $true
+  $script:ProxyBypassWasTrimmed = $false
+  $merged = Merge-BypassList -ExistingValues @($env:NO_PROXY, $env:no_proxy) -Required $required -MaxLength $ProxyBypassMaxLength
+  try {
+    $env:NO_PROXY = $merged
+    $env:no_proxy = $merged
+  } catch {
+    # Some Windows machines inherit a malformed/oversized proxy bypass list.
+    # Never let that optional inheritance prevent the gateway from starting.
+    $merged = ($required -join ',')
+    $env:NO_PROXY = $merged
+    $env:no_proxy = $merged
+    $script:ProxyBypassWasTrimmed = $true
   }
-  if ([Environment]::GetEnvironmentVariable("no_proxy", "User") -ne $merged) {
-    [Environment]::SetEnvironmentVariable("no_proxy", $merged, "User")
-    $changed = $true
+
+  $changed = $false
+  try {
+    if ([Environment]::GetEnvironmentVariable("NO_PROXY", "User") -ne $merged) {
+      [Environment]::SetEnvironmentVariable("NO_PROXY", $merged, "User")
+      $changed = $true
+    }
+    if ([Environment]::GetEnvironmentVariable("no_proxy", "User") -ne $merged) {
+      [Environment]::SetEnvironmentVariable("no_proxy", $merged, "User")
+      $changed = $true
+    }
+  } catch {
+    Write-Warn "用户级 NO_PROXY 过长或无法写入；已使用当前进程的精简绕过列表继续启动。"
   }
   if ($changed) {
     Publish-UserEnvironmentChange
+  }
+  if ($script:ProxyBypassWasTrimmed) {
+    Write-Warn "检测到重复或超长的 NO_PROXY；已精简并保留本地地址，避免 Windows 环境变量超限。"
   }
   Write-Info "本地代理绕过已设置：localhost / 127.0.0.1 / ::1（当前进程 + 用户环境）"
 }

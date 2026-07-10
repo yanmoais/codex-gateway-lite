@@ -1048,9 +1048,7 @@ mod tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n",
         );
         for (key, value) in entries {
-            body.push_str(&format!(
-                "  <key>{key}</key>\n  <string>{value}</string>\n"
-            ));
+            body.push_str(&format!("  <key>{key}</key>\n  <string>{value}</string>\n"));
         }
         body.push_str("</dict>\n</plist>\n");
         fs::write(contents_dir.join("Info.plist"), body).expect("write Info.plist");
