@@ -56,6 +56,17 @@ struct LiteConfig {
     /// list before promoting the requested profile to the top level.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     providers: Vec<LiteProviderProfile>,
+    /// Multi-provider aggregation mode: when true, every provider (the
+    /// active one plus everything in `providers`) contributes its own
+    /// `modelFilter`-filtered models to one merged, de-duplicated model
+    /// catalog, and each proxied request is routed to whichever provider
+    /// actually offers the requested model instead of always going to the
+    /// active provider. `use-provider` still works while this is on — it
+    /// only changes which provider requests fall back to when a model
+    /// isn't claimed by anyone else. False preserves every existing
+    /// single-active-provider behavior unchanged.
+    #[serde(default)]
+    aggregate: bool,
 }
 
 /// A saved (inactive) provider profile: the same shape as the top-level
@@ -91,6 +102,16 @@ struct LiteProvider {
     protocol: LiteProtocol,
     #[serde(default)]
     context_budget: String,
+    /// Aggregate-mode model allowlist: prefixes matched against the model
+    /// slug (provider namespace and any `[window]` suffix stripped,
+    /// lowercased — see `provider_model_filter_matches`). A model is kept
+    /// for this provider if it starts with any listed prefix; an empty list
+    /// means "no filtering, keep everything this provider returns". Only
+    /// meaningful when `LiteConfig::aggregate` is true, but applied to a
+    /// single active provider's own refresh too regardless of aggregate,
+    /// since it's a per-provider setting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -356,6 +377,11 @@ async fn run_cli() -> anyhow::Result<()> {
                 "已切换激活供应商：{}",
                 sanitize_provider_id(&config.provider.id)
             );
+            if config.aggregate {
+                println!(
+                    "聚合模式已开启，use-provider 仅切换默认路由供应商（未被其它供应商认领的模型会转发到它）。"
+                );
+            }
             if no_apply {
                 println!("已按 --no-apply 跳过写入 Codex 配置；运行中的 agent 会自动应用。");
             } else {
@@ -741,7 +767,12 @@ fn upsert_saved_provider_profile(config: &mut LiteConfig, profile: LiteProviderP
         .sort_by(|left, right| left.provider.id.cmp(&right.provider.id));
 }
 
-fn provider_summary_line(id: &str, profile_provider: &LiteProvider, active: bool) -> String {
+fn provider_summary_line(
+    id: &str,
+    profile_provider: &LiteProvider,
+    active: bool,
+    aggregate: bool,
+) -> String {
     let marker = if active { "*" } else { " " };
     let name = if profile_provider.name.trim().is_empty() {
         id
@@ -752,17 +783,30 @@ fn provider_summary_line(id: &str, profile_provider: &LiteProvider, active: bool
         LiteProtocol::Responses => "responses",
         LiteProtocol::ChatCompletions => "chat_completions",
     };
-    format!("{marker} {id}  ({name}, {protocol})")
+    let filter = if profile_provider.model_filter.is_empty() {
+        "不过滤".to_string()
+    } else {
+        format!("过滤前缀 [{}]", profile_provider.model_filter.join(", "))
+    };
+    let aggregate_note = if aggregate { "，聚合参与中" } else { "" };
+    format!("{marker} {id}  ({name}, {protocol}, {filter}{aggregate_note})")
 }
 
 fn print_provider_list(config: &LiteConfig) {
-    println!("供应商列表（* 为当前激活）：");
+    if config.aggregate {
+        println!(
+            "供应商列表（聚合模式已开启：下列全部供应商都会合并进模型菜单；* 为默认路由供应商）："
+        );
+    } else {
+        println!("供应商列表（* 为当前激活）：");
+    }
     println!(
         "{}",
         provider_summary_line(
             &sanitize_provider_id(&config.provider.id),
             &config.provider,
-            true
+            true,
+            config.aggregate,
         )
     );
     for profile in &config.providers {
@@ -771,7 +815,8 @@ fn print_provider_list(config: &LiteConfig) {
             provider_summary_line(
                 &sanitize_provider_id(&profile.provider.id),
                 &profile.provider,
-                false
+                false,
+                config.aggregate,
             )
         );
     }
@@ -1300,7 +1345,11 @@ fn build_profile(config: &LiteConfig) -> anyhow::Result<RelayProfile> {
     } else {
         upstream_api_key
     };
-    let (model_list, model_windows) = split_models(config);
+    let (model_list, model_windows) = if config.aggregate {
+        split_models_list(&aggregate_merged_models(config), &config.model)
+    } else {
+        split_models(config)
+    };
     let model_windows_json = serde_json::to_string(&model_windows)?;
     let context_window = normalize_window_for_config(&config.context_window)?;
     let auto_compact_token_limit = normalize_window_for_config(&config.auto_compact_token_limit)?;
@@ -1349,7 +1398,11 @@ fn build_profile(config: &LiteConfig) -> anyhow::Result<RelayProfile> {
 }
 
 fn provider_uses_local_proxy(config: &LiteConfig) -> bool {
-    config.provider.protocol == LiteProtocol::ChatCompletions
+    // Aggregate mode always needs the local proxy: it's the only point that
+    // sees each request's `model` field and can route it to whichever
+    // provider actually offers that model (see `protocol_proxy_upstream_from_config`).
+    config.aggregate
+        || config.provider.protocol == LiteProtocol::ChatCompletions
         || parse_context_budget_token(&config.provider.context_budget).is_some()
 }
 
@@ -1390,6 +1443,11 @@ fn validate_config(config: &LiteConfig) -> anyhow::Result<()> {
                 );
             }
         }
+    }
+    if config.aggregate && config.providers.is_empty() {
+        eprintln!(
+            "聚合模式（aggregate）已开启，但 providers 为空，当前等效单供应商模式；如需聚合多家模型，请先 add-provider 添加其它供应商"
+        );
     }
     Ok(())
 }
@@ -1451,6 +1509,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
         mode: LiteMode::MixedApi,
         protocol,
         context_budget,
+        model_filter: Vec::new(),
     };
     println!("正在从供应商拉取模型列表...");
     let model_ids = fetch_provider_model_ids(&provider).await?;
@@ -1483,6 +1542,7 @@ async fn init_config(path: &Path, force: bool) -> anyhow::Result<()> {
         common_config,
         plan_hints,
         providers: Vec::new(),
+        aggregate: false,
     };
 
     write_lite_config(path, &config)?;
@@ -1518,6 +1578,12 @@ async fn add_provider_interactive(config_path: &Path) -> anyhow::Result<()> {
         _ => LiteProtocol::Responses,
     };
     let context_budget = prompt_context_budget()?;
+    println!("模型过滤前缀（用于多供应商聚合模式，见 README「Multiple providers」）：");
+    println!(
+        "  只保留匹配以下任一前缀的模型（剥离供应商前缀/[window] 后缀并小写化后比较，大小写不敏感）；"
+    );
+    println!("  留空表示不过滤，保留该供应商返回的全部模型。");
+    let model_filter = prompt_model_filter()?;
     let provider = LiteProvider {
         id: provider_id,
         name: provider_name,
@@ -1527,15 +1593,31 @@ async fn add_provider_interactive(config_path: &Path) -> anyhow::Result<()> {
         mode: LiteMode::MixedApi,
         protocol,
         context_budget,
+        model_filter: model_filter.clone(),
     };
     println!("正在从供应商拉取模型列表...");
     let model_ids = fetch_provider_model_ids(&provider).await?;
     if model_ids.is_empty() {
         bail!("供应商 /models 没有返回任何模型");
     }
-    let models = models_from_ids(&model_ids, &[]);
-    println!("已拉取 {} 个模型。", models.len());
-    let default_model = choose_default_model(&model_ids)?;
+    let fetched_count = model_ids.len();
+    let filtered_ids: Vec<String> = model_ids
+        .into_iter()
+        .filter(|id| provider_model_filter_matches(&model_filter, id))
+        .collect();
+    if filtered_ids.is_empty() {
+        bail!("按 modelFilter 过滤后没有匹配的模型，请检查过滤前缀是否正确");
+    }
+    let models = models_from_ids(&filtered_ids, &[]);
+    if model_filter.is_empty() {
+        println!("已拉取 {} 个模型。", models.len());
+    } else {
+        println!(
+            "已按 modelFilter 过滤：原始 {fetched_count} 个 → 保留 {} 个。",
+            models.len()
+        );
+    }
+    let default_model = choose_default_model(&filtered_ids)?;
     println!("默认模型：{}", default_model);
     upsert_saved_provider_profile(
         &mut config,
@@ -1615,6 +1697,19 @@ fn prompt_context_budget() -> anyhow::Result<String> {
     normalize_context_budget_for_config(&raw)
 }
 
+/// Prompt for a comma-separated list of aggregate-mode model-filter
+/// prefixes (see `provider_model_filter_matches`); blank input means "no
+/// filter, keep every model this provider returns".
+fn prompt_model_filter() -> anyhow::Result<Vec<String>> {
+    let raw = prompt("模型过滤前缀（逗号分隔，留空不过滤）")?;
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn write_lite_config(path: &Path, config: &LiteConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1639,26 +1734,77 @@ async fn refresh_config_models(path: &Path) -> anyhow::Result<usize> {
     if model_ids.is_empty() {
         bail!("供应商 /models 没有返回任何模型");
     }
+    let filtered_ids: Vec<String> = model_ids
+        .into_iter()
+        .filter(|id| provider_model_filter_matches(&config.provider.model_filter, id))
+        .collect();
+    if filtered_ids.is_empty() {
+        bail!("按 modelFilter 过滤后没有匹配的模型，请检查当前激活供应商的过滤前缀设置");
+    }
     let current_model = strip_suffix(config.model.trim()).0;
-    config.models = models_from_ids(&model_ids, &original_config.models);
-    config.model = if model_ids.iter().any(|id| id == &current_model) {
+    config.models = models_from_ids(&filtered_ids, &original_config.models);
+    config.model = if filtered_ids.iter().any(|id| id == &current_model) {
         current_model
     } else {
-        model_ids[0].clone()
+        filtered_ids[0].clone()
     };
     if matches!(config.provider.mode, LiteMode::PureApi) {
         println!("已将 provider.mode 从 pure_api 调整为 mixed_api，以保留 Codex 登录态和历史入口");
         config.provider.mode = LiteMode::MixedApi;
     }
+
+    // Aggregate mode also needs every *saved* profile's own model list kept
+    // reasonably fresh, since they all contribute to the merged catalog and
+    // routing table (see `aggregate_merged_models`/`aggregate_model_routes`)
+    // even while inactive. Outside aggregate mode, inactive profiles are
+    // left untouched here, same as before this feature existed.
+    if config.aggregate {
+        for profile in &mut config.providers {
+            match fetch_provider_model_ids(&profile.provider).await {
+                Ok(ids) => {
+                    let filtered: Vec<String> = ids
+                        .into_iter()
+                        .filter(|id| {
+                            provider_model_filter_matches(&profile.provider.model_filter, id)
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        eprintln!(
+                            "聚合供应商「{}」按 modelFilter 过滤后没有匹配的模型，本次跳过刷新（保留原有模型列表）",
+                            profile.provider.id
+                        );
+                        continue;
+                    }
+                    profile.models = models_from_ids(&filtered, &profile.models);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "聚合供应商「{}」模型列表刷新失败，跳过（不影响其它供应商）：{error:#}",
+                        profile.provider.id
+                    );
+                }
+            }
+        }
+    }
+
     match populate_missing_common_config_from_home(&mut config, &default_user_codex_home_dir()) {
         Ok(true) => println!("已从默认 Codex home 补齐 commonConfig 公共配置片段"),
         Ok(false) => {}
         Err(error) => eprintln!("补齐 commonConfig 失败，保留现有配置：{error:#}"),
     }
+    // In aggregate mode, report the merged/de-duplicated total actually
+    // surfaced to Codex's model picker rather than just the active
+    // provider's own count, so `供应商模型列表已同步：{count} 个模型` reflects
+    // reality.
+    let synced_count = if config.aggregate {
+        aggregate_merged_models(&config).len()
+    } else {
+        filtered_ids.len()
+    };
     if config != original_config {
         write_lite_config(path, &config)?;
     }
-    Ok(model_ids.len())
+    Ok(synced_count)
 }
 
 fn populate_missing_common_config_from_home(
@@ -1777,6 +1923,39 @@ fn is_gpt_family_model_id(id: &str) -> bool {
     model.starts_with("gpt-") || model.starts_with("chatgpt-")
 }
 
+/// Fully normalize a raw model id for aggregate-mode matching/routing
+/// purposes: strip any `[window]` suffix (`strip_suffix`), then strip a
+/// leading `provider/` namespace and lowercase (`normalized_model_slug`).
+/// Shared by `provider_model_filter_matches` (a provider's `modelFilter`
+/// prefixes match regardless of suffix/case/namespace), by
+/// `aggregate_merged_models`/`aggregate_model_routes` (so both agree on
+/// what counts as "the same model"), and by the local proxy's request-time
+/// route lookup (`protocol_proxy::resolve_model_upstream`, called via
+/// `crate::normalized_route_key`), so every place that needs to compare two
+/// model ids uses exactly the same rule.
+pub(crate) fn normalized_route_key(raw_id: &str) -> String {
+    let (slug, _) = strip_suffix(raw_id);
+    normalized_model_slug(&slug)
+}
+
+/// Whether `model_id` should be included in a provider's contribution to
+/// the aggregate model list, per that provider's `modelFilter`. Matching is
+/// a prefix test against the fully normalized slug (see
+/// `normalized_route_key`): provider namespace and any `[window]` suffix
+/// stripped, lowercased — on both `model_id` and each filter prefix, so
+/// `"Claude"` matches `"anthropic/claude-sonnet-5[1m]"`. An empty filter
+/// matches everything (no filtering).
+fn provider_model_filter_matches(filter: &[String], model_id: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let normalized = normalized_route_key(model_id);
+    filter.iter().any(|prefix| {
+        let prefix = normalized_route_key(prefix);
+        !prefix.is_empty() && normalized.starts_with(&prefix)
+    })
+}
+
 fn prompt_required(label: &str) -> anyhow::Result<String> {
     loop {
         let value = prompt(label)?;
@@ -1880,9 +2059,19 @@ fn parse_provider_model_ids(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn split_models(config: &LiteConfig) -> (String, BTreeMap<String, String>) {
-    let mut models = Vec::new();
+    split_models_list(&config.models, &config.model)
+}
+
+/// Core of `split_models`, factored out so `build_profile` can feed it the
+/// aggregate-merged model list (`aggregate_merged_models`) instead of the
+/// active provider's own `config.models` when `config.aggregate` is true.
+fn split_models_list(
+    models: &[LiteModel],
+    fallback_model: &str,
+) -> (String, BTreeMap<String, String>) {
+    let mut result = Vec::new();
     let mut windows = BTreeMap::new();
-    for item in &config.models {
+    for item in models {
         let (id, window) = match item {
             LiteModel::Id(value) => {
                 let (id, suffix_window) = strip_suffix(value);
@@ -1902,21 +2091,141 @@ fn split_models(config: &LiteConfig) -> (String, BTreeMap<String, String>) {
         if id.is_empty() {
             continue;
         }
-        if !models.iter().any(|existing: &String| existing == id) {
-            models.push(id.to_string());
+        if !result.iter().any(|existing: &String| existing == id) {
+            result.push(id.to_string());
         }
         if !window.trim().is_empty() {
             windows.insert(id.to_string(), window.trim().to_string());
         }
     }
-    if models.is_empty() && !config.model.trim().is_empty() {
-        let (model, suffix_window) = strip_suffix(&config.model);
-        models.push(model);
+    if result.is_empty() && !fallback_model.trim().is_empty() {
+        let (model, suffix_window) = strip_suffix(fallback_model);
+        result.push(model);
         if let Some(window) = suffix_window {
-            windows.insert(models[0].clone(), window);
+            windows.insert(result[0].clone(), window);
         }
     }
-    (models.join("\n"), windows)
+    (result.join("\n"), windows)
+}
+
+/// One participant in aggregate mode: the active top-level provider, or one
+/// of the saved `config.providers` profiles. Carries just what merging and
+/// routing need — the provider's own connection info plus its own
+/// (already `modelFilter`-applied, from the last refresh) model list.
+struct AggregateParticipant<'a> {
+    provider: &'a LiteProvider,
+    models: &'a [LiteModel],
+}
+
+/// Every *usable* aggregate participant, in contribution order: the active
+/// top-level provider first, then `config.providers` in array order. Order
+/// matters — both `aggregate_merged_models` and `aggregate_model_routes`
+/// resolve a model-id clash across participants by keeping the first
+/// contributor, so they have to walk participants in this same order to
+/// agree with each other.
+///
+/// A participant with no usable API key (empty `apiKey` and an unset or
+/// unresolvable `apiKeyEnv`) or an empty `baseUrl` is filtered out here,
+/// once, so the merged catalog (`aggregate_merged_models`) and the routing
+/// table (`aggregate_model_routes`) always agree on which participants
+/// exist — offering a model in the catalog that a request for it could
+/// never actually reach would be worse than just not offering it. The
+/// active provider is always validated (hard error, not a skip) before
+/// this ever runs — see `validate_config`/`build_profile` — so in practice
+/// only a *saved* profile can be filtered out here.
+fn aggregate_participants(config: &LiteConfig) -> Vec<AggregateParticipant<'_>> {
+    std::iter::once(AggregateParticipant {
+        provider: &config.provider,
+        models: &config.models,
+    })
+    .chain(config.providers.iter().map(|profile| AggregateParticipant {
+        provider: &profile.provider,
+        models: &profile.models,
+    }))
+    .filter(|participant| aggregate_participant_is_usable(participant.provider))
+    .collect()
+}
+
+fn aggregate_participant_is_usable(provider: &LiteProvider) -> bool {
+    if provider.base_url.trim().is_empty() {
+        return false;
+    }
+    resolve_api_key(provider)
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Merge every aggregate participant's own model list into one
+/// order-preserving, de-duplicated `Vec<LiteModel>`: the active provider's
+/// own list first, then `config.providers` in array order. Two entries are
+/// considered "the same model" if their ids match after stripping any
+/// `[window]` suffix, stripping a `provider/` namespace, and lowercasing
+/// (see `normalized_route_key`); the first contributor to offer a given
+/// model wins, together with whatever `contextWindow` override that
+/// contributor had stored for it. Only meaningful when `config.aggregate`
+/// is true (see `build_profile`, `aggregate_model_routes`).
+fn aggregate_merged_models(config: &LiteConfig) -> Vec<LiteModel> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for participant in aggregate_participants(config) {
+        for model in participant.models {
+            let raw_id = match model {
+                LiteModel::Id(id) => id.as_str(),
+                LiteModel::Detailed { id, .. } => id.as_str(),
+            };
+            let key = normalized_route_key(raw_id);
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            merged.push(model.clone());
+        }
+    }
+    merged
+}
+
+/// Build the aggregate per-model routing table: for each participant, in
+/// the same contribution order and with the same first-wins tie-break as
+/// `aggregate_merged_models`, record which upstream (base URL + resolved
+/// API key) a request for one of that participant's own models should be
+/// sent to. Keeping the exact same order/tie-break as the merge step
+/// guarantees the model catalog Codex's picker shows and the upstream a
+/// request actually reaches always agree on which provider "owns" a model.
+///
+/// `aggregate_participants` already filtered out any participant with no
+/// usable API key or an empty `baseUrl`, so a live request could never
+/// reach one anyway; the `continue` below is just a defensive re-check
+/// while resolving the actual key value (`apiKeyEnv` reads an environment
+/// variable, which — in principle — could change between the two calls).
+fn aggregate_model_routes(config: &LiteConfig) -> BTreeMap<String, protocol_proxy::ModelRoute> {
+    let mut seen = HashSet::new();
+    let mut routes = BTreeMap::new();
+    for participant in aggregate_participants(config) {
+        let base_url = participant.provider.base_url.trim().trim_end_matches('/');
+        let Ok(api_key) = resolve_api_key(participant.provider) else {
+            continue;
+        };
+        if base_url.is_empty() || api_key.trim().is_empty() {
+            continue;
+        }
+        for model in participant.models {
+            let raw_id = match model {
+                LiteModel::Id(id) => id.as_str(),
+                LiteModel::Detailed { id, .. } => id.as_str(),
+            };
+            let key = normalized_route_key(raw_id);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            routes.insert(
+                key,
+                protocol_proxy::ModelRoute {
+                    base_url: base_url.to_string(),
+                    api_key: api_key.clone(),
+                },
+            );
+        }
+    }
+    routes
 }
 
 fn strip_suffix(value: &str) -> (String, Option<String>) {
@@ -5536,6 +5845,14 @@ fn protocol_proxy_upstream_from_config(
     request_model: Option<&str>,
 ) -> anyhow::Result<protocol_proxy::ProtocolProxyUpstream> {
     let context_budget = resolve_context_budget(config, request_model);
+    // Only aggregate mode needs a routing table; leaving it empty otherwise
+    // means `resolve_model_upstream` always falls back to this struct's own
+    // `base_url`/`api_key`, i.e. the exact pre-aggregate behavior.
+    let model_routes = if config.aggregate {
+        aggregate_model_routes(config)
+    } else {
+        BTreeMap::new()
+    };
     Ok(protocol_proxy::ProtocolProxyUpstream {
         id: sanitize_provider_id(&config.provider.id),
         name: if config.provider.name.trim().is_empty() {
@@ -5553,6 +5870,7 @@ fn protocol_proxy_upstream_from_config(
         protocol: config.provider.protocol.to_proxy(),
         user_agent: String::new(),
         context_budget,
+        model_routes,
     })
 }
 
@@ -5602,15 +5920,17 @@ fn model_context_window_override(config: &LiteConfig, model_id: &str) -> Option<
 
 fn explicit_context_budget_limit(reserve_tokens: u64, context_window: &str) -> u64 {
     match parse_window_token(context_window) {
-        Some(window_tokens) if window_tokens > reserve_tokens => window_tokens - reserve_tokens,
-        // Misconfigured: contextBudget (reserve) is >= the known window, so
-        // `window - reserve` would be zero/negative. Returning reserve_tokens
-        // as-is here would make the budget *larger* than the window, i.e.
-        // effectively disable trimming. `validate_config` already rejects
-        // this combination up front; this branch is only a defensive
-        // fallback, so clamp to a conservative fraction of the window
-        // instead of silently defeating the budget.
-        Some(window_tokens) => window_tokens.saturating_mul(85) / 100,
+        Some(window_tokens) => {
+            // The configured reserve is a single global value, but it is
+            // applied against each model's own window. A reserve sized for a
+            // large window must not eat a small model's window whole: 200K
+            // reserve on grok's 256K window left 56K usable — no request fit,
+            // and Codex looped 502-retries forever. Cap the effective reserve
+            // at 30% of this model's window (a 1M window with a 200K reserve
+            // stays unchanged; a 256K window keeps ~179K usable).
+            let max_reserve = window_tokens.saturating_mul(30) / 100;
+            window_tokens.saturating_sub(reserve_tokens.min(max_reserve))
+        }
         None => reserve_tokens,
     }
 }
@@ -11711,6 +12031,15 @@ CREATE TABLE threads (
                 .as_str()
                 .is_some_and(|value| value.contains("You are Codex"))
         );
+        // Identity pin so third-party models don't invent a GPT-Codex persona.
+        assert!(model["base_instructions"].as_str().is_some_and(|value| {
+            value.contains("The underlying model serving this session is `claude-sonnet-5`")
+        }));
+        assert!(
+            model["model_messages"]["instructions_template"]
+                .as_str()
+                .is_some_and(|value| value.contains("is `claude-sonnet-5`"))
+        );
     }
 
     #[test]
@@ -12971,6 +13300,7 @@ not-a-pid garbage line without valid pid
                 mode: LiteMode::PureApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "gpt-5.5".to_string(),
             models: models_from_ids(
@@ -12989,6 +13319,7 @@ not-a-pid garbage line without valid pid
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         let (models, windows) = split_models(&config);
 
@@ -13084,6 +13415,7 @@ not-a-pid garbage line without valid pid
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::ChatCompletions,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "claude-fable-5".to_string(),
             models: models_from_ids(&["claude-fable-5".to_string()], &[]),
@@ -13092,6 +13424,7 @@ not-a-pid garbage line without valid pid
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
 
         let profile = build_profile(&config).expect("profile builds");
@@ -13125,6 +13458,7 @@ not-a-pid garbage line without valid pid
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: "200K".to_string(),
+                model_filter: Vec::new(),
             },
             model: "claude-fable-5".to_string(),
             models: models_from_ids(&["claude-fable-5".to_string()], &[]),
@@ -13133,6 +13467,7 @@ not-a-pid garbage line without valid pid
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
 
         let profile = build_profile(&config).expect("profile builds");
@@ -13280,6 +13615,7 @@ enabled = true
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "claude-fable-5".to_string(),
             models: models_from_ids(&["claude-fable-5".to_string()], &[]),
@@ -13288,6 +13624,7 @@ enabled = true
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
 
         assert!(
@@ -13576,6 +13913,7 @@ trusted_hash = "abc"
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "claude-fable-5".to_string(),
             models: models_from_ids(&["claude-fable-5".to_string(), "gpt-5.5".to_string()], &[]),
@@ -13584,6 +13922,7 @@ trusted_hash = "abc"
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         let profile = build_profile(&config).expect("profile builds");
         let merged = merge_lite_profile_into_config(existing, &profile).expect("config merges");
@@ -13772,6 +14111,7 @@ mod plan_hints_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "m".to_string(),
             models: vec![LiteModel::Id("m".to_string())],
@@ -13780,6 +14120,7 @@ mod plan_hints_tests {
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         let text = serde_json::to_string(&config).expect("serializes");
         assert!(
@@ -13796,6 +14137,249 @@ mod plan_hints_tests {
         upsert_saved_provider_profile(&mut config, replacement);
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.providers[0].provider.api_key, "sk-beta-2");
+    }
+
+    #[test]
+    fn provider_model_filter_matches_prefix_case_namespace_and_suffix() {
+        // Empty filter: no filtering, everything passes.
+        assert!(provider_model_filter_matches(&[], "claude-sonnet-5"));
+
+        let filter = vec!["claude".to_string()];
+        // Plain prefix hit.
+        assert!(provider_model_filter_matches(&filter, "claude-sonnet-5"));
+        // Case-insensitive on the model id.
+        assert!(provider_model_filter_matches(&filter, "Claude-Sonnet-5"));
+        // Case-insensitive on the filter prefix itself.
+        assert!(provider_model_filter_matches(
+            &["Claude".to_string()],
+            "claude-sonnet-5"
+        ));
+        // A `provider/` namespace prefix on the model id is stripped before
+        // matching.
+        assert!(provider_model_filter_matches(
+            &filter,
+            "anthropic/claude-sonnet-5"
+        ));
+        // A `[window]` suffix on the model id is stripped before matching.
+        assert!(provider_model_filter_matches(
+            &filter,
+            "claude-sonnet-5[1m]"
+        ));
+        // Both at once.
+        assert!(provider_model_filter_matches(
+            &filter,
+            "anthropic/Claude-Sonnet-5[1m]"
+        ));
+        // Non-matching prefix is rejected.
+        assert!(!provider_model_filter_matches(&filter, "gpt-5.6-sol"));
+    }
+
+    /// A two-provider aggregate fixture: the active provider ("alpha")
+    /// contributes `model-a` and `shared-model`; the saved profile ("beta")
+    /// contributes `shared-model` (a clash, alpha wins since it's first)
+    /// and `model-c` (unique to beta).
+    fn aggregate_test_config() -> LiteConfig {
+        let json = r#"{
+            "aggregate": true,
+            "provider": {
+                "id": "alpha",
+                "name": "Alpha",
+                "baseUrl": "https://alpha.example/v1",
+                "apiKey": "sk-alpha",
+                "protocol": "responses"
+            },
+            "model": "model-a",
+            "models": ["model-a", "shared-model"],
+            "contextWindow": "1M",
+            "providers": [
+                {
+                    "provider": {
+                        "id": "beta",
+                        "name": "Beta",
+                        "baseUrl": "https://beta.example/v1",
+                        "apiKey": "sk-beta",
+                        "protocol": "responses"
+                    },
+                    "model": "model-c",
+                    "models": ["shared-model", "model-c"],
+                    "contextWindow": "200K"
+                }
+            ]
+        }"#;
+        serde_json::from_str(json).expect("aggregate config parses")
+    }
+
+    fn lite_model_ids(models: &[LiteModel]) -> Vec<String> {
+        models
+            .iter()
+            .map(|model| match model {
+                LiteModel::Id(id) => id.clone(),
+                LiteModel::Detailed { id, .. } => id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aggregate_merged_models_orders_active_first_then_providers_array_and_dedupes() {
+        let config = aggregate_test_config();
+        let ids = lite_model_ids(&aggregate_merged_models(&config));
+        assert_eq!(
+            ids,
+            vec![
+                "model-a".to_string(),
+                "shared-model".to_string(),
+                "model-c".to_string(),
+            ],
+            "active provider's models come first, then providers[] in array order, with the first contributor winning any name clash"
+        );
+    }
+
+    #[test]
+    fn aggregate_model_routes_maps_each_model_to_its_contributing_provider() {
+        let config = aggregate_test_config();
+        let routes = aggregate_model_routes(&config);
+
+        // alpha (active, first) owns "model-a" and wins the "shared-model" clash.
+        let model_a = routes
+            .get(&normalized_route_key("model-a"))
+            .expect("model-a routed");
+        assert_eq!(model_a.base_url, "https://alpha.example/v1");
+        assert_eq!(model_a.api_key, "sk-alpha");
+        let shared = routes
+            .get(&normalized_route_key("shared-model"))
+            .expect("shared-model routed");
+        assert_eq!(shared.base_url, "https://alpha.example/v1");
+        assert_eq!(shared.api_key, "sk-alpha");
+
+        // beta uniquely owns "model-c".
+        let model_c = routes
+            .get(&normalized_route_key("model-c"))
+            .expect("model-c routed");
+        assert_eq!(model_c.base_url, "https://beta.example/v1");
+        assert_eq!(model_c.api_key, "sk-beta");
+
+        // A model nobody contributed is simply absent from the table; the
+        // fallback-to-default step lives in
+        // `protocol_proxy::resolve_model_upstream`, not here.
+        assert!(!routes.contains_key(&normalized_route_key("nonexistent-model")));
+    }
+
+    #[test]
+    fn aggregate_model_routes_skips_participants_missing_api_key_or_base_url() {
+        let json = r#"{
+            "aggregate": true,
+            "provider": {
+                "id": "alpha",
+                "baseUrl": "https://alpha.example/v1",
+                "apiKey": "sk-alpha",
+                "protocol": "responses"
+            },
+            "models": ["model-a"],
+            "providers": [
+                {
+                    "provider": {
+                        "id": "beta",
+                        "baseUrl": "https://beta.example/v1",
+                        "protocol": "responses"
+                    },
+                    "models": ["model-b"]
+                },
+                {
+                    "provider": {
+                        "id": "gamma",
+                        "baseUrl": "",
+                        "apiKey": "sk-gamma",
+                        "protocol": "responses"
+                    },
+                    "models": ["model-c"]
+                }
+            ]
+        }"#;
+        let config: LiteConfig = serde_json::from_str(json).expect("config parses");
+        let routes = aggregate_model_routes(&config);
+        assert!(routes.contains_key(&normalized_route_key("model-a")));
+        assert!(
+            !routes.contains_key(&normalized_route_key("model-b")),
+            "beta has no apiKey and no apiKeyEnv, must be skipped"
+        );
+        assert!(
+            !routes.contains_key(&normalized_route_key("model-c")),
+            "gamma has an empty baseUrl, must be skipped"
+        );
+    }
+
+    #[test]
+    fn aggregate_merged_models_also_skips_participants_missing_api_key_or_base_url() {
+        // Same fixture as the routing-table test above: the catalog
+        // (`aggregate_merged_models`) and the routing table
+        // (`aggregate_model_routes`) share `aggregate_participants`, so a
+        // participant that can never actually be routed to must not show up
+        // in the merged model catalog either — otherwise Codex's picker
+        // would offer a model that silently falls back to a different
+        // provider's upstream at request time.
+        let json = r#"{
+            "aggregate": true,
+            "provider": {
+                "id": "alpha",
+                "baseUrl": "https://alpha.example/v1",
+                "apiKey": "sk-alpha",
+                "protocol": "responses"
+            },
+            "models": ["model-a"],
+            "providers": [
+                {
+                    "provider": {
+                        "id": "beta",
+                        "baseUrl": "https://beta.example/v1",
+                        "protocol": "responses"
+                    },
+                    "models": ["model-b"]
+                },
+                {
+                    "provider": {
+                        "id": "gamma",
+                        "baseUrl": "",
+                        "apiKey": "sk-gamma",
+                        "protocol": "responses"
+                    },
+                    "models": ["model-c"]
+                }
+            ]
+        }"#;
+        let config: LiteConfig = serde_json::from_str(json).expect("config parses");
+        let ids = lite_model_ids(&aggregate_merged_models(&config));
+        assert_eq!(ids, vec!["model-a".to_string()]);
+    }
+
+    #[test]
+    fn build_profile_uses_aggregate_merged_models_when_aggregate_is_on() {
+        let config = aggregate_test_config();
+        let profile = build_profile(&config).expect("profile builds");
+        let models: Vec<&str> = profile.model_list.lines().collect();
+        assert_eq!(models, vec!["model-a", "shared-model", "model-c"]);
+    }
+
+    #[test]
+    fn build_profile_ignores_providers_array_when_aggregate_is_off() {
+        let mut config = aggregate_test_config();
+        config.aggregate = false;
+        let profile = build_profile(&config).expect("profile builds");
+        let models: Vec<&str> = profile.model_list.lines().collect();
+        assert_eq!(
+            models,
+            vec!["model-a", "shared-model"],
+            "non-aggregate mode must not pull beta's models into the catalog"
+        );
+    }
+
+    #[test]
+    fn validate_config_warns_but_does_not_fail_when_aggregate_has_no_saved_providers() {
+        let mut config = aggregate_test_config();
+        config.providers.clear();
+        // A warning-only path (eprintln), not a hard error: aggregate mode
+        // with zero saved providers is just equivalent to single-provider
+        // mode, not an invalid configuration.
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]
@@ -14188,6 +14772,7 @@ mod context_budget_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::ChatCompletions,
                 context_budget: "200K".to_string(),
+                model_filter: Vec::new(),
             },
             model: String::new(),
             models: vec![],
@@ -14196,6 +14781,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: true,
             providers: Vec::new(),
+            aggregate: false,
         };
         let budget = resolve_context_budget(&config, None);
         assert_eq!(budget.max_input_tokens, 800_000);
@@ -14226,6 +14812,7 @@ mod context_budget_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::Responses,
                 context_budget: "off".to_string(),
+                model_filter: Vec::new(),
             },
             model: String::new(),
             models: vec![LiteModel::Id("model".to_string())],
@@ -14234,6 +14821,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         assert!(!provider_uses_local_proxy(&config));
         assert_eq!(normalize_context_budget_for_config("off").unwrap(), "");
@@ -14252,6 +14840,7 @@ mod context_budget_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::ChatCompletions,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: String::new(),
             models: vec![],
@@ -14260,6 +14849,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: true,
             providers: Vec::new(),
+            aggregate: false,
         };
         let budget = resolve_context_budget(&config, None);
         // 85% of 200K = 170K
@@ -14279,6 +14869,18 @@ mod context_budget_tests {
     }
 
     #[test]
+    fn explicit_context_budget_limit_caps_reserve_per_model_window_share() {
+        // A 200K reserve tuned for a 1M window applies unchanged there...
+        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 800_000);
+        // ...but on grok's 256K window the raw subtraction left only 56K
+        // usable (endless 502-retry loop); the 30% reserve cap keeps ~179K.
+        assert_eq!(
+            explicit_context_budget_limit(200_000, "256K"),
+            256_000 - 76_800
+        );
+    }
+
+    #[test]
     fn validate_config_rejects_context_budget_reserve_not_smaller_than_window() {
         let config = LiteConfig {
             provider: LiteProvider {
@@ -14290,6 +14892,7 @@ mod context_budget_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::ChatCompletions,
                 context_budget: "200K".to_string(),
+                model_filter: Vec::new(),
             },
             model: "m".to_string(),
             models: vec![LiteModel::Id("m".to_string())],
@@ -14298,6 +14901,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         let error = validate_config(&config).expect_err("reserve >= window must fail validation");
         assert!(error.to_string().contains("contextBudget"));
@@ -14318,6 +14922,7 @@ mod context_budget_tests {
                 mode: LiteMode::MixedApi,
                 protocol: LiteProtocol::ChatCompletions,
                 context_budget: String::new(),
+                model_filter: Vec::new(),
             },
             model: "small-model".to_string(),
             models: vec![
@@ -14335,6 +14940,7 @@ mod context_budget_tests {
             common_config: String::new(),
             plan_hints: false,
             providers: Vec::new(),
+            aggregate: false,
         };
         // No explicit contextBudget reserve configured, so the budget is
         // derived as 85% of whichever window applies.

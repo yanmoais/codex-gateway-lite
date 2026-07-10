@@ -231,6 +231,13 @@ pub fn build_model_catalog_json(
                 parse_window_token(crate::default_context_window_for_model_id(&entry.slug))
                     .unwrap_or(272_000)
             });
+            // Third-party models behind the gateway have no reliable sense of
+            // their own identity: the "You are Codex" system prompt makes e.g.
+            // grok-4.5 introduce itself as a GPT-Codex model. Pin the real id.
+            let model_instructions = format!(
+                "{base_instructions}\n\nThe underlying model serving this session is `{}`. When asked what model you are, state this exact model id instead of inferring one from context.",
+                entry.slug
+            );
             json!({
                 "slug": entry.slug,
                 "id": entry.slug,
@@ -240,9 +247,9 @@ pub fn build_model_catalog_json(
                 "created": 0,
                 "display_name": entry.display_name,
                 "description": entry.display_name,
-                "base_instructions": &base_instructions,
+                "base_instructions": &model_instructions,
                 "model_messages": {
-                    "instructions_template": &base_instructions,
+                    "instructions_template": &model_instructions,
                     "instructions_variables": {}
                 },
                 "context_window": context_window,
@@ -260,7 +267,11 @@ pub fn build_model_catalog_json(
                 "supports_reasoning_summaries": true,
                 "supports_parallel_tool_calls": true,
                 "supports_search_tool": true,
-                "supports_image_detail_original": true,
+                // false so Codex downscales attached images instead of
+                // embedding originals: multi-MB base64 images survive
+                // compaction forever and blow the upstream request-size
+                // cap (measured: two 4.2MB images -> upstream 400).
+                "supports_image_detail_original": false,
                 "web_search_tool_type": "text_and_image",
                 "apply_patch_tool_type": "freeform",
                 "shell_type": "shell_command",
@@ -907,6 +918,7 @@ fn macos_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| plist_string_value(&plist, "CFBundleVersion"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn macos_app_executable_name(app_dir: &Path) -> Option<String> {
     let plist = fs::read_to_string(app_dir.join("Contents").join("Info.plist")).ok()?;
     plist_string_value(&plist, "CFBundleExecutable")

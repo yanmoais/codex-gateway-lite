@@ -157,6 +157,26 @@ pub struct ProtocolProxyUpstream {
     pub protocol: RelayProtocol,
     pub user_agent: String,
     pub context_budget: ContextBudgetConfig,
+    /// Multi-provider aggregation routing table: a normalized model slug
+    /// (see `crate::normalized_route_key`) mapped to whichever upstream
+    /// actually serves that model. Populated only when the gateway config
+    /// has `aggregate: true` (see `LiteConfig::aggregate` / `main::
+    /// aggregate_model_routes` in main.rs); empty otherwise, in which case
+    /// every request just uses this struct's own `base_url`/`api_key`
+    /// (see `resolve_model_upstream`).
+    pub model_routes: BTreeMap<String, ModelRoute>,
+}
+
+/// A single aggregate-mode routing target: which upstream a request for one
+/// specific model should actually be sent to. Deliberately carries only
+/// connection info — protocol and context-budget behavior always follow
+/// the active/default provider (`ProtocolProxyUpstream::protocol` /
+/// `::context_budget`), never a per-route override; see
+/// `resolve_model_upstream`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelRoute {
+    pub base_url: String,
+    pub api_key: String,
 }
 
 /// Context budget configuration for trimming oversized input before upstream requests.
@@ -580,7 +600,8 @@ pub async fn open_responses_proxy_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     validate_upstream(relay)?;
-    let (endpoint, upstream_body, wire_api) = upstream_request_parts(relay, request_json.clone())?;
+    let (endpoint, upstream_body, wire_api, api_key) =
+        upstream_request_parts(relay, request_json.clone())?;
     let upstream = send_upstream_request_for_responses(
         upstream_request_builder(
             upstream_http_client_with_user_agent(&effective_user_agent(
@@ -588,7 +609,7 @@ pub async fn open_responses_proxy_request(
                 original_user_agent,
             ))?,
             &endpoint,
-            relay.api_key.trim(),
+            api_key.trim(),
             is_stream,
             &upstream_body,
         ),
@@ -666,6 +687,18 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Aggregate-mode routing: resolve before the request is mutated below,
+    // using the model exactly as the caller sent it. This is the direct
+    // `/v1/chat/completions` entry point (as opposed to Codex's own traffic,
+    // which always goes through `/v1/responses` and is routed inside
+    // `upstream_request_parts`), so it needs its own resolution call.
+    let request_model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (base_url, api_key) = resolve_model_upstream(relay, request_model.as_deref());
+    let base_url = base_url.to_string();
+    let api_key = api_key.to_string();
     // Codex's own traffic always goes through /v1/responses (converted
     // above in `upstream_request_parts`); this path is for direct
     // `/v1/chat/completions` callers bypassing that conversion, so the
@@ -693,8 +726,8 @@ pub async fn open_chat_completions_proxy_request(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .post(chat_completions_url(&relay.base_url))
-    .bearer_auth(relay.api_key.trim())
+    .post(chat_completions_url(&base_url))
+    .bearer_auth(api_key.trim())
     .header(reqwest::header::CONTENT_TYPE, "application/json")
     .json(&request_json);
     let upstream = send_upstream_request_with_header_timeout(
@@ -706,7 +739,7 @@ pub async fn open_chat_completions_proxy_request(
         format!(
             "供应商「{}」请求上游 Chat Completions 失败，endpoint: {}",
             relay.name,
-            chat_completions_url(&relay.base_url)
+            chat_completions_url(&base_url)
         )
     })?;
     let status_code = upstream.status().as_u16();
@@ -847,10 +880,61 @@ fn warn_if_still_over_budget(
     );
 }
 
+/// Resolve which `(base_url, api_key)` a request for `model` should
+/// actually be sent to. `relay.model_routes` (populated only in aggregate
+/// mode — see `LiteConfig::aggregate` in main.rs) maps a normalized model
+/// slug to whichever provider actually serves it; a model absent from the
+/// table, or aggregate mode being off (an empty table), falls back to
+/// `relay`'s own `base_url`/`api_key` (the default/active provider). This
+/// never overrides `relay.protocol` or `relay.context_budget` — aggregate
+/// mode always forwards using the active provider's wire protocol and
+/// context budget (see module-level design notes on `ModelRoute`).
+fn resolve_model_upstream<'a>(
+    relay: &'a ProtocolProxyUpstream,
+    model: Option<&str>,
+) -> (&'a str, &'a str) {
+    let routed = model.and_then(|raw| relay.model_routes.get(&crate::normalized_route_key(raw)));
+    match routed {
+        Some(route) => (route.base_url.as_str(), route.api_key.as_str()),
+        None => (relay.base_url.as_str(), relay.api_key.as_str()),
+    }
+}
+
 fn upstream_request_parts(
     relay: &ProtocolProxyUpstream,
-    request_json: Value,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+    mut request_json: Value,
+) -> anyhow::Result<(String, Value, UpstreamWireApi, String)> {
+    // Resolve routing before anything else touches `request_json`, using
+    // the model exactly as Codex sent it (pre-cleanup) — routing depends
+    // only on which model was requested, not on any of the budget/cleanup
+    // transforms below.
+    let request_model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (routed_base_url, routed_api_key) = resolve_model_upstream(relay, request_model.as_deref());
+    let routed_base_url = routed_base_url.to_string();
+    let routed_api_key = routed_api_key.to_string();
+
+    // Runs ahead of the Responses/Chat Completions branch below so both wire
+    // formats share a single cleaning pass instead of duplicating it: the
+    // Chat Completions body is derived from this same Responses-shaped
+    // `request_json` via `responses_to_chat_completions`, so any
+    // `input_image` left in here would reach upstream through either path
+    // unchanged — and through the Chat Completions path even worse, since a
+    // `function_call_output.output` array is JSON-serialized straight into
+    // message text, base64 and all (see `response_output_text`).
+    let images_over_budget_replaced = enforce_input_image_budget(&mut request_json);
+    if images_over_budget_replaced > 0 {
+        log_upstream_event_deduped(
+            "input_image_budget_strip",
+            format!(
+                "历史图片总体积超出 {}MB 预算，已将 {} 张较旧的历史图片替换为文本占位，避免上游因请求体过大拒绝（400 invalid_request_error）",
+                INPUT_IMAGE_TOTAL_BUDGET_BYTES / (1024 * 1024),
+                images_over_budget_replaced,
+            ),
+        );
+    }
     match relay.protocol {
         RelayProtocol::Responses => {
             let mut body = request_json;
@@ -882,13 +966,13 @@ fn upstream_request_parts(
                 relay.context_budget.max_input_tokens,
             );
             Ok((
-                responses_url(&relay.base_url),
+                responses_url(&routed_base_url),
                 body,
                 UpstreamWireApi::Responses,
+                routed_api_key,
             ))
         }
         RelayProtocol::ChatCompletions => {
-            let mut request_json = request_json;
             let stale_reasoning_items_stripped = request_json
                 .get_mut("input")
                 .and_then(Value::as_array_mut)
@@ -923,9 +1007,10 @@ fn upstream_request_parts(
                 relay.context_budget.max_input_tokens,
             );
             Ok((
-                chat_completions_url(&relay.base_url),
+                chat_completions_url(&routed_base_url),
                 chat_body,
                 UpstreamWireApi::ChatCompletions,
+                routed_api_key,
             ))
         }
     }
@@ -5048,6 +5133,140 @@ fn remove_orphaned_responses_tool_outputs(
     }
 }
 
+// ===== Historical Input-Image Byte Budget =====
+
+/// Byte-budget ceiling on how much historical `input_image` payload (bytes
+/// of the `image_url` string, used as a stand-in for wire size) this proxy
+/// will forward upstream in a single Responses `input` array.
+///
+/// This is independent of `ContextBudgetConfig`, which budgets by estimated
+/// *token* count: Codex's own client-side context compaction never evicts
+/// old images because it also reasons in tokens, and a flat per-image token
+/// estimate is negligible next to the image's real multi-MB base64 size. So
+/// once a screenshot (in a user message's `input_image` part) or a
+/// `view_image` tool result (in a `function_call_output.output` array)
+/// enters the conversation, it gets resent unchanged on every later turn,
+/// forever.
+///
+/// Empirically: a real session carrying two 4.2MB base64 images (one of
+/// each kind above) produced an 8.7MB request body and a
+/// `400 invalid_request_error` from upstream; resending either image alone
+/// (4.2MB) returned `200`. The true upstream body-size ceiling therefore
+/// sits somewhere in (4.2MB, 8.7MB]; 4MB stays safely under the smallest
+/// observed failure.
+const INPUT_IMAGE_TOTAL_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+const INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT: &str =
+    "[image removed by gateway: history image budget exceeded]";
+
+/// Approximate an `input_image` part's wire size using its `image_url`
+/// string length (a data URL for locally-attached images). The base64
+/// payload dwarfs the rest of the part's JSON by orders of magnitude, so the
+/// string length alone is good enough for budgeting purposes.
+fn input_image_part_bytes(part: &Value) -> usize {
+    let Some(image_url) = part.get("image_url") else {
+        return 0;
+    };
+    if let Some(url) = image_url.as_str() {
+        return url.len();
+    }
+    image_url
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0)
+}
+
+/// Cap the total byte size of historical `input_image` parts in a Responses
+/// API request's `input` array to `INPUT_IMAGE_TOTAL_BUDGET_BYTES`, so a
+/// conversation that has accumulated large images across many turns can't
+/// blow the upstream request-body size limit (see that constant's doc for
+/// the empirical basis). Returns the number of image parts replaced.
+///
+/// Scans two locations an `input_image` part can appear in:
+/// - a message item's `content` array (e.g. a screenshot the user attached)
+/// - a `function_call_output`/`custom_tool_call_output` item's `output`
+///   array, when `output` is itself an array (e.g. the `view_image` tool)
+///
+/// Walks `input` newest-first (from the end of the array backwards),
+/// keeping images while the cumulative byte budget allows it and replacing
+/// every older image that doesn't fit with a small text placeholder. A
+/// dropped image's bytes are never "refunded" to the budget, so one huge
+/// image can't make room for itself by starving smaller, older images — if
+/// nothing fits (including the single newest image), everything is
+/// replaced. Only the image part itself is swapped for a placeholder; the
+/// surrounding item, array shape, and any non-image part are left
+/// untouched.
+///
+/// Runs unconditionally, ahead of (and independent of) the token-based
+/// `apply_responses_context_budget`/`apply_context_budget`: those can leave
+/// these images untouched entirely (a `max_input_tokens` of 0 means
+/// unlimited, and even when enabled, a flat per-image token estimate rarely
+/// reflects the real base64 size).
+fn enforce_input_image_budget(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    // (item_index, field the part's array lives under, part_index, bytes)
+    let mut slots: Vec<(usize, &'static str, usize, usize)> = Vec::new();
+    for (item_index, item) in items.iter().enumerate() {
+        if let Some(parts) = item.get("content").and_then(Value::as_array) {
+            for (part_index, part) in parts.iter().enumerate() {
+                if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                    let bytes = input_image_part_bytes(part);
+                    slots.push((item_index, "content", part_index, bytes));
+                }
+            }
+        }
+        let is_tool_output = matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output") | Some("custom_tool_call_output")
+        );
+        if is_tool_output {
+            if let Some(parts) = item.get("output").and_then(Value::as_array) {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                        let bytes = input_image_part_bytes(part);
+                        slots.push((item_index, "output", part_index, bytes));
+                    }
+                }
+            }
+        }
+    }
+
+    if slots.is_empty() {
+        return 0;
+    }
+
+    // Newest-first: keep images while they still fit the remaining budget,
+    // queue every older one that doesn't for replacement.
+    let mut budget_remaining = INPUT_IMAGE_TOTAL_BUDGET_BYTES;
+    let mut to_replace: Vec<(usize, &'static str, usize)> = Vec::new();
+    for (item_index, field, part_index, bytes) in slots.into_iter().rev() {
+        if bytes <= budget_remaining {
+            budget_remaining -= bytes;
+        } else {
+            to_replace.push((item_index, field, part_index));
+        }
+    }
+
+    let replaced = to_replace.len();
+    for (item_index, field, part_index) in to_replace {
+        if let Some(target) = items[item_index]
+            .get_mut(field)
+            .and_then(Value::as_array_mut)
+            .and_then(|parts| parts.get_mut(part_index))
+        {
+            *target = json!({
+                "type": "input_text",
+                "text": INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT
+            });
+        }
+    }
+    replaced
+}
+
 #[cfg(test)]
 mod repeated_log_tests {
     use super::*;
@@ -5186,6 +5405,7 @@ mod grok_review_fix_tests {
             protocol,
             user_agent: String::new(),
             context_budget,
+            model_routes: BTreeMap::new(),
         }
     }
 
@@ -5214,7 +5434,7 @@ mod grok_review_fix_tests {
             RelayProtocol::ChatCompletions,
             ContextBudgetConfig::default(),
         );
-        let (_, chat_body, wire_api) = upstream_request_parts(&relay, request_json).unwrap();
+        let (_, chat_body, wire_api, _) = upstream_request_parts(&relay, request_json).unwrap();
         assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
         let messages = chat_body["messages"].as_array().unwrap();
         let carries_stale_reasoning = messages.iter().any(|message| {
@@ -5374,5 +5594,382 @@ mod grok_review_fix_tests {
             payload["response"]["incomplete_details"]["reason"],
             json!("content_filter")
         );
+    }
+}
+
+#[cfg(test)]
+mod input_image_budget_tests {
+    use super::*;
+
+    const ONE_MB: usize = 1024 * 1024;
+
+    /// Build a data-url string of an exact byte length so budget math in
+    /// these tests is precise regardless of the (irrelevant) fake payload
+    /// contents.
+    fn data_url(byte_len: usize) -> String {
+        let prefix = "data:image/png;base64,";
+        let filler_len = byte_len.saturating_sub(prefix.len());
+        format!("{prefix}{}", "A".repeat(filler_len))
+    }
+
+    fn message_with_image(role: &str, image_url: &str) -> Value {
+        json!({
+            "type": "message",
+            "role": role,
+            "content": [{ "type": "input_image", "image_url": image_url }]
+        })
+    }
+
+    fn function_call_output_with_image(call_id: &str, image_url: &str) -> Value {
+        json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": [{ "type": "input_image", "image_url": image_url }]
+        })
+    }
+
+    #[test]
+    fn within_budget_images_are_left_untouched() {
+        let image_a = data_url(ONE_MB);
+        let image_b = data_url(ONE_MB);
+        let mut body = json!({
+            "model": "test-model",
+            "input": [
+                message_with_image("user", &image_a),
+                message_with_image("user", &image_b),
+            ]
+        });
+        let original = body.clone();
+
+        let replaced = enforce_input_image_budget(&mut body);
+
+        assert_eq!(replaced, 0, "both 1MB images fit the 4MB budget together");
+        assert_eq!(
+            body, original,
+            "body must be byte-for-byte unchanged when under budget"
+        );
+    }
+
+    #[test]
+    fn over_budget_replaces_oldest_image_keeps_newest_and_leaves_text_alone() {
+        // 3MB (oldest) + 3MB (newest) = 6MB > 4MB budget. Walking
+        // newest-first, the newest fits (remaining 4MB - 3MB = 1MB); the
+        // oldest no longer fits in the remaining 1MB and must be replaced.
+        let old_image = data_url(3 * ONE_MB);
+        let new_image = data_url(3 * ONE_MB);
+        let mut oldest = message_with_image("user", &old_image);
+        oldest["content"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "type": "input_text", "text": "look at this old screenshot" }),
+        );
+        let newest = message_with_image("user", &new_image);
+
+        let mut body = json!({
+            "model": "test-model",
+            "input": [oldest, newest]
+        });
+
+        let replaced = enforce_input_image_budget(&mut body);
+
+        assert_eq!(replaced, 1);
+        let items = body["input"].as_array().unwrap();
+
+        // Oldest message: text part untouched, image part replaced.
+        let oldest_parts = items[0]["content"].as_array().unwrap();
+        assert_eq!(oldest_parts[0]["type"], json!("input_text"));
+        assert_eq!(
+            oldest_parts[0]["text"],
+            json!("look at this old screenshot")
+        );
+        assert_eq!(oldest_parts[1]["type"], json!("input_text"));
+        assert_eq!(
+            oldest_parts[1]["text"],
+            json!(INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT)
+        );
+
+        // Newest message: image kept exactly as-is.
+        let newest_parts = items[1]["content"].as_array().unwrap();
+        assert_eq!(newest_parts[0]["type"], json!("input_image"));
+        assert_eq!(newest_parts[0]["image_url"], json!(new_image));
+    }
+
+    #[test]
+    fn mixed_message_and_function_call_output_images_are_budgeted_by_recency() {
+        // Oldest -> newest: message A (2MB), function_call_output B (2MB),
+        // function_call_output C (1MB), message D (2MB). Total 7MB > 4MB
+        // budget. Walking newest-first: D fits (remaining 2MB), C fits
+        // (remaining 1MB), B no longer fits (needs 2MB) so it's replaced,
+        // and A doesn't fit either (dropped bytes are never refunded to the
+        // budget) so it's replaced too — position in `input` (recency)
+        // decides survival, not whether the image sits in a message or a
+        // function_call_output.
+        let image_a = data_url(2 * ONE_MB);
+        let image_b = data_url(2 * ONE_MB);
+        let image_c = data_url(ONE_MB);
+        let image_d = data_url(2 * ONE_MB);
+
+        let mut body = json!({
+            "model": "test-model",
+            "input": [
+                message_with_image("user", &image_a),
+                function_call_output_with_image("call_b", &image_b),
+                function_call_output_with_image("call_c", &image_c),
+                message_with_image("assistant", &image_d),
+            ]
+        });
+
+        let replaced = enforce_input_image_budget(&mut body);
+
+        assert_eq!(replaced, 2);
+        let items = body["input"].as_array().unwrap();
+
+        // A (message, oldest): replaced.
+        assert_eq!(items[0]["content"][0]["type"], json!("input_text"));
+        assert_eq!(
+            items[0]["content"][0]["text"],
+            json!(INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT)
+        );
+        // B (function_call_output): replaced.
+        assert_eq!(items[1]["output"][0]["type"], json!("input_text"));
+        assert_eq!(
+            items[1]["output"][0]["text"],
+            json!(INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT)
+        );
+        // C (function_call_output): kept.
+        assert_eq!(items[2]["output"][0]["type"], json!("input_image"));
+        assert_eq!(items[2]["output"][0]["image_url"], json!(image_c));
+        // D (message, newest): kept.
+        assert_eq!(items[3]["content"][0]["type"], json!("input_image"));
+        assert_eq!(items[3]["content"][0]["image_url"], json!(image_d));
+    }
+
+    #[test]
+    fn single_image_larger_than_budget_is_replaced_even_though_it_is_newest() {
+        let huge_image = data_url(6 * ONE_MB);
+        let mut item = message_with_image("user", &huge_image);
+        item["content"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "type": "input_text", "text": "here is a huge screenshot" }),
+        );
+        let mut body = json!({
+            "model": "test-model",
+            "input": [item]
+        });
+
+        let replaced = enforce_input_image_budget(&mut body);
+
+        assert_eq!(
+            replaced, 1,
+            "a single image over budget must be replaced even with nothing older competing for the budget"
+        );
+        let parts = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], json!("input_text"));
+        assert_eq!(parts[0]["text"], json!("here is a huge screenshot"));
+        assert_eq!(parts[1]["type"], json!("input_text"));
+        assert_eq!(parts[1]["text"], json!(INPUT_IMAGE_BUDGET_PLACEHOLDER_TEXT));
+    }
+
+    #[test]
+    fn request_without_images_is_left_completely_unchanged() {
+        let mut body = json!({
+            "model": "test-model",
+            "input": [
+                { "role": "user", "content": "plain text question" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "do_thing",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "a plain string result, not an array"
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "an answer" }]
+                }
+            ]
+        });
+        let original = body.clone();
+
+        let replaced = enforce_input_image_budget(&mut body);
+
+        assert_eq!(replaced, 0);
+        assert_eq!(
+            body, original,
+            "a request with no input_image parts must be byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn wired_into_both_responses_and_chat_completions_relay_paths() {
+        // The whole point of cleaning at the top of `upstream_request_parts`
+        // (before the protocol match) is that both wire formats derive from
+        // the same Responses-shaped body, so one pass covers both — this
+        // guards against a future refactor accidentally moving the call
+        // into only one branch and re-opening the leak on the other.
+        let huge_image = data_url(6 * ONE_MB);
+        let request_json = json!({
+            "model": "test-model",
+            "input": [message_with_image("user", &huge_image)]
+        });
+
+        let responses_relay = ProtocolProxyUpstream {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            api_key: "key".to_string(),
+            protocol: RelayProtocol::Responses,
+            user_agent: String::new(),
+            context_budget: ContextBudgetConfig::default(),
+            model_routes: BTreeMap::new(),
+        };
+        let (_, responses_body, wire_api, _) =
+            upstream_request_parts(&responses_relay, request_json.clone()).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::Responses);
+        assert_eq!(
+            responses_body["input"][0]["content"][0]["type"],
+            json!("input_text"),
+            "Responses passthrough must replace the oversized image: {responses_body:?}"
+        );
+
+        let chat_relay = ProtocolProxyUpstream {
+            protocol: RelayProtocol::ChatCompletions,
+            ..responses_relay
+        };
+        let (_, chat_body, wire_api, _) =
+            upstream_request_parts(&chat_relay, request_json).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
+        let chat_json = serde_json::to_string(&chat_body).unwrap();
+        assert!(
+            !chat_json.contains("base64"),
+            "converted Chat Completions body must not carry the oversized image's base64 payload: {chat_json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_routing_tests {
+    use super::*;
+
+    /// A default/active upstream plus two aggregate-mode routes claimed by
+    /// two other (fictional) providers, for asserting that a request's
+    /// `model` field picks the right one.
+    fn relay_with_routes() -> ProtocolProxyUpstream {
+        let mut model_routes = BTreeMap::new();
+        model_routes.insert(
+            "claude-sonnet-5".to_string(),
+            ModelRoute {
+                base_url: "https://claude.example/v1".to_string(),
+                api_key: "sk-claude".to_string(),
+            },
+        );
+        model_routes.insert(
+            "gpt-5.6".to_string(),
+            ModelRoute {
+                base_url: "https://gpt.example/v1".to_string(),
+                api_key: "sk-gpt".to_string(),
+            },
+        );
+        ProtocolProxyUpstream {
+            id: "default".to_string(),
+            name: "default".to_string(),
+            base_url: "https://default.example/v1".to_string(),
+            api_key: "sk-default".to_string(),
+            protocol: RelayProtocol::Responses,
+            user_agent: String::new(),
+            context_budget: ContextBudgetConfig::default(),
+            model_routes,
+        }
+    }
+
+    #[test]
+    fn resolve_model_upstream_routes_matched_models_and_falls_back_for_others() {
+        let relay = relay_with_routes();
+
+        let (base_url, api_key) = resolve_model_upstream(&relay, Some("claude-sonnet-5"));
+        assert_eq!(base_url, "https://claude.example/v1");
+        assert_eq!(api_key, "sk-claude");
+
+        let (base_url, api_key) = resolve_model_upstream(&relay, Some("gpt-5.6"));
+        assert_eq!(base_url, "https://gpt.example/v1");
+        assert_eq!(api_key, "sk-gpt");
+
+        // Namespace-prefixed, suffixed, mixed-case model id still matches
+        // the same route (see `crate::normalized_route_key`).
+        let (base_url, api_key) = resolve_model_upstream(&relay, Some("openai/GPT-5.6[1m]"));
+        assert_eq!(base_url, "https://gpt.example/v1");
+        assert_eq!(api_key, "sk-gpt");
+
+        // A model neither route claims falls back to the relay's own
+        // default upstream.
+        let (base_url, api_key) = resolve_model_upstream(&relay, Some("some-unclaimed-model"));
+        assert_eq!(base_url, "https://default.example/v1");
+        assert_eq!(api_key, "sk-default");
+
+        // No model at all also falls back to the default.
+        let (base_url, api_key) = resolve_model_upstream(&relay, None);
+        assert_eq!(base_url, "https://default.example/v1");
+        assert_eq!(api_key, "sk-default");
+    }
+
+    #[test]
+    fn upstream_request_parts_routes_different_models_to_different_upstreams() {
+        let relay = relay_with_routes();
+
+        let claude_request = json!({ "model": "claude-sonnet-5", "input": [] });
+        let (endpoint, _, _, api_key) = upstream_request_parts(&relay, claude_request).unwrap();
+        assert_eq!(endpoint, responses_url("https://claude.example/v1"));
+        assert_eq!(api_key, "sk-claude");
+
+        let gpt_request = json!({ "model": "gpt-5.6", "input": [] });
+        let (endpoint, _, _, api_key) = upstream_request_parts(&relay, gpt_request).unwrap();
+        assert_eq!(endpoint, responses_url("https://gpt.example/v1"));
+        assert_eq!(api_key, "sk-gpt");
+
+        // A model neither route claims falls back to the relay's own
+        // default upstream (the active/default provider).
+        let other_request = json!({ "model": "some-other-model", "input": [] });
+        let (endpoint, _, _, api_key) = upstream_request_parts(&relay, other_request).unwrap();
+        assert_eq!(endpoint, responses_url("https://default.example/v1"));
+        assert_eq!(api_key, "sk-default");
+    }
+
+    #[test]
+    fn upstream_request_parts_routing_also_applies_to_chat_completions_wire_format() {
+        // Same routing table, but `relay.protocol` is ChatCompletions this
+        // time, so `upstream_request_parts` takes the other match arm — the
+        // routed base_url/api_key must still apply there, since aggregate
+        // routing is resolved once up front, ahead of the protocol match.
+        let mut relay = relay_with_routes();
+        relay.protocol = RelayProtocol::ChatCompletions;
+
+        let request = json!({ "model": "gpt-5.6", "input": [] });
+        let (endpoint, _, wire_api, api_key) = upstream_request_parts(&relay, request).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
+        assert_eq!(endpoint, chat_completions_url("https://gpt.example/v1"));
+        assert_eq!(api_key, "sk-gpt");
+    }
+
+    #[test]
+    fn empty_model_routes_always_falls_back_to_default_upstream() {
+        // Aggregate mode off: `model_routes` is empty, so every request
+        // must keep using the relay's own base_url/api_key exactly as
+        // before this feature existed.
+        let relay = ProtocolProxyUpstream {
+            id: "solo".to_string(),
+            name: "solo".to_string(),
+            base_url: "https://solo.example/v1".to_string(),
+            api_key: "sk-solo".to_string(),
+            protocol: RelayProtocol::Responses,
+            user_agent: String::new(),
+            context_budget: ContextBudgetConfig::default(),
+            model_routes: BTreeMap::new(),
+        };
+        let (base_url, api_key) = resolve_model_upstream(&relay, Some("anything"));
+        assert_eq!(base_url, "https://solo.example/v1");
+        assert_eq!(api_key, "sk-solo");
     }
 }

@@ -226,6 +226,41 @@ cargo run --manifest-path Cargo.toml -- remove-provider old-gateway
 - 切换后自动重新 apply Codex 配置并软刷新（`--no-apply` 可跳过，交给运行中的 agent 处理）；
 - API Key 只保存在用户目录私有配置文件里，不进入 Codex config 或 Git。
 
+### 聚合模式（aggregate）
+
+同一个中转站给了多把 Key、每把只能调一个模型分组（比如 Claude 组 / GPT 组 / Grok 组）时，可以把这些 Key 都配成供应商，再开启顶层 `aggregate: true`：
+
+```json
+{
+  "aggregate": true,
+  "provider": {
+    "id": "gw-claude",
+    "baseUrl": "https://gateway.example/v1",
+    "apiKey": "sk-claude-key",
+    "protocol": "responses",
+    "modelFilter": ["claude"]
+  },
+  "model": "claude-sonnet-5",
+  "models": ["claude-sonnet-5", "claude-opus-4-8"],
+  "providers": [
+    {
+      "provider": {
+        "id": "gw-gpt",
+        "baseUrl": "https://gateway.example/v1",
+        "apiKey": "sk-gpt-key",
+        "protocol": "responses",
+        "modelFilter": ["gpt"]
+      },
+      "models": ["gpt-5.6-sol", "gpt-5.6-terra"]
+    }
+  ]
+}
+```
+
+- 每个供应商按自己的 `modelFilter`（前缀匹配，留空=不过滤）只贡献自己分组的模型，避免重复中转站/重复分组的模型互相打架；
+- 所有供应商（含未激活的 `providers[]`）过滤后的模型会合并去重成一份菜单喂给 Codex，同名模型按参与顺序先到先得（顶层供应商优先）；
+- 请求时按模型名自动路由到对应供应商的 Base URL + Key，没有任何供应商认领的模型转发到当前激活（`use-provider` 切换的那个）供应商；`use-provider` 在聚合模式下仍可执行，只是改变的是这个兜底路由目标，而不是退出聚合。
+
 ## Account session sync
 
 从官方账号登录切换到 API Key 供应商时，旧会话的 `model_provider` 还停留在 `openai`，Codex App 侧栏按当前 provider 过滤会导致这些会话消失。每次 apply（含 agent 启动、配置变更、use-provider）会自动做全量会话同步：
