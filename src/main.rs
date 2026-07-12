@@ -5871,6 +5871,14 @@ async fn start_protocol_proxy(config_path: PathBuf) -> anyhow::Result<ProtocolPr
                         if let Err(error) =
                             handle_protocol_proxy_connection(stream, config_path).await
                         {
+                            // Codex 侧中断/挂断本地连接（用户停止一轮对话、自动重试
+                            // 替换在途请求、App 退出或重建连接）会让代理这边的后续
+                            // 读写表现为 Broken pipe / Connection reset。这是客户端
+                            // 正常生命周期事件，不是代理故障，静默忽略，避免终端
+                            // 被“本地协议代理请求失败：Broken pipe”这类误报刷屏。
+                            if protocol_proxy_error_is_client_disconnect(&error) {
+                                return;
+                            }
                             eprintln!("本地协议代理请求失败：{error:#}");
                         }
                     });
@@ -6003,6 +6011,26 @@ fn protocol_proxy_request_closed_before_headers(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("本地协议代理连接提前关闭"))
+}
+
+/// Whether a connection-handling error is just the local Codex client
+/// hanging up mid-request/mid-response rather than a real proxy failure.
+/// Codex tears down its side of the local proxy socket whenever the user
+/// interrupts a turn, an automatic retry replaces an in-flight request, or
+/// the app exits/reconnects; reads and writes on that socket then surface as
+/// `BrokenPipe` / `ConnectionReset` style io errors. Treat those as benign
+/// so the launcher terminal doesn't show scary error lines for them.
+fn protocol_proxy_error_is_client_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|io_error| {
+            matches!(
+                io_error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            )
+        })
+    })
 }
 
 async fn handle_streaming_responses_proxy(
@@ -13762,6 +13790,28 @@ model_catalog_json = "model-catalogs/gateway.json"
 
         let other = anyhow::anyhow!("读取本地协议代理请求失败");
         assert!(!protocol_proxy_request_closed_before_headers(&other));
+    }
+
+    #[test]
+    fn protocol_proxy_treats_client_disconnect_io_errors_as_benign() {
+        // 裸 io 错误（写已关闭 socket 时由 `?` 直接向上抛，无 context）。
+        let bare_broken_pipe = anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert!(protocol_proxy_error_is_client_disconnect(&bare_broken_pipe));
+
+        // 带 context 包装的 io 错误也要能穿透 error chain 识别出来。
+        let wrapped_reset = anyhow::Error::from(io::Error::from(io::ErrorKind::ConnectionReset))
+            .context("读取本地协议代理请求失败");
+        assert!(protocol_proxy_error_is_client_disconnect(&wrapped_reset));
+        let wrapped_aborted =
+            anyhow::Error::from(io::Error::from(io::ErrorKind::ConnectionAborted))
+                .context("写入本地协议代理响应失败");
+        assert!(protocol_proxy_error_is_client_disconnect(&wrapped_aborted));
+
+        // 其它错误（上游失败、配置错误、超时等）仍必须照常打印。
+        let upstream = anyhow::anyhow!("上游请求失败: HTTP 502");
+        assert!(!protocol_proxy_error_is_client_disconnect(&upstream));
+        let timeout = anyhow::Error::from(io::Error::from(io::ErrorKind::TimedOut));
+        assert!(!protocol_proxy_error_is_client_disconnect(&timeout));
     }
 
     #[test]

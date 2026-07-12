@@ -251,6 +251,10 @@ ensure_lite_binary() {
     info "构建 release 二进制（后续源码未变化会直接复用）"
     cargo build --quiet --release --manifest-path Cargo.toml
     ok "release 二进制已就绪：$LITE_BIN"
+  elif [[ "${LITE_BIN_FRESH_REPORTED:-0}" != "1" ]]; then
+    # 静默跳过构建时给一行可见反馈，避免误以为“没有自动构建”。
+    ok "release 二进制已是最新（构建于 $(stat -f %Sm -t '%m-%d %H:%M' "$LITE_BIN" 2>/dev/null || echo '未知时间')），跳过重新构建"
+    LITE_BIN_FRESH_REPORTED=1
   fi
 }
 
