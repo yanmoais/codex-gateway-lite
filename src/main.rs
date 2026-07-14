@@ -207,7 +207,12 @@ enum Command {
         plan_ui: bool,
         interval_ms: u64,
     },
-    StopAgent,
+    StopAgent {
+        config_path: PathBuf,
+        codex_home: Option<PathBuf>,
+        debug_port: u16,
+        restore: bool,
+    },
     UninstallAgent,
     Init {
         config_path: PathBuf,
@@ -365,8 +370,17 @@ async fn run_cli() -> anyhow::Result<()> {
                 interval_ms,
             )?;
         }
-        Command::StopAgent => {
+        Command::StopAgent {
+            config_path,
+            codex_home,
+            debug_port,
+            restore,
+        } => {
             stop_agent_service()?;
+            if restore {
+                restore_direct_upstream_after_stop(&config_path, codex_home.as_deref(), debug_port)
+                    .await;
+            }
         }
         Command::UninstallAgent => {
             uninstall_persistent_agent()?;
@@ -647,8 +661,18 @@ fn parse_args() -> anyhow::Result<Command> {
             Ok(Command::UninstallAgent)
         }
         "stop-agent" => {
+            let config_path = take_optional_path_arg(&mut args, "--config")?
+                .unwrap_or_else(default_user_config_path);
+            let codex_home = take_optional_path_arg(&mut args, "--codex-home")?;
+            let debug_port = take_u16_arg(&mut args, "--debug-port", 9229)?;
+            let no_restore = take_flag(&mut args, "--no-restore");
             reject_unknown_args(&args)?;
-            Ok(Command::StopAgent)
+            Ok(Command::StopAgent {
+                config_path,
+                codex_home,
+                debug_port,
+                restore: !no_restore,
+            })
         }
         "init" => {
             let config_path = take_optional_path_arg(&mut args, "--config")?
@@ -6214,6 +6238,7 @@ async fn handle_streaming_responses_proxy(
         loop {
             match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
                 Ok(UpstreamChunkPoll::Chunk(chunk)) => {
+                    protocol_proxy::scan_responses_passthrough_chunk_for_upstream_failure(&chunk);
                     write_http_chunk(&mut stream, &chunk).await?
                 }
                 Ok(UpstreamChunkPoll::End) => break,
@@ -7897,6 +7922,76 @@ fn stop_agent_service() -> anyhow::Result<()> {
     }
     println!("Codex Gateway Lite agent 已停止");
     Ok(())
+}
+
+/// After the agent (and with it the 127.0.0.1 protocol proxy) is stopped, the
+/// Codex config would keep pointing at the dead local port and every request
+/// would fail with "stream disconnected". Rewrite it to talk to the active
+/// provider's upstream directly — same provider, same models, same catalog —
+/// so Codex keeps working without the local proxy in the middle.
+///
+/// This only touches ~/.codex/config.toml (with the usual backup); the Lite
+/// config.json is left untouched, so the next agent start restores the proxy
+/// route exactly as before.
+async fn restore_direct_upstream_after_stop(
+    config_path: &Path,
+    codex_home: Option<&Path>,
+    debug_port: u16,
+) {
+    let mut config = match read_lite_config(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("读取 Lite 配置失败，跳过直连还原（Codex 配置未改动）：{error:#}");
+            return;
+        }
+    };
+    if !provider_uses_local_proxy(&config) {
+        println!("当前配置本就是直连上游，无需还原");
+        return;
+    }
+    if config.provider.protocol == LiteProtocol::ChatCompletions {
+        eprintln!(
+            "当前供应商是 Chat Completions 协议，必须经本地代理转换，无法直连上游；已保留现有 Codex 配置。如需退出后继续使用，请换用 Responses 协议的供应商。"
+        );
+        return;
+    }
+    if config.aggregate {
+        println!(
+            "聚合模式依赖本地代理路由，直连还原将只保留当前激活供应商：{}",
+            sanitize_provider_id(&config.provider.id)
+        );
+    }
+    // In-memory only: turning these off flips `provider_uses_local_proxy` to
+    // false so `apply_config` writes the upstream base_url and the real API
+    // key instead of the local proxy endpoint.
+    config.aggregate = false;
+    config.provider.context_budget = String::new();
+    match apply_config(&config, codex_home, config.plan_hints) {
+        Ok(report) => {
+            println!(
+                "已将 Codex 配置还原为直连上游（供应商与模型保持不变）：{}",
+                report.config_path.display()
+            );
+            if let Some(path) = &report.backup_path {
+                println!("  backup: {path}");
+            }
+            println!("  注意：直连模式下没有本地代理的上下文预算裁剪，超长会话可能被上游拒绝。");
+        }
+        Err(error) => {
+            eprintln!("还原直连上游失败，Codex 配置保持现状：{error:#}");
+            return;
+        }
+    }
+    // Best-effort: reload the running Codex renderer so it picks up the
+    // direct-upstream config immediately, then re-inject the model whitelist
+    // once (it survives in that renderer until the app itself restarts).
+    if soft_reload_codex(debug_port).await.is_ok() {
+        if let Err(error) = wait_and_inject_lite_model_whitelist(debug_port, codex_home).await {
+            eprintln!("直连还原后模型白名单注入失败（重开 Codex App 后自动恢复）：{error:#}");
+        }
+    } else {
+        println!("Codex App 未在运行或 CDP 不可达；直连配置将在下次启动时生效。");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10869,7 +10964,7 @@ fn print_help() {
   codex-gateway-lite agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
   codex-gateway-lite launch [--config <config.json>] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--no-plan-ui]
   codex-gateway-lite install-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--app <Codex.app|ChatGPT.app|Codex.exe|app dir>] [--debug-port 9229] [--interval-ms 1000] [--no-plan-ui]
-  codex-gateway-lite stop-agent
+  codex-gateway-lite stop-agent [--config ~/.codex-gateway-lite/config.json] [--codex-home <dir>] [--debug-port 9229] [--no-restore]
   codex-gateway-lite uninstall-agent
   codex-gateway-lite init [--config ~/.codex-gateway-lite/config.json] [--force]
   codex-gateway-lite providers [--config <config.json>]
@@ -10892,7 +10987,7 @@ fn print_help() {
   agent   常驻模式：启动 Codex、按需启动本地协议代理、监听配置、保活 CDP、持续重注入任务清单 UI
   launch  自动识别并用 remote-debugging-port 启动 Codex App；macOS 同步固定 CODEX_HOME 和 user-data-dir，可选先 apply 配置
   install-agent  macOS 写入 LaunchAgent；Windows 写入 Scheduled Task，让 agent 登录后保活
-  stop-agent  停止当前用户会话里的 LaunchAgent/Scheduled Task 和旧 agent 进程，并清理 agent lock
+  stop-agent  停止 LaunchAgent/Scheduled Task 和旧 agent 进程，并把 Codex 配置还原为直连上游（供应商与模型保持不变；--no-restore 跳过还原，仅清进程）
   uninstall-agent  macOS 卸载 LaunchAgent；Windows 删除 Scheduled Task
   init    首次交互式配置 Base URL/API Key，自动同步 1M 模型列表，并从默认 Codex home 抽取公共配置
   providers  列出已保存的供应商，* 标记当前激活项
@@ -13954,6 +14049,14 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(
             macos_script.contains("cargo run --quiet --manifest-path Cargo.toml -- stop-agent")
         );
+        // `status` is a read-only special variable in zsh (an alias of $?);
+        // using it as a `local` aborts the cleanup trap on its first line and
+        // stop-agent never runs, leaving Codex pointed at the dead local proxy.
+        assert!(!macos_script.contains("local status="));
+        // Exit-time stop restores direct upstream; the pre-launch sweep must
+        // skip the restore (the proxy config is re-applied right after).
+        assert!(macos_script.contains("run_lite stop-agent --no-restore"));
+        assert!(macos_script.contains("stop-agent --debug-port \"$DEBUG_PORT\""));
         assert!(macos_script.contains("stop_stale_agent_processes() {"));
         assert!(macos_script.contains(
             "  stop_stale_agent_processes
@@ -13968,6 +14071,8 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains("$script:AgentStarted = $true"));
         assert!(windows_script.contains("} finally {"));
         assert!(windows_script.contains("$LiteBin stop-agent"));
+        assert!(windows_script.contains("Run-Lite @(\"stop-agent\", \"--no-restore\")"));
+        assert!(windows_script.contains("stop-agent --debug-port $DebugPort"));
         assert!(
             windows_script.contains("cargo build --quiet --release --manifest-path \"Cargo.toml\"")
         );
@@ -14487,10 +14592,7 @@ not-a-pid garbage line without valid pid
                 model_filter: Vec::new(),
             },
             model: "claude-fable-5".to_string(),
-            models: models_from_ids(
-                &["claude-fable-5".to_string(), "gpt-5.5".to_string()],
-                &[],
-            ),
+            models: models_from_ids(&["claude-fable-5".to_string(), "gpt-5.5".to_string()], &[]),
             context_window: "1M".to_string(),
             auto_compact_token_limit: String::new(),
             common_config: String::new(),
@@ -14555,6 +14657,49 @@ not-a-pid garbage line without valid pid
         );
 
         assert!(context_budget_caps_for_catalog(&config, &entries).is_empty());
+    }
+
+    #[test]
+    fn restore_direct_upstream_flips_base_url_off_local_proxy() {
+        // Mirrors what `restore_direct_upstream_after_stop` does in memory:
+        // a Responses provider that only routes through the local proxy
+        // because of context_budget/aggregate must, after clearing both,
+        // resolve to its real upstream base_url and real API key so the
+        // written Codex config keeps working once the proxy is gone.
+        let mut config = LiteConfig {
+            provider: LiteProvider {
+                id: "cpa".to_string(),
+                name: String::new(),
+                base_url: "https://api.example.test:2087/v1".to_string(),
+                api_key: "sk-real-upstream-key".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::Responses,
+                context_budget: "200K".to_string(),
+                model_filter: Vec::new(),
+            },
+            model: "claude-fable-5".to_string(),
+            models: models_from_ids(&["claude-fable-5".to_string()], &[]),
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+            providers: Vec::new(),
+            aggregate: true,
+        };
+        assert!(provider_uses_local_proxy(&config));
+
+        config.aggregate = false;
+        config.provider.context_budget = String::new();
+
+        assert!(!provider_uses_local_proxy(&config));
+        assert_eq!(
+            codex_provider_base_url(&config),
+            "https://api.example.test:2087/v1"
+        );
+        let profile = build_profile(&config).expect("profile builds");
+        assert_eq!(profile.api_key, "sk-real-upstream-key");
+        assert_eq!(profile.base_url, "https://api.example.test:2087/v1");
     }
 
     #[test]
@@ -15158,7 +15303,8 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, false, &HashMap::new());
+        let catalog_json =
+            codex_lite::build_model_catalog_json(&entries, None, false, &HashMap::new());
         let catalog: serde_json::Value =
             serde_json::from_str(&catalog_json).expect("catalog is valid JSON");
         let base = catalog["models"][0]["base_instructions"]
@@ -15178,7 +15324,8 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, true, &HashMap::new());
+        let catalog_json =
+            codex_lite::build_model_catalog_json(&entries, None, true, &HashMap::new());
         let catalog: serde_json::Value =
             serde_json::from_str(&catalog_json).expect("catalog is valid JSON");
         let base = catalog["models"][0]["base_instructions"]
@@ -15216,8 +15363,12 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json =
-            codex_lite::build_model_catalog_json(&entries, None, config.plan_hints, &HashMap::new());
+        let catalog_json = codex_lite::build_model_catalog_json(
+            &entries,
+            None,
+            config.plan_hints,
+            &HashMap::new(),
+        );
         assert!(
             catalog_json.contains("update_plan"),
             "first-use config should generate task-plan guidance"

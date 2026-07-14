@@ -1256,9 +1256,13 @@ mod tests {
                 suffix_window: None,
             })
             .collect::<Vec<_>>();
-        let catalog: Value =
-            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &HashMap::new()))
-                .expect("catalog parses");
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &HashMap::new(),
+        ))
+        .expect("catalog parses");
 
         let models = catalog["models"].as_array().expect("models array");
         assert_eq!(models[0]["context_window"].as_u64(), Some(258_400));
@@ -1297,9 +1301,13 @@ mod tests {
         }];
         let mut budget_caps = HashMap::new();
         budget_caps.insert("claude-fable-5".to_string(), 180_880);
-        let catalog: Value =
-            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &budget_caps))
-                .expect("catalog parses");
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &budget_caps,
+        ))
+        .expect("catalog parses");
         assert_eq!(
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
             // 90% of the cap, leaving headroom for tokenizer estimation drift.
@@ -1317,9 +1325,13 @@ mod tests {
             display_name: "claude-fable-5".to_string(),
             suffix_window: Some(1_000_000),
         }];
-        let catalog: Value =
-            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &HashMap::new()))
-                .expect("catalog parses");
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &HashMap::new(),
+        ))
+        .expect("catalog parses");
         assert_eq!(
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
             Some(650_000)
@@ -1338,9 +1350,13 @@ mod tests {
         }];
         let mut budget_caps = HashMap::new();
         budget_caps.insert("claude-fable-5".to_string(), 800_000);
-        let catalog: Value =
-            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &budget_caps))
-                .expect("catalog parses");
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &budget_caps,
+        ))
+        .expect("catalog parses");
         assert_eq!(
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
             Some(650_000)

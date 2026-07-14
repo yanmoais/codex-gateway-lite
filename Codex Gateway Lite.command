@@ -41,17 +41,20 @@ fail() { print "\n  ${RED}✗${RESET} $1"; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 cleanup_agent_on_exit() {
-  local status=$?
+  # zsh 里 status 是只读特殊变量（$? 的别名），不能用作 local 变量名，
+  # 否则 trap 第一行就报错、后面的 stop-agent 根本不会执行。
+  local exit_code=$?
   trap - EXIT INT TERM HUP
   if [[ "${AGENT_STARTED:-0}" == "1" ]]; then
-    print "\n${YELLOW}${BOLD}脚本退出，停止 Codex Gateway Lite agent...${RESET}"
+    print "\n${YELLOW}${BOLD}脚本退出，停止 Codex Gateway Lite agent 并还原直连上游...${RESET}"
+    # 还原直连的输出保留在终端上，让用户看到 Codex 配置已经指回上游。
     if [[ -x "$LITE_BIN" ]]; then
-      "$LITE_BIN" stop-agent >/dev/null 2>&1 || true
+      "$LITE_BIN" stop-agent --debug-port "$DEBUG_PORT" 2>&1 || true
     else
-      (cd "$SCRIPT_DIR" && cargo run --quiet --manifest-path Cargo.toml -- stop-agent) >/dev/null 2>&1 || true
+      (cd "$SCRIPT_DIR" && cargo run --quiet --manifest-path Cargo.toml -- stop-agent --debug-port "$DEBUG_PORT") 2>&1 || true
     fi
   fi
-  exit "$status"
+  exit "$exit_code"
 }
 
 trap cleanup_agent_on_exit EXIT INT TERM HUP
@@ -302,7 +305,8 @@ main() {
 
   section "2/3 初始化 Codex Gateway Lite 配置"
   mkdir -p "$CONFIG_DIR"
-  run_lite stop-agent
+  # 启动前只清残留进程，不做直连还原——马上就要重新 apply 代理配置了。
+  run_lite stop-agent --no-restore
   run_lite init --config "$CONFIG_FILE"
 
   section "3/3 启动 agent 并拉起 Codex App"

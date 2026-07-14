@@ -606,12 +606,12 @@ function Run-Lite([string[]]$ArgsList) {
 }
 function Stop-AgentOnExit {
   if (-not $script:AgentStarted) { return }
-  Write-Host "`n脚本退出，停止 Codex Gateway Lite agent..." -ForegroundColor Yellow
+  Write-Host "`n脚本退出，停止 Codex Gateway Lite agent 并还原直连上游..." -ForegroundColor Yellow
   try {
     if (Test-Path $LiteBin) {
-      & $LiteBin stop-agent | Out-Null
+      & $LiteBin stop-agent --debug-port $DebugPort
     } else {
-      cargo run --quiet --manifest-path "Cargo.toml" -- stop-agent | Out-Null
+      cargo run --quiet --manifest-path "Cargo.toml" -- stop-agent --debug-port $DebugPort
     }
   } catch {
   }
@@ -631,7 +631,8 @@ try {
 
   Write-Section "2/3 初始化 Codex Gateway Lite 配置"
   New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-  Run-Lite @("stop-agent")
+  # 启动前只清残留进程，不做直连还原——马上就要重新 apply 代理配置了。
+  Run-Lite @("stop-agent", "--no-restore")
   Run-Lite @("init", "--config", $ConfigFile)
 
   Write-Section "3/3 启动 agent 并拉起 Codex App"
