@@ -315,10 +315,18 @@ main() {
   info "  use-provider <id>  切换当前激活的供应商"
 
   AGENT_STARTED=1
+  # 终端模式下同时落一份日志（agent.terminal.log），排查时不依赖终端窗口仍开着。
+  # 超过 5MB 时先滚动到 .1，简单两代轮转，不引入 logrotate。
+  AGENT_LOG="$CONFIG_DIR/agent.terminal.log"
+  if [[ -f "$AGENT_LOG" ]] && (( $(stat -f %z "$AGENT_LOG" 2>/dev/null || echo 0) > 5242880 )); then
+    mv -f "$AGENT_LOG" "$AGENT_LOG.1"
+  fi
+  print "" >> "$AGENT_LOG"
+  print "===== $(date '+%Y-%m-%d %H:%M:%S') Codex Gateway Lite agent 启动 =====" >> "$AGENT_LOG"
   if [[ -n "$APP_PATH" ]]; then
-    run_lite agent --config "$CONFIG_FILE" --app "$APP_PATH" --debug-port "$DEBUG_PORT"
+    run_lite agent --config "$CONFIG_FILE" --app "$APP_PATH" --debug-port "$DEBUG_PORT" 2>&1 | tee -a "$AGENT_LOG"
   else
-    run_lite agent --config "$CONFIG_FILE" --debug-port "$DEBUG_PORT"
+    run_lite agent --config "$CONFIG_FILE" --debug-port "$DEBUG_PORT" 2>&1 | tee -a "$AGENT_LOG"
   fi
 
   print "\n${GREEN}${BOLD}Codex Gateway Lite agent 已退出。${RESET}"

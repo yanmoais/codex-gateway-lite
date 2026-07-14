@@ -2045,15 +2045,17 @@ fn models_from_ids(ids: &[String], existing_models: &[LiteModel]) -> Vec<LiteMod
 /// - Anthropic: https://docs.anthropic.com/en/docs/about-claude/models
 /// - xAI: https://docs.x.ai/docs/models
 ///
-/// Last reviewed: 2026-07-10.
+/// Last reviewed: 2026-07-14.
 const MODEL_CONTEXT_WINDOW_TABLE: &[(&str, &str)] = &[
-    // OpenAI GPT-5.6 family (GA 2026-07-09): gpt-5.6-sol / gpt-5.6-terra /
-    // gpt-5.6-luna plus the bare `gpt-5.6` alias (routes to Sol). All three
-    // tiers share the same official 1,050,000-token context window and 128K
-    // max output per the vendor model pages, so a single prefix entry covers
-    // the family. `parse_window_token` only takes integers with a K/M
-    // suffix, so 1.05M is spelled 1050K here.
-    ("gpt-5.6", "1050K"),
+    // GPT-5.6 API model pages advertise a larger native window, but Codex
+    // sessions authenticated through the ChatGPT product lane are subject to
+    // smaller effective limits. Keep the catalog below those ceilings so
+    // Codex compacts before chatgpt.com rejects the request.
+    // Order matters: Terra/Luna must precede the bare family alias.
+    ("gpt-5.6-terra", "128K"),
+    ("gpt-5.6-luna", "128K"),
+    ("gpt-5.6-sol", "258400"),
+    ("gpt-5.6", "258400"),
     // OpenAI GPT-4.1 family officially supports up to ~1M input tokens.
     ("gpt-4.1", "1M"),
     ("chatgpt-4.1", "1M"),
@@ -6072,7 +6074,7 @@ async fn handle_streaming_responses_proxy(
     // "idle timeout waiting for SSE".
     let mut sse_header_sent = false;
     let open_fut =
-        protocol_proxy::open_responses_proxy_request(&request.body, &upstream_config, user_agent);
+        protocol_proxy::open_responses_proxy_request(&request_json, &upstream_config, user_agent);
     tokio::pin!(open_fut);
     let open_result = match tokio::time::timeout(UPSTREAM_HEADER_SOFT_WAIT, open_fut.as_mut()).await
     {
@@ -6132,9 +6134,8 @@ async fn handle_streaming_responses_proxy(
                     "上游拒绝了带图请求（HTTP 400），已移除 {stripped} 张历史图片后自动重试一次（可能是上游图片内容审核或体积限制）"
                 ),
             );
-            let retry_body = retry_json.to_string();
             let retry_fut = protocol_proxy::open_responses_proxy_request(
-                &retry_body,
+                &retry_json,
                 &upstream_config,
                 user_agent,
             );
@@ -14372,7 +14373,7 @@ not-a-pid garbage line without valid pid
     }
 
     #[test]
-    fn model_windows_use_258400_for_gpt_and_1m_for_other_fetched_models() {
+    fn model_windows_use_codex_product_limits_for_gpt_5_5_and_5_6() {
         let config = LiteConfig {
             provider: LiteProvider {
                 id: "gateway".to_string(),
@@ -14410,15 +14411,15 @@ not-a-pid garbage line without valid pid
         assert_eq!(windows.get("gpt-5.5").map(String::as_str), Some("258400"));
         assert_eq!(
             windows.get("gpt-5.6-sol").map(String::as_str),
-            Some("1050K")
+            Some("258400")
         );
         assert_eq!(
             windows.get("gpt-5.6-terra").map(String::as_str),
-            Some("1050K")
+            Some("128K")
         );
         assert_eq!(
             windows.get("gpt-5.6-luna").map(String::as_str),
-            Some("1050K")
+            Some("128K")
         );
         assert_eq!(
             windows.get("openai/chatgpt-4o-latest").map(String::as_str),
@@ -14432,18 +14433,14 @@ not-a-pid garbage line without valid pid
 
     #[test]
     fn default_context_window_uses_known_vendor_family_table() {
-        assert_eq!(default_context_window_for_model_id("gpt-5.6"), "1050K");
-        assert_eq!(default_context_window_for_model_id("gpt-5.6-sol"), "1050K");
-        assert_eq!(
-            default_context_window_for_model_id("gpt-5.6-terra"),
-            "1050K"
-        );
-        assert_eq!(default_context_window_for_model_id("gpt-5.6-luna"), "1050K");
+        assert_eq!(default_context_window_for_model_id("gpt-5.6"), "258400");
+        assert_eq!(default_context_window_for_model_id("gpt-5.6-sol"), "258400");
+        assert_eq!(default_context_window_for_model_id("gpt-5.6-terra"), "128K");
+        assert_eq!(default_context_window_for_model_id("gpt-5.6-luna"), "128K");
         assert_eq!(
             default_context_window_for_model_id("openai/gpt-5.6-sol"),
-            "1050K"
+            "258400"
         );
-        // GPT-5.5 and earlier keep the Codex-effective GPT-family fallback.
         assert_eq!(default_context_window_for_model_id("gpt-5.5"), "258400");
         assert_eq!(
             default_context_window_for_model_id("openai/chatgpt-4o-latest"),
@@ -16457,12 +16454,15 @@ mod responses_budget_tests {
         assert!(report.images_stripped > 0);
 
         let items = body["input"].as_array().unwrap();
-        let old_user = &items[0];
-        let parts = old_user["content"].as_array().unwrap();
-        let has_old_image = parts
-            .iter()
-            .any(|p| p.get("type").and_then(|v| v.as_str()) == Some("input_image"));
-        assert!(!has_old_image, "Old image should have been stripped");
+        let serialized = serde_json::to_string(items).unwrap();
+        assert!(
+            !serialized.contains("base64,OLD"),
+            "Old image should have been stripped or its old message removed"
+        );
+        assert!(
+            serialized.contains("base64,NEW"),
+            "The latest user image must remain in the active turn"
+        );
     }
 
     #[test]
@@ -16496,6 +16496,81 @@ mod responses_budget_tests {
         let final_items = body["input"].as_array().unwrap();
         assert!(final_items.len() < original_len);
 
+        let last = final_items.last().unwrap();
+        assert_eq!(last["content"].as_str().unwrap(), "Final question");
+    }
+
+    #[test]
+    fn responses_budget_trim_preserves_leading_instruction_messages() {
+        let budget = crate::protocol_proxy::ContextBudgetConfig {
+            max_input_tokens: 120,
+            image_token_estimate: 800,
+        };
+        let mut items = vec![
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": "<permissions instructions>\nsandbox_mode danger-full-access"
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": "# AGENTS.md instructions for /tmp/project\nAlways call update_plan."
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": "<environment_context>\ncwd /tmp/project\n</environment_context>"
+            }),
+        ];
+        for i in 0..20 {
+            items.push(json!({
+                "role": "user",
+                "content": format!("Question {i} with padding text xxxxxxxxxxxxxxxxxxxxxxxx")
+            }));
+            items.push(json!({
+                "role": "assistant",
+                "content": format!("Answer {i} with padding text yyyyyyyyyyyyyyyyyyyyyyyy")
+            }));
+        }
+        items.push(json!({ "role": "user", "content": "Final question" }));
+
+        let mut body = json!({
+            "model": "test",
+            "input": items
+        });
+        let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
+        assert!(report.was_trimmed);
+        assert!(report.messages_removed > 0);
+
+        let final_items = body["input"].as_array().unwrap();
+        // The three Codex-injected instruction messages must survive at the
+        // head, in order, followed by the trim marker.
+        assert!(
+            final_items[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<permissions instructions>")
+        );
+        assert!(
+            final_items[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("# AGENTS.md instructions")
+        );
+        assert!(
+            final_items[2]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<environment_context>")
+        );
+        assert!(
+            final_items[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("trimmed to fit context budget")
+        );
+        // Recent conversation still preserved.
         let last = final_items.last().unwrap();
         assert_eq!(last["content"].as_str().unwrap(), "Final question");
     }

@@ -317,6 +317,21 @@ fn parse_window_token(token: &str) -> Option<u64> {
 }
 
 fn auto_compact_token_limit_for_model(slug: &str, context_window: u64) -> Value {
+    let model = slug
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .to_ascii_lowercase();
+    // The ChatGPT/Codex product lane has smaller effective windows than the
+    // native GPT-5.6 API. Leave room for tool schemas, output, and estimation
+    // drift so compaction starts before the endpoint returns context_too_large.
+    if model.starts_with("gpt-5.6-terra") || model.starts_with("gpt-5.6-luna") {
+        return json!(100_000.min(context_window.saturating_mul(80) / 100));
+    }
+    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+        return json!(220_000.min(context_window.saturating_mul(85) / 100));
+    }
     if is_anthropic_family_model(slug) {
         return json!(context_window.saturating_mul(65) / 100);
     }
@@ -1199,6 +1214,42 @@ mod tests {
                 "slug {slug} should not get the fast speed tier"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_catalog_entries_use_codex_product_windows_and_compact_early() {
+        let entries = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            .into_iter()
+            .map(|slug| ModelCatalogEntry {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                suffix_window: None,
+            })
+            .collect::<Vec<_>>();
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(&entries, None, false))
+            .expect("catalog parses");
+
+        let models = catalog["models"].as_array().expect("models array");
+        assert_eq!(models[0]["context_window"].as_u64(), Some(258_400));
+        assert_eq!(
+            models[0]["auto_compact_token_limit"].as_u64(),
+            Some(219_640)
+        );
+        assert_eq!(models[1]["context_window"].as_u64(), Some(258_400));
+        assert_eq!(
+            models[1]["auto_compact_token_limit"].as_u64(),
+            Some(219_640)
+        );
+        assert_eq!(models[2]["context_window"].as_u64(), Some(128_000));
+        assert_eq!(
+            models[2]["auto_compact_token_limit"].as_u64(),
+            Some(100_000)
+        );
+        assert_eq!(models[3]["context_window"].as_u64(), Some(128_000));
+        assert_eq!(
+            models[3]["auto_compact_token_limit"].as_u64(),
+            Some(100_000)
+        );
     }
 
     #[test]
