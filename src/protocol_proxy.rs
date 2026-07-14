@@ -24,15 +24,16 @@ const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// costs nothing client-side.
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(800);
 /// Maximum gap allowed between two SSE chunks while relaying an already-open
-/// upstream stream. Without this, a stalled upstream (network stall, silent
-/// keep-alive with no data) leaves the chunk-forwarding loop awaiting
-/// `response.chunk()` forever: the local proxy holds the TCP connection to
-/// Codex open but silent, so Codex's own client-side idle timeout eventually
-/// fires and the session gets torn down with an opaque
-/// "stream disconnected before completion" error that gives the user no signal
-/// about what actually stalled. Enforcing our own shorter idle timeout here
-/// lets the proxy fail fast with a clear diagnostic instead.
-pub const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// upstream stream, so a truly dead upstream doesn't hold the loop forever.
+/// This must comfortably exceed legitimate silent stretches: Claude-family
+/// models at high reasoning effort think for minutes, and the VPS-side
+/// thinking-filter swallows those thinking deltas, so the proxy sees zero
+/// bytes the whole time (observed >60s regularly on claude-fable-5; grok/gpt
+/// never hit this because nothing filters their stream). The client side is
+/// safe during the wait: the proxy emits SSE keepalive comments and the
+/// provider config pins Codex's own idle timeout at 900s, so this just needs
+/// to stay below that.
+pub const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(720);
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
