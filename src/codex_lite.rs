@@ -351,9 +351,6 @@ fn auto_compact_token_limit_for_model(
     } else {
         None
     };
-    let Some(base) = base else {
-        return Value::Null;
-    };
     // The model-native window (used above) has no idea the local proxy hard-
     // trims every outgoing request to a much smaller `max_input_tokens` (see
     // `ContextBudgetConfig` in protocol_proxy.rs). Without this clamp Codex
@@ -362,9 +359,20 @@ fn auto_compact_token_limit_for_model(
     // gets rejected upstream as "prompt too long" instead of compacting.
     // Clamp to 90% of the proxy's cap, leaving headroom for the difference
     // between Codex's token estimate and the proxy's own estimator.
-    match budget_cap {
-        Some(cap) => json!(base.min(cap.saturating_mul(90) / 100)),
-        None => json!(base),
+    //
+    // Families with no native threshold (grok, gpt-5.5, …) must not skip
+    // the clamp either: a Null limit disables Codex's auto-compact
+    // entirely, so with the proxy cap in force those sessions grew
+    // unbounded (1M+ tokens observed) until the still-open turn alone
+    // exceeded the cap — untrimmable by design — and every send died
+    // upstream, seen as grok-4.5 turns silently ending mid-loop while a
+    // 1M-window model on the same thread kept working.
+    let capped = budget_cap.map(|cap| cap.saturating_mul(90) / 100);
+    match (base, capped) {
+        (Some(base), Some(cap)) => json!(base.min(cap)),
+        (Some(base), None) => json!(base),
+        (None, Some(cap)) => json!(cap),
+        (None, None) => Value::Null,
     }
 }
 
@@ -1361,6 +1369,53 @@ mod tests {
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
             Some(650_000)
         );
+    }
+
+    #[test]
+    fn auto_compact_token_limit_applies_cap_to_families_without_native_threshold() {
+        // grok-4.5 (256K window) has no model-native compact threshold, so
+        // before the fix its limit was Null — Codex never auto-compacted,
+        // sessions grew past 1M tokens, and once the still-open turn alone
+        // exceeded the proxy's 179_200-token send cap every request died
+        // upstream (turns silently ending mid-loop). With a cap present the
+        // limit must fall back to 90% of the cap instead of Null.
+        let entries = vec![ModelCatalogEntry {
+            slug: "grok-4.5".to_string(),
+            display_name: "grok-4.5".to_string(),
+            suffix_window: Some(256_000),
+        }];
+        let mut budget_caps = HashMap::new();
+        budget_caps.insert("grok-4.5".to_string(), 179_200);
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &budget_caps,
+        ))
+        .expect("catalog parses");
+        assert_eq!(
+            catalog["models"][0]["auto_compact_token_limit"].as_u64(),
+            Some(179_200 * 90 / 100)
+        );
+    }
+
+    #[test]
+    fn auto_compact_token_limit_stays_null_without_native_threshold_or_cap() {
+        // No native threshold and no proxy cap (proxy unused / budget off):
+        // the pre-fix behavior — no auto-compact limit — must be preserved.
+        let entries = vec![ModelCatalogEntry {
+            slug: "grok-4.5".to_string(),
+            display_name: "grok-4.5".to_string(),
+            suffix_window: Some(256_000),
+        }];
+        let catalog: Value = serde_json::from_str(&build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &HashMap::new(),
+        ))
+        .expect("catalog parses");
+        assert!(catalog["models"][0]["auto_compact_token_limit"].is_null());
     }
 
     #[test]
