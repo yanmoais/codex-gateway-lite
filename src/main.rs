@@ -1352,6 +1352,12 @@ fn merge_lite_profile_into_config(
     });
     provider["wire_api"] = toml_edit::value("responses");
     provider["requires_openai_auth"] = toml_edit::value(true);
+    // Codex's own SSE idle timeout defaults to 300s and only real SSE events
+    // reset it — the proxy's keepalive comment frames don't. It must outlast
+    // the proxy's 800s stream header wait, or Codex tears the turn down with
+    // "idle timeout waiting for SSE" while the proxy is still healthily
+    // waiting on a slow upstream.
+    provider["stream_idle_timeout_ms"] = toml_edit::value(900_000);
     if !profile.base_url.trim().is_empty() {
         provider["base_url"] = toml_edit::value(profile.base_url.trim());
     }
