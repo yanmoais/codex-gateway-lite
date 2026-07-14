@@ -1249,7 +1249,7 @@ fn apply_config(
     let home = resolve_codex_home(codex_home);
     let profile = build_profile(config)?;
     let config_contents = build_preserving_config_contents(&home, &profile, &config.common_config)?;
-    write_lite_model_catalog(&home, &profile, plan_hints)?;
+    write_lite_model_catalog(&home, config, &profile, plan_hints)?;
     let result = codex_lite::apply_relay_config_file_to_home(&home, &config_contents)?;
     let catalog_path = home
         .join("model-catalogs")
@@ -1462,6 +1462,7 @@ fn merge_toml_table_like(target: &mut dyn toml_edit::TableLike, source: &dyn tom
 
 fn write_lite_model_catalog(
     home: &Path,
+    config: &LiteConfig,
     profile: &RelayProfile,
     plan_hints: bool,
 ) -> anyhow::Result<()> {
@@ -1478,10 +1479,35 @@ fn write_lite_model_catalog(
     let entries =
         codex_lite::collect_catalog_entries(&profile.model_list, &model_windows, &profile.model);
     let fallback_window = parse_window_token(&profile.context_window);
-    let catalog_json = codex_lite::build_model_catalog_json(&entries, fallback_window, plan_hints);
+    let budget_caps = context_budget_caps_for_catalog(config, &entries);
+    let catalog_json =
+        codex_lite::build_model_catalog_json(&entries, fallback_window, plan_hints, &budget_caps);
     fs::write(&catalog_path, catalog_json)
         .with_context(|| format!("写入模型 catalog 失败：{}", catalog_path.display()))?;
     Ok(())
+}
+
+/// Per-model effective send cap enforced by the local protocol proxy
+/// (`ContextBudgetConfig::max_input_tokens`, see `resolve_context_budget`),
+/// keyed by model slug — one entry per catalog entry whose provider actually
+/// routes through the local proxy with a budget configured. Entries not
+/// present here (proxy unused, or `context_budget` off) get `None` from
+/// `HashMap::get` in `build_model_catalog_json`, i.e. unchanged behavior.
+fn context_budget_caps_for_catalog(
+    config: &LiteConfig,
+    entries: &[codex_lite::ModelCatalogEntry],
+) -> HashMap<String, u64> {
+    if !provider_uses_local_proxy(config) {
+        return HashMap::new();
+    }
+    let mut caps = HashMap::new();
+    for entry in entries {
+        let budget = resolve_context_budget(config, Some(entry.slug.as_str()));
+        if !budget.is_unlimited() {
+            caps.insert(entry.slug.clone(), budget.max_input_tokens);
+        }
+    }
+    caps
 }
 
 fn ensure_trailing_newline(value: String) -> String {
@@ -13034,9 +13060,13 @@ CREATE TABLE threads (
             display_name: "Claude Sonnet 5".to_string(),
             suffix_window: Some(1_000_000),
         }];
-        let catalog: Value =
-            serde_json::from_str(&codex_lite::build_model_catalog_json(&entries, None, false))
-                .expect("catalog json parses");
+        let catalog: Value = serde_json::from_str(&codex_lite::build_model_catalog_json(
+            &entries,
+            None,
+            false,
+            &HashMap::new(),
+        ))
+        .expect("catalog json parses");
         let model = &catalog["models"][0];
 
         assert_eq!(model["model"].as_str(), Some("claude-sonnet-5"));
@@ -14438,6 +14468,96 @@ not-a-pid garbage line without valid pid
     }
 
     #[test]
+    fn context_budget_caps_for_catalog_matches_per_model_proxy_budget() {
+        // Mirrors the real bug report: a global `context_budget` reserve
+        // applied against each model's own window (see
+        // `explicit_context_budget_limit`) leaves very different effective
+        // send caps per model — the catalog clamp has to follow suit per
+        // model, not use one provider-wide number.
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "gateway".to_string(),
+                name: String::new(),
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "test".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::Responses,
+                context_budget: "200K".to_string(),
+                model_filter: Vec::new(),
+            },
+            model: "claude-fable-5".to_string(),
+            models: models_from_ids(
+                &["claude-fable-5".to_string(), "gpt-5.5".to_string()],
+                &[],
+            ),
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+            providers: Vec::new(),
+            aggregate: false,
+        };
+        let profile = build_profile(&config).expect("profile builds");
+        let model_windows: HashMap<String, String> =
+            serde_json::from_str(&profile.model_windows).unwrap_or_default();
+        let entries = codex_lite::collect_catalog_entries(
+            &profile.model_list,
+            &model_windows,
+            &profile.model,
+        );
+
+        let caps = context_budget_caps_for_catalog(&config, &entries);
+
+        // claude-fable-5 keeps its 1M window largely intact (200K reserve is
+        // well under the model's own 30% cap), while gpt-5.5's much smaller
+        // 258400 window loses a proportionally bigger chunk to the same
+        // reserve — 180_880, the exact number from the bug's proxy log line
+        // ("上下文预算裁剪后仍超出预算：204519 > 180880").
+        assert_eq!(caps.get("claude-fable-5").copied(), Some(800_000));
+        assert_eq!(caps.get("gpt-5.5").copied(), Some(180_880));
+    }
+
+    #[test]
+    fn context_budget_caps_for_catalog_empty_when_local_proxy_unused() {
+        // No context_budget configured and a Responses-protocol provider
+        // never routes through the local proxy (`provider_uses_local_proxy`
+        // is false), so there's no effective send cap to clamp against —
+        // the catalog must fall back to the old, unclamped behavior.
+        let config = LiteConfig {
+            provider: LiteProvider {
+                id: "gateway".to_string(),
+                name: String::new(),
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "test".to_string(),
+                api_key_env: String::new(),
+                mode: LiteMode::MixedApi,
+                protocol: LiteProtocol::Responses,
+                context_budget: String::new(),
+                model_filter: Vec::new(),
+            },
+            model: "claude-fable-5".to_string(),
+            models: models_from_ids(&["claude-fable-5".to_string()], &[]),
+            context_window: "1M".to_string(),
+            auto_compact_token_limit: String::new(),
+            common_config: String::new(),
+            plan_hints: false,
+            providers: Vec::new(),
+            aggregate: false,
+        };
+        let profile = build_profile(&config).expect("profile builds");
+        let model_windows: HashMap<String, String> =
+            serde_json::from_str(&profile.model_windows).unwrap_or_default();
+        let entries = codex_lite::collect_catalog_entries(
+            &profile.model_list,
+            &model_windows,
+            &profile.model,
+        );
+
+        assert!(context_budget_caps_for_catalog(&config, &entries).is_empty());
+    }
+
+    #[test]
     fn default_context_window_uses_known_vendor_family_table() {
         assert_eq!(default_context_window_for_model_id("gpt-5.6"), "258400");
         assert_eq!(default_context_window_for_model_id("gpt-5.6-sol"), "258400");
@@ -15038,7 +15158,7 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, false);
+        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, false, &HashMap::new());
         let catalog: serde_json::Value =
             serde_json::from_str(&catalog_json).expect("catalog is valid JSON");
         let base = catalog["models"][0]["base_instructions"]
@@ -15058,7 +15178,7 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, true);
+        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, true, &HashMap::new());
         let catalog: serde_json::Value =
             serde_json::from_str(&catalog_json).expect("catalog is valid JSON");
         let base = catalog["models"][0]["base_instructions"]
@@ -15096,7 +15216,8 @@ mod plan_hints_tests {
             display_name: "test-model".to_string(),
             suffix_window: None,
         }];
-        let catalog_json = codex_lite::build_model_catalog_json(&entries, None, config.plan_hints);
+        let catalog_json =
+            codex_lite::build_model_catalog_json(&entries, None, config.plan_hints, &HashMap::new());
         assert!(
             catalog_json.contains("update_plan"),
             "first-use config should generate task-plan guidance"

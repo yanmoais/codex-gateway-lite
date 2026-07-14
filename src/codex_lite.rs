@@ -213,6 +213,14 @@ pub fn build_model_catalog_json(
     entries: &[ModelCatalogEntry],
     fallback_window: Option<u64>,
     plan_hints: bool,
+    // 本地代理实际会发送的 token 上限，按模型 slug 区分（见 main.rs 的
+    // `context_budget_cap_for_model`）。这是代理硬裁前允许通过的量，跟
+    // Codex 自己算出来的 auto_compact 阈值是两套独立的数字：如果代理的
+    // 上限比 auto_compact 阈值更紧，Codex 永远等不到自己触发压缩就先被
+    // 代理裁剪，裁不动时上游就会拒绝。这里把有 cap 的模型的阈值收紧到
+    // cap 以内，让 Codex 先手压缩。没有 cap（未启用本地代理 / 未设置
+    // context_budget）的模型不受影响。
+    budget_caps: &HashMap<String, u64>,
 ) -> String {
     let base_instructions = if plan_hints {
         format!("{DEFAULT_BASE_INSTRUCTIONS}{PLAN_HINTS_SUPPLEMENT}")
@@ -255,7 +263,11 @@ pub fn build_model_catalog_json(
                 "context_window": context_window,
                 "max_context_window": context_window,
                 "effective_context_window_percent": 100,
-                "auto_compact_token_limit": auto_compact_token_limit_for_model(&entry.slug, context_window),
+                "auto_compact_token_limit": auto_compact_token_limit_for_model(
+                    &entry.slug,
+                    context_window,
+                    budget_caps.get(&entry.slug).copied(),
+                ),
                 "priority": 1000 + index,
                 "visibility": "list",
                 "supported_in_api": true,
@@ -316,7 +328,11 @@ fn parse_window_token(token: &str) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
-fn auto_compact_token_limit_for_model(slug: &str, context_window: u64) -> Value {
+fn auto_compact_token_limit_for_model(
+    slug: &str,
+    context_window: u64,
+    budget_cap: Option<u64>,
+) -> Value {
     let model = slug
         .trim()
         .rsplit('/')
@@ -326,16 +342,30 @@ fn auto_compact_token_limit_for_model(slug: &str, context_window: u64) -> Value 
     // The ChatGPT/Codex product lane has smaller effective windows than the
     // native GPT-5.6 API. Leave room for tool schemas, output, and estimation
     // drift so compaction starts before the endpoint returns context_too_large.
-    if model.starts_with("gpt-5.6-terra") || model.starts_with("gpt-5.6-luna") {
-        return json!(100_000.min(context_window.saturating_mul(80) / 100));
+    let base = if model.starts_with("gpt-5.6-terra") || model.starts_with("gpt-5.6-luna") {
+        Some(100_000.min(context_window.saturating_mul(80) / 100))
+    } else if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+        Some(220_000.min(context_window.saturating_mul(85) / 100))
+    } else if is_anthropic_family_model(slug) {
+        Some(context_window.saturating_mul(65) / 100)
+    } else {
+        None
+    };
+    let Some(base) = base else {
+        return Value::Null;
+    };
+    // The model-native window (used above) has no idea the local proxy hard-
+    // trims every outgoing request to a much smaller `max_input_tokens` (see
+    // `ContextBudgetConfig` in protocol_proxy.rs). Without this clamp Codex
+    // never reaches its own auto_compact_token_limit before the proxy's
+    // trimmer bites, so a session that can't be trimmed any further just
+    // gets rejected upstream as "prompt too long" instead of compacting.
+    // Clamp to 90% of the proxy's cap, leaving headroom for the difference
+    // between Codex's token estimate and the proxy's own estimator.
+    match budget_cap {
+        Some(cap) => json!(base.min(cap.saturating_mul(90) / 100)),
+        None => json!(base),
     }
-    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
-        return json!(220_000.min(context_window.saturating_mul(85) / 100));
-    }
-    if is_anthropic_family_model(slug) {
-        return json!(context_window.saturating_mul(65) / 100);
-    }
-    Value::Null
 }
 
 fn is_anthropic_family_model(slug: &str) -> bool {
@@ -1226,8 +1256,9 @@ mod tests {
                 suffix_window: None,
             })
             .collect::<Vec<_>>();
-        let catalog: Value = serde_json::from_str(&build_model_catalog_json(&entries, None, false))
-            .expect("catalog parses");
+        let catalog: Value =
+            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &HashMap::new()))
+                .expect("catalog parses");
 
         let models = catalog["models"].as_array().expect("models array");
         assert_eq!(models[0]["context_window"].as_u64(), Some(258_400));
@@ -1249,6 +1280,70 @@ mod tests {
         assert_eq!(
             models[3]["auto_compact_token_limit"].as_u64(),
             Some(100_000)
+        );
+    }
+
+    #[test]
+    fn auto_compact_token_limit_clamps_to_proxy_budget_cap_when_tighter() {
+        // Real-world numbers from the bug this guards against: a 1M-window
+        // fable model normally compacts at 65% (650_000), but the local
+        // proxy's actual send cap was ~180_880 tokens — far below that.
+        // Codex would never see 650_000 tokens to trigger its own compact,
+        // so it must be clamped down into range instead.
+        let entries = vec![ModelCatalogEntry {
+            slug: "claude-fable-5".to_string(),
+            display_name: "claude-fable-5".to_string(),
+            suffix_window: Some(1_000_000),
+        }];
+        let mut budget_caps = HashMap::new();
+        budget_caps.insert("claude-fable-5".to_string(), 180_880);
+        let catalog: Value =
+            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &budget_caps))
+                .expect("catalog parses");
+        assert_eq!(
+            catalog["models"][0]["auto_compact_token_limit"].as_u64(),
+            // 90% of the cap, leaving headroom for tokenizer estimation drift.
+            Some(180_880 * 90 / 100)
+        );
+    }
+
+    #[test]
+    fn auto_compact_token_limit_unclamped_when_no_budget_cap_present() {
+        // No cap entry for this slug (e.g. provider doesn't use the local
+        // proxy, or context_budget is off) must reproduce the pre-clamp
+        // behavior exactly.
+        let entries = vec![ModelCatalogEntry {
+            slug: "claude-fable-5".to_string(),
+            display_name: "claude-fable-5".to_string(),
+            suffix_window: Some(1_000_000),
+        }];
+        let catalog: Value =
+            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &HashMap::new()))
+                .expect("catalog parses");
+        assert_eq!(
+            catalog["models"][0]["auto_compact_token_limit"].as_u64(),
+            Some(650_000)
+        );
+    }
+
+    #[test]
+    fn auto_compact_token_limit_ignores_cap_looser_than_native_threshold() {
+        // A generous cap (bigger than the model-native auto_compact
+        // threshold once scaled by 90%) must never raise the limit — only
+        // ever tighten it. `min()` keeps this a one-way clamp.
+        let entries = vec![ModelCatalogEntry {
+            slug: "claude-fable-5".to_string(),
+            display_name: "claude-fable-5".to_string(),
+            suffix_window: Some(1_000_000),
+        }];
+        let mut budget_caps = HashMap::new();
+        budget_caps.insert("claude-fable-5".to_string(), 800_000);
+        let catalog: Value =
+            serde_json::from_str(&build_model_catalog_json(&entries, None, false, &budget_caps))
+                .expect("catalog parses");
+        assert_eq!(
+            catalog["models"][0]["auto_compact_token_limit"].as_u64(),
+            Some(650_000)
         );
     }
 
