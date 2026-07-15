@@ -128,20 +128,26 @@ h1, p { margin: 0; }
   transform: scale(0.6);
   transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
-.tl-red { background: radial-gradient(circle at 30% 28%, #ff8d84, #ff5f57 60%, #e0443e); }
-.tl-yellow { background: radial-gradient(circle at 30% 28%, #ffd479, #febc2e 60%, #d89c1f); }
-.tl-green { background: radial-gradient(circle at 30% 28%, #6fe38a, #28c840 60%, #1ea72f); }
+.tl-red { background: radial-gradient(circle at 30% 28%, #ff8d84, #ff5f57 60%, #e0443e); --glow: rgba(255, 95, 87, 0.75); }
+.tl-yellow { background: radial-gradient(circle at 30% 28%, #ffd479, #febc2e 60%, #d89c1f); --glow: rgba(254, 188, 46, 0.75); }
+.tl-green { background: radial-gradient(circle at 30% 28%, #6fe38a, #28c840 60%, #1ea72f); --glow: rgba(40, 200, 64, 0.75); }
 .tl-red::before { content: '\2715'; }
 .tl-yellow::before { content: '\2212'; }
 .tl-green::before { content: '\002B'; }
-.traffic-lights:hover .tl { transform: scale(1.08); filter: brightness(1.05); }
+.traffic-lights:hover .tl { transform: scale(1.08); filter: brightness(1.05); animation: none; }
 .traffic-lights:hover .tl::before { opacity: 1; transform: scale(1); }
 .traffic-lights:active .tl { transform: scale(0.94); }
-@keyframes tlPulseGreen {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(40, 200, 64, 0.45); }
-  50% { box-shadow: 0 0 0 4px rgba(40, 200, 64, 0); }
+/* Idle state: a "drop" of light lands on red, bounces down into the dot,
+   then hands off to yellow and finally green — same keyframe on all three,
+   just staggered, so it reads as one drop rolling left-to-right on a loop
+   rather than three dots blinking independently. */
+@keyframes tlDrop {
+  0%, 72%, 100% { transform: translateY(0) scale(1); box-shadow: 0 0 0 0 var(--glow); }
+  36% { transform: translateY(1px) scale(1.25); box-shadow: 0 2px 7px 1px var(--glow); }
 }
-.traffic-lights:not(:hover) .tl-green { animation: tlPulseGreen 2.4s var(--ease) infinite; }
+.traffic-lights:not(:hover) .tl { animation: tlDrop 1.8s var(--ease) infinite; }
+.traffic-lights:not(:hover) .tl-yellow { animation-delay: 0.16s; }
+.traffic-lights:not(:hover) .tl-green { animation-delay: 0.32s; }
 .titlebar-title { flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
 .titlebar-right { min-width: 120px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 
@@ -519,9 +525,11 @@ h1, p { margin: 0; }
 .log-entry:hover { background: rgba(255, 255, 255, 0.035); }
 .log-entry-error { border-left-color: var(--danger); }
 .log-entry-warn { border-left-color: var(--warning); }
+.log-entry-notice { border-left-color: var(--accent); background: var(--accent-dim); }
 .sgr-dim { opacity: 0.6; }
 .sgr-red { color: var(--danger); }
 .sgr-yellow { color: var(--warning); }
+.sgr-cyan { color: var(--accent); font-weight: 600; }
 
 .logs-scroll-bottom-btn {
   position: absolute; right: 16px; bottom: 16px;
@@ -1390,7 +1398,7 @@ function applyUpdate() {
 
 /* ============ Logs page ============ */
 var ANSI_SGR_RE = /\x1b\[([0-9;]*)m|\x1b\[[0-9;]*[A-Za-z]/g;
-var ANSI_CLASS_MAP = { '2': 'sgr-dim', '31': 'sgr-red', '33': 'sgr-yellow' };
+var ANSI_CLASS_MAP = { '2': 'sgr-dim', '31': 'sgr-red', '33': 'sgr-yellow', '36': 'sgr-cyan' };
 
 function renderAnsiLog(text) {
   var out = '';
@@ -1471,6 +1479,7 @@ function buildLogEntryElement(rawText) {
   el.innerHTML = renderAnsiLog(rawText);
   if (el.querySelector('.sgr-red')) el.classList.add('log-entry-error');
   else if (el.querySelector('.sgr-yellow')) el.classList.add('log-entry-warn');
+  else if (el.querySelector('.sgr-cyan')) el.classList.add('log-entry-notice');
   return el;
 }
 

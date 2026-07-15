@@ -1289,6 +1289,12 @@ pub enum LogLevel {
     Error,
     Warn,
     Info,
+    /// Routine, not a sign of trouble, but worth standing out from the rest
+    /// of the uncolored `Info` stream because it's an actionable nudge the
+    /// user may want to notice mid-scroll (e.g. the stale-plan reminder) —
+    /// cyan, so it reads as "look here" without implying degraded/failed
+    /// like `Warn`/`Error` do.
+    Notice,
 }
 
 /// Print a diagnostic line to stderr, throttled per `key` to at most once
@@ -1364,10 +1370,12 @@ fn render_log_line(prefix: &str, level: LogLevel, line: &str, colors_enabled: bo
     const DIM: &str = "\x1b[2m";
     const RED: &str = "\x1b[31m";
     const YELLOW: &str = "\x1b[33m";
+    const CYAN: &str = "\x1b[36m";
     const RESET: &str = "\x1b[0m";
     let colored_body = match level {
         LogLevel::Error => format!("{RED}{line}{RESET}"),
         LogLevel::Warn => format!("{YELLOW}{line}{RESET}"),
+        LogLevel::Notice => format!("{CYAN}{line}{RESET}"),
         LogLevel::Info => line.to_string(),
     };
     format!("{DIM}{prefix}{RESET}{colored_body}\n\n")
@@ -1632,7 +1640,7 @@ fn upstream_request_parts(
         }
         log_upstream_event_deduped(
             "plan_reminder_nudge",
-            LogLevel::Info,
+            LogLevel::Notice,
             format!("已提醒模型更新 update_plan（距上次调用已过 {stale_tool_calls} 次工具调用）"),
         );
     }
@@ -7063,6 +7071,13 @@ mod repeated_log_tests {
     }
 
     #[test]
+    fn render_log_line_wraps_notice_body_in_cyan() {
+        let rendered = render_log_line("[12:00:00] ", LogLevel::Notice, "已提醒模型更新 update_plan", true);
+        assert!(rendered.contains("\x1b[36m已提醒模型更新 update_plan\x1b[0m"));
+        assert!(rendered.starts_with("\x1b[2m[12:00:00] \x1b[0m"));
+    }
+
+    #[test]
     fn render_log_line_leaves_info_body_uncolored() {
         let rendered = render_log_line("[12:00:00] ", LogLevel::Info, "已裁剪", true);
         // Info 只有前缀带暗淡色，消息正文本身不额外包一层颜色码。
@@ -7085,9 +7100,11 @@ mod repeated_log_tests {
             (LogLevel::Error, true),
             (LogLevel::Warn, true),
             (LogLevel::Info, true),
+            (LogLevel::Notice, true),
             (LogLevel::Error, false),
             (LogLevel::Warn, false),
             (LogLevel::Info, false),
+            (LogLevel::Notice, false),
         ] {
             let rendered = render_log_line("[p] ", level, "msg", colors_enabled);
             assert!(
