@@ -83,8 +83,9 @@ done
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
   BOLD="$(tput bold)"; DIM="$(tput dim)"; RESET="$(tput sgr0)"
   GREEN="$(tput setaf 2)"; YELLOW="$(tput setaf 3)"; RED="$(tput setaf 1)"; BLUE="$(tput setaf 4)"
+  CYAN="$(tput setaf 6)"
 else
-  BOLD=""; DIM=""; RESET=""; GREEN=""; YELLOW=""; RED=""; BLUE=""
+  BOLD=""; DIM=""; RESET=""; GREEN=""; YELLOW=""; RED=""; BLUE=""; CYAN=""
 fi
 
 print_header() {
@@ -94,6 +95,26 @@ print_header() {
   print "${BOLD}╰────────────────────────────────────────────╯${RESET}"
   print "${DIM}项目目录：$SCRIPT_DIR${RESET}"
   print "${DIM}配置文件：$CONFIG_FILE${RESET}"
+  print ""
+}
+
+# Confirmation banner for mode 1 (background launch) — the only output most
+# users ever see, since Finder's Terminal window closes moments after this
+# prints. Deliberately not a bordered box like `print_header`: every value
+# here (URL, log path, this script's own absolute path) is variable-length
+# and can run long, and a fixed-width box drawn around it would either
+# overflow or need real terminal-width-aware wrapping to still look right.
+# A plain label/value list sidesteps that entirely. The three Chinese labels
+# below are deliberately kept at 4 characters each (8 terminal columns, since
+# CJK glyphs render double-width) so they line up without any padding math.
+print_background_launch_summary() {
+  local url="http://127.0.0.1:$PROXY_PORT/ui"
+  print ""
+  print "  ${GREEN}${BOLD}✓  Codex Gateway Lite 已在后台启动${RESET}"
+  print ""
+  print "  ${DIM}配置页面${RESET}  ${BOLD}${CYAN}${url}${RESET}"
+  print "  ${DIM}日志文件${RESET}  ${AGENT_LOG}"
+  print "  ${DIM}终端调试${RESET}  \"${SCRIPT_PATH}\" --foreground"
   print ""
 }
 
@@ -621,10 +642,7 @@ main_background_launch() {
   CGL_BACKGROUND_CHILD=1 nohup "$SCRIPT_PATH" >> "$AGENT_LOG" 2>&1 &
   disown 2>/dev/null || true
 
-  ok "Codex Gateway Lite 已在后台启动"
-  info "配置页面：http://127.0.0.1:$PROXY_PORT/ui"
-  info "如需在终端里看彩色实时输出，可执行：\"$SCRIPT_PATH\" --foreground"
-  info "日志文件：$AGENT_LOG"
+  print_background_launch_summary
 }
 
 if [[ "${CGL_BACKGROUND_CHILD:-0}" == "1" ]]; then
