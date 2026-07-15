@@ -347,7 +347,7 @@ fn auto_compact_token_limit_for_model(
     } else if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
         Some(220_000.min(context_window.saturating_mul(85) / 100))
     } else if is_anthropic_family_model(slug) {
-        Some(context_window.saturating_mul(65) / 100)
+        Some(context_window.saturating_mul(50) / 100)
     } else {
         None
     };
@@ -1298,9 +1298,9 @@ mod tests {
     #[test]
     fn auto_compact_token_limit_clamps_to_proxy_budget_cap_when_tighter() {
         // Real-world numbers from the bug this guards against: a 1M-window
-        // fable model normally compacts at 65% (650_000), but the local
+        // fable model normally compacts at 50% (500_000), but the local
         // proxy's actual send cap was ~180_880 tokens — far below that.
-        // Codex would never see 650_000 tokens to trigger its own compact,
+        // Codex would never see 500_000 tokens to trigger its own compact,
         // so it must be clamped down into range instead.
         let entries = vec![ModelCatalogEntry {
             slug: "claude-fable-5".to_string(),
@@ -1342,7 +1342,7 @@ mod tests {
         .expect("catalog parses");
         assert_eq!(
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
-            Some(650_000)
+            Some(500_000)
         );
     }
 
@@ -1367,7 +1367,7 @@ mod tests {
         .expect("catalog parses");
         assert_eq!(
             catalog["models"][0]["auto_compact_token_limit"].as_u64(),
-            Some(650_000)
+            Some(500_000)
         );
     }
 

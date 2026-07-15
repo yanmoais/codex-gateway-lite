@@ -157,6 +157,13 @@ pub struct ProtocolProxyUpstream {
     pub protocol: RelayProtocol,
     pub user_agent: String,
     pub context_budget: ContextBudgetConfig,
+    /// Mirrors `LiteConfig::plan_hints` (see main.rs): gates both the
+    /// one-time `PLAN_HINTS_SUPPLEMENT` baked into `base_instructions` at
+    /// catalog-build time (codex_lite.rs) and the mid-conversation
+    /// stale-plan nudge injected per request below
+    /// (`should_inject_plan_reminder`) — same toggle, two different points
+    /// in the model's context where it needs reinforcing.
+    pub plan_hints: bool,
     /// Multi-provider aggregation routing table: a normalized model slug
     /// (see `crate::normalized_route_key`) mapped to whichever upstream
     /// actually serves that model. Populated only when the gateway config
@@ -1507,6 +1514,55 @@ pub fn record_responses_trace(
     );
 }
 
+/// Threshold for the stale-plan nudge below: roughly the point where a stuck
+/// step starts feeling invisible to the user without being a false-positive
+/// on normal short multi-tool turns (a few tool calls in a row for one step
+/// is completely ordinary; six in a row with no plan touch is not).
+const STALE_PLAN_REMINDER_THRESHOLD: usize = 6;
+
+/// Wrapped in the same `<tag>`-style convention Codex's own injected content
+/// uses (`<environment_context>`, `<user_instructions>`, ...) so the model
+/// recognizes this as harness-injected, not the human typing.
+const PLAN_REMINDER_TEXT: &str = "<plan_reminder>Reminder: you have made several tool calls without updating your plan via update_plan. If the current step is done, mark it complete and move to the next one; if you haven't created a plan yet for this multi-step task, create one now.</plan_reminder>";
+
+/// Count `function_call` items after the most recent `update_plan` call in a
+/// Responses `input` array — or every `function_call` item if `update_plan`
+/// has never been called this conversation (i.e. no plan exists yet).
+fn count_function_calls_since_last_update_plan(items: &[Value]) -> usize {
+    let last_update_plan_idx = items.iter().rposition(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("name").and_then(Value::as_str) == Some("update_plan")
+    });
+    let start = last_update_plan_idx.map(|idx| idx + 1).unwrap_or(0);
+    items[start..]
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .count()
+}
+
+/// Whether the outgoing request should carry a stale-plan nudge: only when
+/// `plan_hints` is on for the active config and the model has gone
+/// `STALE_PLAN_REMINDER_THRESHOLD` tool calls without touching `update_plan`.
+fn should_inject_plan_reminder(items: &[Value], plan_hints: bool) -> bool {
+    plan_hints
+        && count_function_calls_since_last_update_plan(items) >= STALE_PLAN_REMINDER_THRESHOLD
+}
+
+/// Append the ephemeral reminder to the outgoing Responses `input` array.
+/// Shaped as `role: "user"` — the same role this gateway's own context-budget
+/// trim marker (see `apply_responses_context_budget`) and Codex's own
+/// injected instruction messages already use for synthetic, non-literal-user
+/// content, since a Responses `message` item has no role meant for "the
+/// harness talking, not the user or the model". Never persisted: Codex owns
+/// and resends its own full history every turn, so this only ever affects
+/// the single outgoing call it's appended to.
+fn inject_plan_reminder_item(items: &mut Vec<Value>) {
+    items.push(json!({
+        "role": "user",
+        "content": PLAN_REMINDER_TEXT,
+    }));
+}
+
 fn upstream_request_parts(
     relay: &ProtocolProxyUpstream,
     mut request_json: Value,
@@ -1558,6 +1614,29 @@ fn upstream_request_parts(
             ),
         );
     }
+
+    // Stale-plan nudge: runs ahead of the Responses/Chat Completions branch
+    // (like the image-budget pass above) and independent of `is_native_openai`
+    // — `plan_hints`'s one-time `PLAN_HINTS_SUPPLEMENT` is baked into every
+    // model's base_instructions regardless of native/third-party (see
+    // codex_lite::build_model_catalog_json), so the mid-conversation nudge
+    // that reinforces it follows the same toggle unconditionally.
+    let stale_tool_calls_before_nudge = request_json
+        .get("input")
+        .and_then(Value::as_array)
+        .filter(|items| should_inject_plan_reminder(items, relay.plan_hints))
+        .map(|items| count_function_calls_since_last_update_plan(items));
+    if let Some(stale_tool_calls) = stale_tool_calls_before_nudge {
+        if let Some(items) = request_json.get_mut("input").and_then(Value::as_array_mut) {
+            inject_plan_reminder_item(items);
+        }
+        log_upstream_event_deduped(
+            "plan_reminder_nudge",
+            LogLevel::Info,
+            format!("已提醒模型更新 update_plan（距上次调用已过 {stale_tool_calls} 次工具调用）"),
+        );
+    }
+
     match relay.protocol {
         RelayProtocol::Responses => {
             let mut body = request_json;
@@ -7238,6 +7317,7 @@ mod grok_review_fix_tests {
             protocol,
             user_agent: String::new(),
             context_budget,
+            plan_hints: false,
             model_routes: BTreeMap::new(),
         }
     }
@@ -8075,6 +8155,7 @@ mod input_image_budget_tests {
             protocol: RelayProtocol::Responses,
             user_agent: String::new(),
             context_budget: ContextBudgetConfig::default(),
+            plan_hints: false,
             model_routes: BTreeMap::new(),
         };
         let (_, responses_body, wire_api, _) =
@@ -8132,6 +8213,7 @@ mod aggregate_routing_tests {
             protocol: RelayProtocol::Responses,
             user_agent: String::new(),
             context_budget: ContextBudgetConfig::default(),
+            plan_hints: false,
             model_routes,
         }
     }
@@ -8217,10 +8299,206 @@ mod aggregate_routing_tests {
             protocol: RelayProtocol::Responses,
             user_agent: String::new(),
             context_budget: ContextBudgetConfig::default(),
+            plan_hints: false,
             model_routes: BTreeMap::new(),
         };
         let (base_url, api_key) = resolve_model_upstream(&relay, Some("anything"));
         assert_eq!(base_url, "https://solo.example/v1");
         assert_eq!(api_key, "sk-solo");
+    }
+}
+
+#[cfg(test)]
+mod plan_nudge_tests {
+    use super::*;
+
+    fn function_call(name: &str) -> Value {
+        json!({ "type": "function_call", "name": name, "arguments": "{}", "call_id": "call_1" })
+    }
+
+    fn update_plan_call() -> Value {
+        function_call("update_plan")
+    }
+
+    fn plan_hints_relay(protocol: RelayProtocol) -> ProtocolProxyUpstream {
+        ProtocolProxyUpstream {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            api_key: "key".to_string(),
+            protocol,
+            user_agent: String::new(),
+            context_budget: ContextBudgetConfig::default(),
+            plan_hints: true,
+            model_routes: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn count_since_last_update_plan_counts_all_calls_when_never_called() {
+        let items = vec![
+            function_call("shell"),
+            function_call("apply_patch"),
+            function_call("shell"),
+        ];
+        assert_eq!(count_function_calls_since_last_update_plan(&items), 3);
+    }
+
+    #[test]
+    fn count_since_last_update_plan_only_counts_calls_after_the_most_recent_one() {
+        let items = vec![
+            function_call("shell"),
+            update_plan_call(),
+            function_call("shell"),
+            function_call("apply_patch"),
+        ];
+        assert_eq!(count_function_calls_since_last_update_plan(&items), 2);
+    }
+
+    #[test]
+    fn count_since_last_update_plan_uses_the_latest_update_plan_not_the_first() {
+        let items = vec![
+            update_plan_call(),
+            function_call("shell"),
+            function_call("shell"),
+            update_plan_call(),
+            function_call("shell"),
+        ];
+        assert_eq!(count_function_calls_since_last_update_plan(&items), 1);
+    }
+
+    #[test]
+    fn count_since_last_update_plan_is_zero_for_empty_or_missing_history() {
+        assert_eq!(count_function_calls_since_last_update_plan(&[]), 0);
+    }
+
+    #[test]
+    fn should_inject_plan_reminder_respects_plan_hints_toggle() {
+        let mut items = vec![];
+        for _ in 0..STALE_PLAN_REMINDER_THRESHOLD {
+            items.push(function_call("shell"));
+        }
+        assert!(
+            should_inject_plan_reminder(&items, true),
+            "stale history with plan_hints on must trigger the nudge"
+        );
+        assert!(
+            !should_inject_plan_reminder(&items, false),
+            "plan_hints off must never trigger the nudge, however stale"
+        );
+    }
+
+    #[test]
+    fn should_inject_plan_reminder_only_fires_at_or_above_the_threshold() {
+        let mut items = vec![];
+        for _ in 0..(STALE_PLAN_REMINDER_THRESHOLD - 1) {
+            items.push(function_call("shell"));
+        }
+        assert!(
+            !should_inject_plan_reminder(&items, true),
+            "one call under the threshold must not be a false positive"
+        );
+        items.push(function_call("shell"));
+        assert!(
+            should_inject_plan_reminder(&items, true),
+            "hitting the threshold exactly must trigger the nudge"
+        );
+    }
+
+    #[test]
+    fn inject_plan_reminder_item_appends_a_labeled_user_role_item() {
+        let mut items = vec![function_call("shell")];
+        inject_plan_reminder_item(&mut items);
+        assert_eq!(items.len(), 2);
+        let injected = items.last().unwrap();
+        assert_eq!(injected["role"], "user");
+        let text = injected["content"].as_str().expect("content is a string");
+        assert!(text.contains("update_plan"));
+        assert!(text.starts_with("<plan_reminder>"));
+    }
+
+    #[test]
+    fn upstream_request_parts_injects_reminder_for_responses_when_stale_and_enabled() {
+        let mut input = vec![];
+        for _ in 0..STALE_PLAN_REMINDER_THRESHOLD {
+            input.push(function_call("shell"));
+        }
+        let request_json = json!({ "model": "test-model", "input": input });
+        let relay = plan_hints_relay(RelayProtocol::Responses);
+
+        let (_, body, wire_api, _) = upstream_request_parts(&relay, request_json).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::Responses);
+        let items = body["input"].as_array().unwrap();
+        let last = items.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap()
+                .contains("update_plan"),
+            "reminder must survive the Responses passthrough path unmodified: {items:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_request_parts_injects_reminder_for_chat_completions_when_stale_and_enabled() {
+        let mut input = vec![function_call("shell")];
+        for _ in 0..STALE_PLAN_REMINDER_THRESHOLD {
+            input.push(function_call("apply_patch"));
+        }
+        let request_json = json!({ "model": "test-model", "input": input });
+        let relay = plan_hints_relay(RelayProtocol::ChatCompletions);
+
+        let (_, body, wire_api, _) = upstream_request_parts(&relay, request_json).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
+        let messages = body["messages"].as_array().unwrap();
+        let has_reminder = messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("update_plan"))
+        });
+        assert!(
+            has_reminder,
+            "reminder must survive translation into the Chat Completions body: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_request_parts_skips_reminder_when_plan_hints_disabled() {
+        let mut input = vec![];
+        for _ in 0..(STALE_PLAN_REMINDER_THRESHOLD + 2) {
+            input.push(function_call("shell"));
+        }
+        let request_json = json!({ "model": "test-model", "input": input.clone() });
+        let mut relay = plan_hints_relay(RelayProtocol::Responses);
+        relay.plan_hints = false;
+
+        let (_, body, _, _) = upstream_request_parts(&relay, request_json).unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            input.len(),
+            "plan_hints off must never append the reminder, however stale: {items:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_request_parts_skips_reminder_when_below_threshold() {
+        let mut input = vec![];
+        for _ in 0..(STALE_PLAN_REMINDER_THRESHOLD - 1) {
+            input.push(function_call("shell"));
+        }
+        let request_json = json!({ "model": "test-model", "input": input.clone() });
+        let relay = plan_hints_relay(RelayProtocol::Responses);
+
+        let (_, body, _, _) = upstream_request_parts(&relay, request_json).unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            input.len(),
+            "a normal short multi-tool turn must not be a false positive: {items:?}"
+        );
     }
 }

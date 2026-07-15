@@ -6868,6 +6868,7 @@ fn protocol_proxy_upstream_from_config(
         protocol: config.provider.protocol.to_proxy(),
         user_agent: String::new(),
         context_budget,
+        plan_hints: config.plan_hints,
         model_routes,
     })
 }
@@ -7337,11 +7338,17 @@ fn redact_lite_config_api_keys(config: &LiteConfig) -> LiteConfig {
     redacted
 }
 
-/// One field's worth of `merge_submitted_lite_config`'s rule: keep `current`
+/// The original, strictly *positional* rule for one field: keep `current`
 /// when `submitted` is empty or is exactly what `redact_api_key(current)`
 /// would display (i.e. the browser just echoed back what `GET
 /// /api/ui/config` showed it, unedited); otherwise `submitted` is a
-/// deliberate edit and replaces it.
+/// deliberate edit and replaces it. `merge_submitted_lite_config` no longer
+/// calls this directly — see `resolve_submitted_api_key` for why a purely
+/// positional match stopped being enough — but the rule is still correct
+/// in isolation, so it stays as a building block with its own tests below.
+/// Only the tests call it now, so it's otherwise dead outside `#[cfg(test)]`
+/// builds — hence the explicit `allow`.
+#[allow(dead_code)]
 fn merge_submitted_api_key(submitted: &str, current: &str) -> String {
     if submitted.is_empty() || submitted == redact_api_key(current) {
         current.to_string()
@@ -7350,30 +7357,75 @@ fn merge_submitted_api_key(submitted: &str, current: &str) -> String {
     }
 }
 
+/// Collect every real `apiKey` currently on disk — the active provider's
+/// and every saved profile's under `providers[]` — keyed by the redacted
+/// placeholder `redact_api_key` would show for it. This lets a submitted
+/// key be recognized as "untouched" no matter *which* provider slot it
+/// comes back in, which matters because the Web UI's "set as active
+/// provider" action swaps whole provider objects (including their already-
+/// redacted `apiKey` strings) between `provider` and `providers[]` purely
+/// client-side before POSTing; the browser never re-fetches or re-redacts
+/// anything, so the redacted string sitting in the active slot after a
+/// swap can belong to a *different* provider than the one that used to be
+/// active there.
+///
+/// Two real keys could in principle redact to the same placeholder — that
+/// only happens for keys under 14 characters, which `redact_api_key`
+/// collapses to a single "•••" regardless of content — in which case the
+/// first one encountered wins via `or_insert_with`. Real API keys are
+/// essentially never that short, so this is not worth resolving further.
+fn known_api_key_masks(current: &LiteConfig) -> HashMap<String, String> {
+    let mut masks = HashMap::new();
+    if !current.provider.api_key.is_empty() {
+        masks
+            .entry(redact_api_key(&current.provider.api_key))
+            .or_insert_with(|| current.provider.api_key.clone());
+    }
+    for profile in &current.providers {
+        if !profile.provider.api_key.is_empty() {
+            masks
+                .entry(redact_api_key(&profile.provider.api_key))
+                .or_insert_with(|| profile.provider.api_key.clone());
+        }
+    }
+    masks
+}
+
+/// Resolve one submitted `apiKey` field against `known_masks` (see
+/// `known_api_key_masks`): empty stays empty, a value that matches some
+/// known key's redacted placeholder is that untouched key restored —
+/// regardless of which position it was submitted at — and anything else is
+/// a genuinely new key used as-is.
+fn resolve_submitted_api_key(submitted: &str, known_masks: &HashMap<String, String>) -> String {
+    if submitted.is_empty() {
+        String::new()
+    } else if let Some(real_key) = known_masks.get(submitted) {
+        real_key.clone()
+    } else {
+        submitted.to_string()
+    }
+}
+
 /// Merge a POSTed config (from the browser) with what's currently on disk:
-/// every `apiKey` field gets `merge_submitted_api_key`'s treatment, so
-/// leaving a key untouched in the UI never blanks it out and never requires
-/// the browser to round-trip the real plaintext secret just to leave it
-/// alone. Saved profiles in `providers[]` are matched to their current
-/// counterpart by `id` (sanitized the same way `switch_active_provider`
-/// does); an id with no current match — a brand new profile, or one whose
-/// id itself just changed — has nothing to preserve, so its submitted key
-/// is used as-is.
+/// every `apiKey` field is resolved against *every* real key already on
+/// disk (`known_api_key_masks` + `resolve_submitted_api_key`), not just
+/// whatever used to live at the same position or `id`. A purely positional
+/// match isn't enough because the Web UI can reshuffle whole provider
+/// objects — including their already-redacted `apiKey` placeholders —
+/// between `provider` and `providers[]` before submitting; matching
+/// against the full set of known redactions still recognizes an untouched
+/// key wherever it lands and restores the right real value, instead of
+/// writing some other provider's masked placeholder to disk as if it were
+/// a real secret. Leaving a key untouched in the UI still never blanks it
+/// out and never requires the browser to round-trip the real plaintext
+/// secret just to leave it alone.
 fn merge_submitted_lite_config(submitted: LiteConfig, current: &LiteConfig) -> LiteConfig {
     let mut merged = submitted;
-    merged.provider.api_key =
-        merge_submitted_api_key(&merged.provider.api_key, &current.provider.api_key);
+    let known_masks = known_api_key_masks(current);
+    merged.provider.api_key = resolve_submitted_api_key(&merged.provider.api_key, &known_masks);
     for profile in &mut merged.providers {
-        let current_key = current
-            .providers
-            .iter()
-            .find(|candidate| {
-                sanitize_provider_id(&candidate.provider.id)
-                    == sanitize_provider_id(&profile.provider.id)
-            })
-            .map(|candidate| candidate.provider.api_key.as_str())
-            .unwrap_or("");
-        profile.provider.api_key = merge_submitted_api_key(&profile.provider.api_key, current_key);
+        profile.provider.api_key =
+            resolve_submitted_api_key(&profile.provider.api_key, &known_masks);
     }
     merged
 }
@@ -18767,7 +18819,7 @@ mod ui_config_tests {
         assert_eq!(config.provider.api_key, "sk-active-0123456789ab");
     }
 
-    // --- merge_submitted_api_key / merge_submitted_lite_config ---
+    // --- merge_submitted_api_key / known_api_key_masks / resolve_submitted_api_key / merge_submitted_lite_config ---
 
     #[test]
     fn merge_submitted_api_key_keeps_current_when_submitted_is_empty() {
@@ -18820,11 +18872,20 @@ mod ui_config_tests {
             "sk-saved-secret-0123456789",
         );
 
-        // Submitted keeps the active key blank (unchanged) and gives the
-        // saved profile's key back as its redacted placeholder (also
-        // unchanged), while renaming the saved profile's model.
+        // Submitted gives back each key's own redacted placeholder
+        // (unchanged for both the active and the saved profile), while
+        // renaming the saved profile's model. Note this now has to use the
+        // real placeholder rather than an empty string to mean "active key
+        // unchanged": `resolve_submitted_api_key` no longer treats an empty
+        // submission as shorthand for "whatever is currently at this
+        // position" (there is no single "this position" any more once keys
+        // are matched across all known providers instead of by slot), so an
+        // empty submission now really does mean "no key" rather than
+        // "unmodified".
+        let redacted_active = redact_api_key("sk-active-0123456789ab");
         let redacted_saved = redact_api_key("sk-saved-secret-0123456789");
-        let mut submitted = sample_config_with_saved_provider("", "beta", &redacted_saved);
+        let mut submitted =
+            sample_config_with_saved_provider(&redacted_active, "beta", &redacted_saved);
         submitted.providers[0].model = "beta-model-renamed".to_string();
 
         let merged = merge_submitted_lite_config(submitted, &current);
@@ -18836,12 +18897,217 @@ mod ui_config_tests {
         assert_eq!(merged.providers[0].model, "beta-model-renamed");
 
         // A genuine edit to the saved profile's key is honored.
-        let edited = sample_config_with_saved_provider("", "beta", "sk-brand-new-saved-key-999");
+        let edited = sample_config_with_saved_provider(
+            &redacted_active,
+            "beta",
+            "sk-brand-new-saved-key-999",
+        );
         let merged_edit = merge_submitted_lite_config(edited, &current);
         assert_eq!(
             merged_edit.providers[0].provider.api_key,
             "sk-brand-new-saved-key-999"
         );
+    }
+
+    // --- known_api_key_masks / resolve_submitted_api_key ---
+
+    #[test]
+    fn known_api_key_masks_collects_active_and_saved_keys_and_skips_blanks() {
+        let current = sample_config_with_saved_provider(
+            "sk-active-0123456789ab",
+            "beta",
+            "sk-saved-secret-0123456789",
+        );
+        let masks = known_api_key_masks(&current);
+        assert_eq!(masks.len(), 2);
+        assert_eq!(
+            masks.get(&redact_api_key("sk-active-0123456789ab")),
+            Some(&"sk-active-0123456789ab".to_string())
+        );
+        assert_eq!(
+            masks.get(&redact_api_key("sk-saved-secret-0123456789")),
+            Some(&"sk-saved-secret-0123456789".to_string())
+        );
+
+        // An unset (empty) key has no "untouched" placeholder worth
+        // remembering, so it contributes nothing to the map.
+        let blank_current = sample_config("", "solo");
+        assert!(known_api_key_masks(&blank_current).is_empty());
+    }
+
+    #[test]
+    fn resolve_submitted_api_key_empty_stays_empty() {
+        let known_masks = HashMap::new();
+        assert_eq!(resolve_submitted_api_key("", &known_masks), "");
+    }
+
+    #[test]
+    fn resolve_submitted_api_key_restores_a_known_mask_from_any_source_position() {
+        let real_key_a = "sk-aaaa1111111111";
+        let real_key_b = "sk-bbbb2222222222";
+        let mut known_masks = HashMap::new();
+        known_masks.insert(redact_api_key(real_key_a), real_key_a.to_string());
+        known_masks.insert(redact_api_key(real_key_b), real_key_b.to_string());
+
+        // Each placeholder resolves to its own real key: the lookup only
+        // cares whether the string matches a known redaction, never which
+        // config field it was read from.
+        assert_eq!(
+            resolve_submitted_api_key(&redact_api_key(real_key_b), &known_masks),
+            real_key_b
+        );
+        assert_eq!(
+            resolve_submitted_api_key(&redact_api_key(real_key_a), &known_masks),
+            real_key_a
+        );
+    }
+
+    #[test]
+    fn resolve_submitted_api_key_overrides_with_a_genuinely_new_value() {
+        let mut known_masks = HashMap::new();
+        known_masks.insert(
+            redact_api_key("sk-aaaa1111111111"),
+            "sk-aaaa1111111111".to_string(),
+        );
+        assert_eq!(
+            resolve_submitted_api_key("sk-brand-new-key-xyz", &known_masks),
+            "sk-brand-new-key-xyz"
+        );
+    }
+
+    // --- merge_submitted_lite_config: cross-position resolution ---
+
+    #[test]
+    fn merge_submitted_lite_config_restores_keys_after_frontend_provider_swap() {
+        // Simulates the Web UI's "set as active provider" action: it moves
+        // a whole saved provider object (id, name, apiKey placeholder, ...)
+        // into the active slot and moves the previously-active object into
+        // `providers[]`, entirely client-side, with no backend endpoint
+        // involved. The next POST just contains the reshuffled config.
+        let real_key_a = "sk-aaaa1111111111";
+        let real_key_b = "sk-bbbb2222222222";
+
+        // On disk: A is active, B is saved.
+        let current_json = format!(
+            r#"{{
+                "provider": {{
+                    "id": "provider-a",
+                    "name": "A",
+                    "baseUrl": "https://a.example/v1",
+                    "apiKey": "{real_key_a}",
+                    "protocol": "responses"
+                }},
+                "model": "model-a",
+                "models": ["model-a"],
+                "providers": [
+                    {{
+                        "provider": {{
+                            "id": "provider-b",
+                            "name": "B",
+                            "baseUrl": "https://b.example/v1",
+                            "apiKey": "{real_key_b}",
+                            "protocol": "responses"
+                        }},
+                        "model": "model-b",
+                        "models": ["model-b"]
+                    }}
+                ]
+            }}"#
+        );
+        let current: LiteConfig =
+            serde_json::from_str(&current_json).expect("current config parses");
+
+        // Submitted: B's whole object (with B's own redacted placeholder)
+        // now sits at `provider`; A's whole object (with A's own redacted
+        // placeholder) now sits at `providers[0]`.
+        let redacted_a = redact_api_key(real_key_a);
+        let redacted_b = redact_api_key(real_key_b);
+        let submitted_json = format!(
+            r#"{{
+                "provider": {{
+                    "id": "provider-b",
+                    "name": "B",
+                    "baseUrl": "https://b.example/v1",
+                    "apiKey": "{redacted_b}",
+                    "protocol": "responses"
+                }},
+                "model": "model-b",
+                "models": ["model-b"],
+                "providers": [
+                    {{
+                        "provider": {{
+                            "id": "provider-a",
+                            "name": "A",
+                            "baseUrl": "https://a.example/v1",
+                            "apiKey": "{redacted_a}",
+                            "protocol": "responses"
+                        }},
+                        "model": "model-a",
+                        "models": ["model-a"]
+                    }}
+                ]
+            }}"#
+        );
+        let submitted: LiteConfig =
+            serde_json::from_str(&submitted_json).expect("submitted config parses");
+
+        let merged = merge_submitted_lite_config(submitted, &current);
+
+        // Both real keys survive the swap — neither slot ends up with the
+        // other provider's masked placeholder written in as if it were a
+        // real secret.
+        assert_eq!(merged.provider.id, "provider-b");
+        assert_eq!(merged.provider.api_key, real_key_b);
+        assert_eq!(merged.providers[0].provider.id, "provider-a");
+        assert_eq!(merged.providers[0].provider.api_key, real_key_a);
+    }
+
+    #[test]
+    fn merge_submitted_lite_config_uses_a_genuinely_new_key_not_in_any_known_mask() {
+        let real_key_a = "sk-aaaa1111111111";
+        let real_key_b = "sk-bbbb2222222222";
+        let current = sample_config_with_saved_provider(real_key_a, "provider-b", real_key_b);
+
+        // The user promotes B to active (same swap as above) but also
+        // edits its key while doing so, to a value that matches neither
+        // A's nor B's known redaction. That value has nothing to restore
+        // from and must be used exactly as submitted.
+        let brand_new_key = "sk-brand-new-key-999999999";
+        let redacted_a = redact_api_key(real_key_a);
+        let submitted_json = format!(
+            r#"{{
+                "provider": {{
+                    "id": "provider-b",
+                    "name": "B",
+                    "baseUrl": "https://saved.example/v1",
+                    "apiKey": "{brand_new_key}",
+                    "protocol": "chat_completions"
+                }},
+                "model": "model-b",
+                "models": ["model-b"],
+                "providers": [
+                    {{
+                        "provider": {{
+                            "id": "active",
+                            "name": "Active",
+                            "baseUrl": "https://active.example/v1",
+                            "apiKey": "{redacted_a}",
+                            "protocol": "responses"
+                        }},
+                        "model": "active-model",
+                        "models": ["active-model"]
+                    }}
+                ]
+            }}"#
+        );
+        let submitted: LiteConfig =
+            serde_json::from_str(&submitted_json).expect("submitted config parses");
+
+        let merged = merge_submitted_lite_config(submitted, &current);
+        assert_eq!(merged.provider.api_key, brand_new_key);
+        // A's untouched placeholder, now sitting in providers[0], still
+        // resolves back to A's real key in the same merge call.
+        assert_eq!(merged.providers[0].provider.api_key, real_key_a);
     }
 
     // --- Host loopback validation ---

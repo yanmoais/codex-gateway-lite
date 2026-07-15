@@ -42,11 +42,6 @@ body {
   font-family: var(--font-ui);
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 32px 16px;
 }
 button, input, select, textarea { font-family: inherit; color: inherit; }
 h1, p { margin: 0; }
@@ -62,6 +57,7 @@ h1, p { margin: 0; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 100vh;
   gap: 14px;
   color: var(--text-secondary);
   font-size: 13px;
@@ -102,12 +98,8 @@ h1, p { margin: 0; }
 /* ============ Window shell ============ */
 .window {
   width: 100%;
-  max-width: 1080px;
-  height: 720px;
-  max-height: 88vh;
+  height: 100vh;
   background: var(--bg);
-  border-radius: var(--radius-window);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -121,10 +113,35 @@ h1, p { margin: 0; }
   border-bottom: 1px solid var(--hairline);
 }
 .traffic-lights { display: flex; gap: 8px; width: 120px; min-width: 120px; }
-.tl { width: 12px; height: 12px; border-radius: 50%; }
-.tl-red { background: #ff5f57; }
-.tl-yellow { background: #febc2e; }
-.tl-green { background: #28c840; }
+.tl {
+  width: 12px; height: 12px; border-radius: 50%;
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform var(--dur) var(--ease), filter var(--dur) var(--ease);
+}
+.tl::before {
+  content: '';
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  color: rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.tl-red { background: radial-gradient(circle at 30% 28%, #ff8d84, #ff5f57 60%, #e0443e); }
+.tl-yellow { background: radial-gradient(circle at 30% 28%, #ffd479, #febc2e 60%, #d89c1f); }
+.tl-green { background: radial-gradient(circle at 30% 28%, #6fe38a, #28c840 60%, #1ea72f); }
+.tl-red::before { content: '\2715'; }
+.tl-yellow::before { content: '\2212'; }
+.tl-green::before { content: '\002B'; }
+.traffic-lights:hover .tl { transform: scale(1.08); filter: brightness(1.05); }
+.traffic-lights:hover .tl::before { opacity: 1; transform: scale(1); }
+.traffic-lights:active .tl { transform: scale(0.94); }
+@keyframes tlPulseGreen {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(40, 200, 64, 0.45); }
+  50% { box-shadow: 0 0 0 4px rgba(40, 200, 64, 0); }
+}
+.traffic-lights:not(:hover) .tl-green { animation: tlPulseGreen 2.4s var(--ease) infinite; }
 .titlebar-title { flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
 .titlebar-right { min-width: 120px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 
@@ -311,7 +328,7 @@ h1, p { margin: 0; }
 .diagram-note { margin-top: 16px; font-size: 11px; color: var(--text-secondary); text-align: center; }
 
 /* ============ Overview summary grid ============ */
-.summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .summary-card { padding: 14px 16px; margin-bottom: 0; }
 .summary-label { font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; }
 .summary-value { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -323,6 +340,11 @@ h1, p { margin: 0; }
   padding: 12px 16px; border-bottom: 1px solid var(--hairline);
 }
 .provider-card-title { font-size: 13px; font-weight: 600; }
+.provider-card-actions { display: flex; align-items: center; gap: 8px; }
+.badge-current {
+  font-size: 10px; font-weight: 600; background: var(--accent); color: #fff;
+  border-radius: 8px; padding: 2px 8px;
+}
 .dashed-card {
   border: 1.5px dashed var(--hairline); background: transparent;
   display: flex; align-items: center; justify-content: center; gap: 6px;
@@ -342,6 +364,12 @@ h1, p { margin: 0; }
 .models-table td { padding: 8px 16px; border-bottom: 1px solid var(--hairline); }
 .models-table tr:last-child td { border-bottom: none; }
 .models-table .field-input { width: 100%; }
+.models-actions-cell { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.btn-model-default-active { background: var(--accent); color: #fff; cursor: default; }
+.btn-model-default-outline {
+  background: transparent; border: 1px solid var(--hairline); color: var(--text-secondary);
+}
+.btn-model-default-outline:hover { border-color: var(--accent); color: var(--accent); background: transparent; }
 
 /* ============ Save bar ============ */
 .save-bar {
@@ -477,9 +505,20 @@ h1, p { margin: 0; }
   overflow-y: auto; padding: 12px 14px;
 }
 .logs-content {
-  font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text);
-  white-space: pre-wrap; word-break: break-all;
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.75; color: var(--text);
 }
+.log-entry {
+  white-space: pre-wrap; word-break: break-all;
+  padding: 8px 12px 8px 13px;
+  margin-bottom: 8px;
+  border-left: 2px solid transparent;
+  border-radius: 4px;
+  transition: background var(--dur) var(--ease);
+}
+.log-entry:last-child { margin-bottom: 0; }
+.log-entry:hover { background: rgba(255, 255, 255, 0.035); }
+.log-entry-error { border-left-color: var(--danger); }
+.log-entry-warn { border-left-color: var(--warning); }
 .sgr-dim { opacity: 0.6; }
 .sgr-red { color: var(--danger); }
 .sgr-yellow { color: var(--warning); }
@@ -535,8 +574,7 @@ h1, p { margin: 0; }
   <div class="shell">
     <div class="sidebar">
       <button class="nav-item active" data-action="nav" data-page="overview">概览</button>
-      <button class="nav-item" data-action="nav" data-page="provider">当前供应商</button>
-      <button class="nav-item" data-action="nav" data-page="providers">多供应商<span class="badge" id="aggregateBadge" hidden>生效中</span></button>
+      <button class="nav-item" data-action="nav" data-page="providers">供应商<span class="badge" id="aggregateBadge" hidden>生效中</span></button>
       <button class="nav-item" data-action="nav" data-page="models">模型列表</button>
       <button class="nav-item" data-action="nav" data-page="advanced">高级</button>
       <button class="nav-item" data-action="nav" data-page="logs">日志</button>
@@ -574,12 +612,12 @@ h1, p { margin: 0; }
         <div class="card">
           <div class="card-row">
             <div class="row-info">
-              <div class="row-label">聚合多供应商</div>
-              <div class="row-caption">开启后按模型过滤规则合并所有已保存供应商的模型目录，自动路由请求。</div>
+              <div class="row-label">任务卡片</div>
+              <div class="row-caption">在 Codex 客户端右侧注入实时更新的任务清单卡片；关闭则使用模型自身默认行为。</div>
             </div>
             <div class="row-control">
               <label class="switch">
-                <input type="checkbox" id="aggregateToggle" data-scope="active" data-field="aggregate">
+                <input type="checkbox" id="planHintsToggle" data-scope="active" data-field="planHints">
                 <span class="switch-track"><span class="switch-thumb"></span></span>
               </label>
             </div>
@@ -596,8 +634,16 @@ h1, p { margin: 0; }
             <div class="summary-value" id="summaryModel">—</div>
           </div>
           <div class="card summary-card">
-            <div class="summary-label">上下文窗口</div>
-            <div class="summary-value" id="summaryContextWindow">—</div>
+            <div class="summary-label">协议</div>
+            <div class="summary-value" id="summaryProtocol">—</div>
+          </div>
+          <div class="card summary-card">
+            <div class="summary-label">上下文预算</div>
+            <div class="summary-value" id="summaryContextBudget">—</div>
+          </div>
+          <div class="card summary-card">
+            <div class="summary-label">已配置供应商数</div>
+            <div class="summary-value" id="summaryProviderCount">—</div>
           </div>
           <div class="card summary-card">
             <div class="summary-label">配置文件</div>
@@ -606,15 +652,23 @@ h1, p { margin: 0; }
         </div>
       </section>
 
-      <section class="page" id="page-provider">
-        <h1 class="page-title">当前供应商</h1>
-        <p class="page-desc">正在生效的上游供应商与路由参数，保存后重启生效。</p>
-        <div id="page-provider-body"></div>
-      </section>
-
       <section class="page" id="page-providers">
-        <h1 class="page-title">多供应商</h1>
-        <p class="page-desc">保存多个供应商配置；开启概览页的"聚合多供应商"后，按各自的模型过滤前缀自动合并路由。</p>
+        <h1 class="page-title">供应商</h1>
+        <p class="page-desc">当前生效与已保存的供应商配置；可切换"当前"使用哪一个，保存后重启生效。</p>
+        <div class="card">
+          <div class="card-row">
+            <div class="row-info">
+              <div class="row-label">聚合多供应商</div>
+              <div class="row-caption">开启后按模型过滤规则合并所有已保存供应商的模型目录，自动路由请求。</div>
+            </div>
+            <div class="row-control">
+              <label class="switch">
+                <input type="checkbox" id="aggregateToggle" data-scope="active" data-field="aggregate">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+          </div>
+        </div>
         <div id="providersList"></div>
         <div class="card dashed-card" data-action="add-provider" role="button" tabindex="0">
           <span class="dashed-plus">+</span><span>添加供应商</span>
@@ -639,18 +693,8 @@ h1, p { margin: 0; }
         <h1 class="page-title">高级</h1>
         <p class="page-desc">影响 Codex 客户端行为的额外设置，改动前建议了解其含义。</p>
         <div class="card">
-          <div class="card-row">
-            <div class="row-info">
-              <div class="row-label">计划提示</div>
-              <div class="row-caption">开启后在系统提示中加入生成执行计划的引导，多数场景建议保持开启。</div>
-            </div>
-            <div class="row-control">
-              <label class="switch">
-                <input type="checkbox" id="planHintsToggle" data-scope="active" data-field="planHints">
-                <span class="switch-track"><span class="switch-thumb"></span></span>
-              </label>
-            </div>
-          </div>
+          <div class="card-title">上下文兜底值</div>
+          <div id="page-advanced-model-defaults-body"></div>
         </div>
         <div class="card">
           <div class="card-title">自定义配置片段</div>
@@ -793,7 +837,16 @@ var logState = {
   stickToBottom: true,
   totalChars: 0,
   fetching: false,
-  failCount: 0
+  failCount: 0,
+  /* Raw text of the not-yet-finalized trailing log entry, i.e. everything
+     received so far after the last "\n\n" boundary. Carried across poll
+     cycles so an entry split across two fetches never gets rendered as two
+     separate `.log-entry` blocks. */
+  pendingBuffer: '',
+  /* The DOM element currently mirroring `pendingBuffer` (kept live and
+     updated in place as more text streams in), or null when there's no
+     open entry yet. */
+  pendingEl: null
 };
 
 /* ============ Restart flow state ============ */
@@ -829,6 +882,18 @@ function normalizeModelEntry(entry) {
   if (typeof entry === 'string') return { id: entry, contextWindow: '' };
   if (entry && typeof entry === 'object') return { id: entry.id || '', contextWindow: entry.contextWindow || '' };
   return { id: '', contextWindow: '' };
+}
+
+/* Effective context window for the current default model: prefer the
+   matching entry's own contextWindow from the models catalog; fall back to
+   the profile-level contextWindow (used when the default model isn't listed
+   in the catalog, or the listed entry doesn't specify its own window). */
+function effectiveContextWindowLabel(cfg) {
+  var models = cfg.models || [];
+  for (var i = 0; i < models.length; i++) {
+    if (models[i].id === cfg.model && models[i].contextWindow) return models[i].contextWindow;
+  }
+  return cfg.contextWindow || '';
 }
 
 function setDeep(obj, path, value) {
@@ -955,7 +1020,6 @@ function showMain() {
 
 /* ============ Render orchestration ============ */
 function renderAll() {
-  renderProviderFields();
   renderModelsTable();
   renderProvidersList();
   renderAdvanced();
@@ -978,11 +1042,18 @@ function updateOverview() {
   var cfg = state.raw;
   var p = cfg.provider;
   byId('summaryProviderName').textContent = p.name || p.id || '—';
-  byId('summaryModel').textContent = cfg.model || '（未指定，使用目录默认）';
-  byId('summaryContextWindow').textContent = cfg.contextWindow || '（未设置）';
+  if (cfg.model) {
+    var win = effectiveContextWindowLabel(cfg);
+    byId('summaryModel').textContent = win ? (cfg.model + ' · ' + win) : cfg.model;
+  } else {
+    byId('summaryModel').textContent = '（未指定，使用目录默认）';
+  }
+  byId('summaryProtocol').textContent = p.protocol === 'chat_completions' ? 'Chat Completions' : 'Responses';
+  byId('summaryContextBudget').textContent = isBudgetDisabled(p.contextBudget) ? '已关闭裁剪' : p.contextBudget;
+  byId('summaryProviderCount').textContent = String(1 + (cfg.providers || []).length);
   byId('summaryConfigPath').textContent = state.configPath || '—';
   byId('aboutConfigPath').textContent = state.configPath || '—';
-  byId('aggregateToggle').checked = !!cfg.aggregate;
+  byId('planHintsToggle').checked = !!cfg.planHints;
   updateLinkDiagram();
 }
 
@@ -1005,8 +1076,10 @@ function updateAggregateBadge() {
 }
 
 function renderAdvanced() {
-  byId('planHintsToggle').checked = !!state.raw.planHints;
   byId('commonConfigTextarea').value = state.raw.commonConfig || '';
+  byId('page-advanced-model-defaults-body').innerHTML =
+    fieldRow('上下文窗口', '当前默认模型若未出现在模型列表中时使用的兜底窗口大小；已登记在模型列表里的模型以各自设置为准。', textInput('active', null, 'contextWindow', state.raw.contextWindow, { mono: true, placeholder: '例如 1M' })) +
+    fieldRow('自动压缩阈值', '同上逻辑，触发自动压缩上下文的兜底 token 阈值，留空使用模型自身默认值。', textInput('active', null, 'autoCompactTokenLimit', state.raw.autoCompactTokenLimit, { mono: true, placeholder: '留空使用默认值' }));
 }
 
 /* ============ Shared field template (active provider + saved profiles) ============ */
@@ -1050,7 +1123,7 @@ function profileFieldsHtml(scope, index, obj) {
   html += '<div class="card"><div class="card-title">认证</div>' +
     fieldRow('API Key', '重新粘贴完整密钥即可更换；聚焦后会自动全选，不修改则保留现有密钥。', textInput(scope, idx, 'provider.apiKey', p.apiKey, { mono: true, apikey: true })) +
     fieldRow('环境变量名', '若填写，登录时优先从该环境变量读取密钥，忽略上面的 API Key。', textInput(scope, idx, 'provider.apiKeyEnv', p.apiKeyEnv, { mono: true, placeholder: '例如 CODEX_GATEWAY_API_KEY' })) +
-    fieldRow('转发模式', 'Mixed API 为推荐模式；Pure API 已废弃，可能覆盖 Codex 登录态。', selectInput(scope, idx, 'provider.mode', p.mode, [
+    fieldRow('转发模式', 'Mixed API 为推荐模式；Pure API 已废弃。', selectInput(scope, idx, 'provider.mode', p.mode, [
       { value: 'mixed_api', label: 'Mixed API（推荐）' },
       { value: 'pure_api', label: 'Pure API（已废弃）' }
     ])) +
@@ -1061,18 +1134,15 @@ function profileFieldsHtml(scope, index, obj) {
     '</div>';
 
   html += '<div class="card"><div class="card-title">路由参数</div>' +
-    fieldRow('上下文预算', '为上下文预留的裁剪余量，如 200K；支持 K/KB/M/MB 后缀，留空或填 off 关闭裁剪。', textInput(scope, idx, 'provider.contextBudget', p.contextBudget, { mono: true, placeholder: '例如 200K，留空关闭' })) +
-    fieldRow('模型过滤前缀', '按前缀过滤该供应商提供的模型，刷新目录时生效（非聚合模式下也生效）；逗号分隔，留空不过滤。', textInput(scope, idx, 'provider.modelFilter', modelFilterText, { mono: true, placeholder: '例如 claude, gpt-5' })) +
-    '</div>';
-
-  html += '<div class="card"><div class="card-title">模型与上下文</div>' +
-    fieldRow('模型 ID', '指定使用的模型 ID，留空则使用目录中的第一个模型。', textInput(scope, idx, 'model', obj.model, { mono: true })) +
-    fieldRow('上下文窗口', '模型的上下文窗口大小，如 1M / 200K，支持整数或 K/M 后缀。', textInput(scope, idx, 'contextWindow', obj.contextWindow, { mono: true, placeholder: '例如 1M' })) +
-    fieldRow('自动压缩阈值', '触发自动压缩上下文的 token 阈值，格式同上，留空使用模型默认值。', textInput(scope, idx, 'autoCompactTokenLimit', obj.autoCompactTokenLimit, { mono: true, placeholder: '留空使用默认值' })) +
+    fieldRow('上下文预算', '为上下文预留的裁剪余量，如 200K；留空或填 off 关闭裁剪。', textInput(scope, idx, 'provider.contextBudget', p.contextBudget, { mono: true, placeholder: '例如 200K，留空关闭' })) +
+    fieldRow('模型过滤前缀', '按前缀过滤该供应商提供的模型，刷新目录时生效；逗号分隔，留空不过滤。', textInput(scope, idx, 'provider.modelFilter', modelFilterText, { mono: true, placeholder: '例如 claude, gpt-5' })) +
     '</div>';
 
   if (scope === 'profile') {
-    html += '<div class="card"><div class="card-title">模型目录</div>' +
+    html += '<div class="card"><div class="card-title">模型与上下文</div>' +
+      fieldRow('默认模型', '指定该供应商默认使用的模型，留空则使用目录中的第一个模型。', textInput(scope, idx, 'model', obj.model, { mono: true })) +
+      fieldRow('上下文窗口', '模型的上下文窗口大小，如 1M / 200K，支持整数或 K/M 后缀。', textInput(scope, idx, 'contextWindow', obj.contextWindow, { mono: true, placeholder: '例如 1M' })) +
+      fieldRow('自动压缩阈值', '触发自动压缩上下文的 token 阈值，格式同上，留空使用模型默认值。', textInput(scope, idx, 'autoCompactTokenLimit', obj.autoCompactTokenLimit, { mono: true, placeholder: '留空使用默认值' })) +
       '<div class="card-row card-row-block"><div class="row-info"><div class="row-label">模型列表</div>' +
       '<div class="row-caption">每行一个模型，格式为「模型 ID」或「模型 ID | 上下文窗口」，例如 claude-sonnet-5 | 1M。</div></div></div>' +
       '<textarea class="field-textarea mono-input" data-scope="profile" data-index="' + idx + '" data-field="__models_text" rows="4" placeholder="claude-sonnet-5 | 1M">' + escapeHtml(modelsToText(obj.models)) + '</textarea>' +
@@ -1081,24 +1151,32 @@ function profileFieldsHtml(scope, index, obj) {
   return html;
 }
 
-function renderProviderFields() {
-  byId('page-provider-body').innerHTML = profileFieldsHtml('active', null, state.raw);
-}
-
 function renderProvidersList() {
-  var list = state.raw.providers;
+  var cfg = state.raw;
   var wrap = byId('providersList');
-  if (!list.length) {
-    wrap.innerHTML = '<div class="empty-hint">还没有已保存的供应商，点击下方"添加供应商"创建一个。</div>';
-    return;
+  byId('aggregateToggle').checked = !!cfg.aggregate;
+
+  var html = '<div class="card provider-card">' +
+    '<div class="provider-card-header"><div class="provider-card-title">' + escapeHtml(cfg.provider.name || cfg.provider.id || '未命名供应商') + '</div>' +
+    '<span class="badge-current">当前</span></div>' +
+    profileFieldsHtml('active', null, cfg) +
+    '</div>';
+
+  if (!cfg.providers.length) {
+    html += '<div class="empty-hint">还没有其他已保存的供应商，点击下方"添加供应商"创建一个。</div>';
+  } else {
+    html += cfg.providers.map(function (prof, i) {
+      return '<div class="card provider-card">' +
+        '<div class="provider-card-header"><div class="provider-card-title">' + escapeHtml(prof.provider.name || prof.provider.id || '未命名供应商') + '</div>' +
+        '<div class="provider-card-actions">' +
+        '<button class="btn btn-secondary btn-small" data-action="use-provider" data-index="' + i + '">设为当前</button>' +
+        '<button class="btn btn-danger btn-small" data-action="delete-provider" data-index="' + i + '">删除</button>' +
+        '</div></div>' +
+        profileFieldsHtml('profile', i, prof) +
+        '</div>';
+    }).join('');
   }
-  wrap.innerHTML = list.map(function (prof, i) {
-    return '<div class="card provider-card">' +
-      '<div class="provider-card-header"><div class="provider-card-title">' + escapeHtml(prof.provider.name || prof.provider.id || '未命名供应商') + '</div>' +
-      '<button class="btn btn-danger btn-small" data-action="delete-provider" data-index="' + i + '">删除</button></div>' +
-      profileFieldsHtml('profile', i, prof) +
-      '</div>';
-  }).join('');
+  wrap.innerHTML = html;
 }
 
 function renderModelsTable() {
@@ -1109,10 +1187,14 @@ function renderModelsTable() {
     return;
   }
   body.innerHTML = rows.map(function (m, i) {
+    var isDefault = !!m.id && m.id === state.raw.model;
+    var defaultBtn = isDefault
+      ? '<span class="btn btn-small btn-model-default-active" title="当前默认模型">默认</span>'
+      : '<button class="btn btn-model-default-outline btn-small" data-action="set-default-model" data-index="' + i + '">设为默认</button>';
     return '<tr>' +
       '<td><input type="text" class="field-input mono-input" data-scope="active" data-field="models.' + i + '.id" value="' + escapeHtml(m.id) + '" placeholder="模型 ID"></td>' +
       '<td><input type="text" class="field-input mono-input" data-scope="active" data-field="models.' + i + '.contextWindow" value="' + escapeHtml(m.contextWindow) + '" placeholder="如 1M"></td>' +
-      '<td><button class="btn btn-danger btn-small" data-action="delete-model" data-index="' + i + '">删除</button></td>' +
+      '<td class="models-actions-cell"><button class="btn btn-danger btn-small" data-action="delete-model" data-index="' + i + '">删除</button>' + defaultBtn + '</td>' +
       '</tr>';
   }).join('');
 }
@@ -1162,6 +1244,38 @@ function deleteProvider(i) {
   notifyChanged();
 }
 
+/* Swap a saved profile into the active slot and the previously-active
+   profile into its place (client-side only; nothing is persisted until the
+   user hits Save). Captures the current active fields into a plain object
+   *before* overwriting `state.raw.provider`/etc, then drops that snapshot
+   in place at the same `providers[i]` index so sibling entries keep their
+   order. Each side's own (possibly redacted) apiKey string travels with its
+   object unchanged; the backend save merge is responsible for recognizing a
+   redacted echo against *any* known provider, not just the one at the same
+   position, so this is safe regardless of which slot ends up where. */
+function useProvider(i) {
+  var cfg = state.raw;
+  var target = cfg.providers[i];
+  if (!target) return;
+  var activeSnapshot = {
+    provider: cfg.provider,
+    model: cfg.model,
+    models: cfg.models,
+    contextWindow: cfg.contextWindow,
+    autoCompactTokenLimit: cfg.autoCompactTokenLimit
+  };
+  cfg.provider = target.provider;
+  cfg.model = target.model;
+  cfg.models = target.models;
+  cfg.contextWindow = target.contextWindow;
+  cfg.autoCompactTokenLimit = target.autoCompactTokenLimit;
+  cfg.providers[i] = activeSnapshot;
+  renderProvidersList();
+  renderModelsTable();
+  renderAdvanced();
+  notifyChanged();
+}
+
 function addModel() {
   state.raw.models.push({ id: '', contextWindow: '' });
   renderModelsTable();
@@ -1170,6 +1284,14 @@ function addModel() {
 
 function deleteModel(i) {
   state.raw.models.splice(i, 1);
+  renderModelsTable();
+  notifyChanged();
+}
+
+function setDefaultModel(i) {
+  var row = state.raw.models[i];
+  if (!row) return;
+  state.raw.model = row.id;
   renderModelsTable();
   notifyChanged();
 }
@@ -1338,19 +1460,67 @@ function updateLogStatusDot() {
   }
 }
 
-function appendLogChunk(text) {
-  if (!text) return;
-  var container = byId('logsContent');
-  var wrapper = document.createElement('span');
-  wrapper.className = 'log-chunk';
-  wrapper.innerHTML = renderAnsiLog(text);
-  container.appendChild(wrapper);
-  logState.totalChars += text.length;
+/* Build one `.log-entry` container for a complete (or still-growing) log
+   entry's raw text. Level is inferred from the *rendered* DOM (real class
+   membership via querySelector, not a substring search over the HTML
+   string) so a log message that happens to mention "sgr-red" as plain text
+   can never be misclassified as an error entry. */
+function buildLogEntryElement(rawText) {
+  var el = document.createElement('div');
+  el.className = 'log-entry';
+  el.innerHTML = renderAnsiLog(rawText);
+  if (el.querySelector('.sgr-red')) el.classList.add('log-entry-error');
+  else if (el.querySelector('.sgr-yellow')) el.classList.add('log-entry-warn');
+  return el;
+}
+
+function trimLogEntries(container) {
   while (logState.totalChars > LOG_BUFFER_CHAR_LIMIT && container.childNodes.length > 1) {
     var first = container.firstChild;
+    if (first === logState.pendingEl) break; /* never evict the still-open tail entry */
     logState.totalChars -= (first.textContent || '').length;
     container.removeChild(first);
   }
+}
+
+/* Split the accumulated buffer on blank-line ("\n\n") entry separators.
+   Every complete part (all but the last) is finalized into its own
+   `.log-entry`; the trailing, possibly-incomplete part is kept both in
+   `logState.pendingBuffer` (prefixed onto the next chunk) and mirrored live
+   into `logState.pendingEl`, which is replaced in place as more text
+   arrives for it — so an entry never gets fractured into two visual blocks
+   at a poll boundary, and the newest lines still show up immediately
+   instead of waiting for some future entry to "close" them off. */
+function appendLogChunk(text) {
+  if (!text) return;
+  logState.totalChars += text.length;
+  var container = byId('logsContent');
+  var combined = logState.pendingBuffer + text;
+  var parts = combined.split('\n\n');
+
+  for (var i = 0; i < parts.length - 1; i++) {
+    var finished = buildLogEntryElement(parts[i]);
+    if (logState.pendingEl) {
+      container.replaceChild(finished, logState.pendingEl);
+      logState.pendingEl = null;
+    } else {
+      container.appendChild(finished);
+    }
+  }
+
+  var tail = parts[parts.length - 1];
+  logState.pendingBuffer = tail;
+  if (tail) {
+    var live = buildLogEntryElement(tail);
+    if (logState.pendingEl) {
+      container.replaceChild(live, logState.pendingEl);
+    } else {
+      container.appendChild(live);
+    }
+    logState.pendingEl = live;
+  }
+
+  trimLogEntries(container);
 }
 
 function isLogsNearBottom(el, threshold) {
@@ -1380,10 +1550,17 @@ function scrollLogsToBottom() {
 function clearLogsView() {
   byId('logsContent').innerHTML = '';
   logState.totalChars = 0;
+  logState.pendingBuffer = '';
+  logState.pendingEl = null;
 }
 
 function copyLogsToClipboard() {
-  var text = byId('logsContent').textContent || '';
+  /* Rejoin with blank lines explicitly rather than reading the container's
+     textContent directly: entries are separate DOM blocks now (the "\n\n"
+     separators themselves are consumed by the split in appendLogChunk and
+     never make it into any single entry's text), so a plain textContent
+     read would run every entry together with no blank line between them. */
+  var text = qsa('.log-entry', byId('logsContent')).map(function (el) { return el.textContent || ''; }).join('\n\n');
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(function () {
       showToast('success', '已复制到剪贴板');
@@ -1587,8 +1764,10 @@ document.addEventListener('click', function (e) {
   else if (action === 'discard') discardChanges();
   else if (action === 'add-provider') addProvider();
   else if (action === 'delete-provider') deleteProvider(Number(btn.dataset.index));
+  else if (action === 'use-provider') useProvider(Number(btn.dataset.index));
   else if (action === 'add-model') addModel();
   else if (action === 'delete-model') deleteModel(Number(btn.dataset.index));
+  else if (action === 'set-default-model') setDefaultModel(Number(btn.dataset.index));
   else if (action === 'open-update') openUpdateModal();
   else if (action === 'close-update') closeUpdateModal();
   else if (action === 'confirm-update') applyUpdate();
