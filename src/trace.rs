@@ -384,7 +384,11 @@ fn cleanup_old_full_dumps_in_dir(dir: &Path, retain_count: usize) {
 /// failures are just another upstream/environment diagnostic from the
 /// user's point of view, not a special case.
 fn log_trace_io_failure(message: &str) {
-    crate::protocol_proxy::log_upstream_event_deduped("trace_io_failure", message.to_string());
+    crate::protocol_proxy::log_upstream_event_deduped(
+        "trace_io_failure",
+        crate::protocol_proxy::LogLevel::Warn,
+        message.to_string(),
+    );
 }
 
 #[cfg(test)]

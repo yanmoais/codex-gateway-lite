@@ -6156,6 +6156,34 @@ async fn handle_protocol_proxy_connection(
         Err(error) => return Err(error),
     };
 
+    // `GET /` and `GET /ui` (the config Web UI's own page) are opened
+    // directly in a browser, which has no way to attach an Authorization
+    // header, so they're the only paths exempt from the bearer-token check
+    // below. `local_ui_page_response` enforces a Host-header loopback check
+    // in its place (see the "Config Web UI backend" section further down),
+    // so a remote page still can't read it via DNS rebinding to 127.0.0.1.
+    if request_skips_local_proxy_token_check(&request.method, &request.path) {
+        let response = local_ui_page_response(&request);
+        stream
+            .write_all(&lite_http_response_bytes(
+                &response.status,
+                &response.content_type,
+                &response.body,
+            ))
+            .await
+            .context("写入本地协议代理响应失败")?;
+        stream.shutdown().await.ok();
+        return Ok(());
+    }
+
+    // `/api/ui/*` responses never carry `Access-Control-Allow-Origin`: the
+    // config UI page is same-origin with this API and needs no CORS grant,
+    // and not sending one keeps an unrelated, CORS-enabled third-party
+    // webpage from reading config.json (API keys included, if not for the
+    // token check below) out-of-band via `fetch`. Captured before `request`
+    // is moved by value into `route_protocol_proxy_request` below.
+    let path_is_ui_api = is_ui_api_path(&request.path);
+
     // The bearer token Codex sends here is the fixed constant this agent
     // wrote into Codex's own `experimental_bearer_token`, not a real
     // upstream secret; this is a cheap guard against other local processes
@@ -6164,10 +6192,11 @@ async fn handle_protocol_proxy_connection(
     if request.method != "OPTIONS" && !request_has_valid_local_proxy_token(&request) {
         let response = local_proxy_unauthorized_response();
         stream
-            .write_all(&lite_http_response_bytes(
+            .write_all(&lite_http_response_bytes_maybe_cors(
                 &response.status,
                 &response.content_type,
                 &response.body,
+                !path_is_ui_api,
             ))
             .await
             .context("写入本地协议代理响应失败")?;
@@ -6185,10 +6214,11 @@ async fn handle_protocol_proxy_connection(
         Err(error) => protocol_proxy_error_response(&error),
     };
     stream
-        .write_all(&lite_http_response_bytes(
+        .write_all(&lite_http_response_bytes_maybe_cors(
             &response.status,
             &response.content_type,
             &response.body,
+            !path_is_ui_api,
         ))
         .await
         .context("写入本地协议代理响应失败")?;
@@ -6252,6 +6282,18 @@ fn protocol_proxy_error_is_client_disconnect(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether `handle_streaming_responses_proxy`'s 400-response fallback (strip
+/// every historical image and retry once — see that function's call site)
+/// should run for `request_model`. Native OpenAI models (see
+/// `protocol_proxy::is_native_openai_model`) are served directly by OpenAI's
+/// own backend, where a 400 is a real rejection rather than the third-party
+/// image-content-filter quirk this fallback exists to work around; silently
+/// stripping history images and retrying would just hide the actual error
+/// from Codex.
+fn should_retry_400_with_images_stripped(request_model: Option<&str>) -> bool {
+    !request_model.is_some_and(protocol_proxy::is_native_openai_model)
+}
+
 async fn handle_streaming_responses_proxy(
     mut stream: TcpStream,
     request: LiteHttpRequest,
@@ -6288,6 +6330,7 @@ async fn handle_streaming_responses_proxy(
     // everything else actually operates on).
     let request_body_len = request.body.len();
     let log_model = request_model.unwrap_or("unknown").to_string();
+    let retry_with_images_stripped_on_400 = should_retry_400_with_images_stripped(request_model);
     let log_session = protocol_proxy::resolve_session_label(&request_json);
 
     protocol_proxy::with_request_log_context(log_model, log_session, async move {
@@ -6349,12 +6392,13 @@ async fn handle_streaming_responses_proxy(
     // historical image replaced by a text placeholder so the turn survives
     // as text-only instead of looping Codex-side retries against a
     // deterministic 400.
-    if upstream.status_code == 400 {
+    if upstream.status_code == 400 && retry_with_images_stripped_on_400 {
         let mut retry_json = request_json.clone();
         let stripped = protocol_proxy::strip_all_input_images(&mut retry_json);
         if stripped > 0 {
             protocol_proxy::log_upstream_event_deduped(
                 "responses_image_reject_retry",
+                protocol_proxy::LogLevel::Warn,
                 format!(
                     "上游拒绝了带图请求（HTTP 400），已移除 {stripped} 张历史图片后自动重试一次（可能是上游图片内容审核或体积限制）"
                 ),
@@ -6431,6 +6475,7 @@ async fn handle_streaming_responses_proxy(
                     let message = format!("Responses 上游流中断: {error}");
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_interrupted",
+                        protocol_proxy::LogLevel::Error,
                         message.clone(),
                     );
                     let error_frame = protocol_proxy::responses_passthrough_failure_sse(
@@ -6447,6 +6492,7 @@ async fn handle_streaming_responses_proxy(
                     );
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_idle_timeout",
+                        protocol_proxy::LogLevel::Error,
                         message.clone(),
                     );
                     let error_frame = protocol_proxy::responses_passthrough_failure_sse(
@@ -6696,6 +6742,15 @@ async fn route_protocol_proxy_request(
             content_type: "text/plain; charset=utf-8".to_string(),
             body: Vec::new(),
         });
+    }
+
+    // Config Web UI JSON API: dispatched before the config/upstream loading
+    // below (which `bail!`s on a broken/missing config.json) so the page,
+    // its version/update endpoints, and the config editor's own GET can all
+    // still work even when config.json is currently broken — letting the
+    // user fix it through the browser instead of only by hand.
+    if is_ui_api_path(&request.path) {
+        return handle_ui_api_request(request, config_path).await;
     }
 
     let config = read_lite_config(config_path)?;
@@ -6955,8 +7010,30 @@ fn find_http_header_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn lite_http_response_bytes(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    lite_http_response_bytes_maybe_cors(status, content_type, body, true)
+}
+
+/// Core of `lite_http_response_bytes`, with the CORS grant made optional.
+/// `/api/ui/*` responses go through this with `cors: false` (see the
+/// `path_is_ui_api` gating in `handle_protocol_proxy_connection`) so the
+/// config Web UI's API never advertises itself as fetchable from another
+/// origin — it's same-origin with the page that calls it and has no need
+/// for CORS at all, unlike the model/responses/chat-completions proxy
+/// routes above, which intentionally stay CORS-open for third-party
+/// browser-based tooling.
+fn lite_http_response_bytes_maybe_cors(
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    cors: bool,
+) -> Vec<u8> {
+    let cors_headers = if cors {
+        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n"
+    } else {
+        ""
+    };
     let headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
         body.len()
     );
     let mut response = headers.into_bytes();
@@ -6990,6 +7067,7 @@ fn protocol_proxy_error_response(error: &anyhow::Error) -> protocol_proxy::Proxy
     // attempt actually failed.
     protocol_proxy::log_upstream_event_deduped(
         "local_proxy_error",
+        protocol_proxy::LogLevel::Error,
         format!("本地代理处理请求失败：{error:#}"),
     );
     protocol_proxy::ProxyHttpResponse {
@@ -7003,6 +7081,1008 @@ fn protocol_proxy_error_response(error: &anyhow::Error) -> protocol_proxy::Proxy
         }))
         .unwrap_or_default(),
     }
+}
+
+// ---------------------------------------------------------------------
+// Config Web UI backend. A same-origin browser page served at `GET /` and
+// `GET /ui`, plus a small JSON API under `/api/ui/*` for viewing/editing
+// config.json, reporting the running build's version, pulling +
+// fast-forwarding local git state, tailing the agent's own terminal log
+// (`/api/ui/logs`, see `handle_ui_logs_get`), and triggering a full
+// rebuild-and-restart of the agent (`/api/ui/restart`, see
+// `handle_ui_restart_post`) — all served by the same hand-rolled HTTP
+// server as the protocol proxy above, on the same 127.0.0.1:57321 port.
+//
+// Security model: the page paths (`/`, `/ui`) skip the bearer-token check
+// in `handle_protocol_proxy_connection` (a browser navigating there has no
+// way to attach an Authorization header) and instead rely on
+// `request_host_is_loopback` to reject anything whose `Host` header isn't
+// literally a loopback address — the standard defense against DNS
+// rebinding, where an attacker-controlled domain resolves to 127.0.0.1 so a
+// victim's browser treats a request to it as "same machine" while the
+// attacker still fully controls everything about the request except that
+// one header. Every `/api/ui/*` route keeps the existing bearer-token
+// check (it's simply never added to the bypass set) *and* re-validates the
+// Host header itself, and never sends `Access-Control-Allow-Origin` (see
+// `lite_http_response_bytes_maybe_cors`), so even a same-machine, CORS
+// enabled webpage can't read config.json (API keys included) via `fetch`.
+// The same model applies to `/api/ui/logs` (would otherwise leak whatever
+// happens to be in the terminal log) and `/api/ui/restart` (would
+// otherwise let any page on the same machine force a rebuild+restart).
+// ---------------------------------------------------------------------
+
+/// The Web UI's single-file frontend (built alongside this backend, as its
+/// own separate piece of work). Kept as a template with `__CGL_TOKEN__` /
+/// `__CGL_VERSION__` placeholders substituted per-request in
+/// `local_ui_page_response`, so neither the token nor the version has to be
+/// baked in at compile time.
+const UI_INDEX_HTML_TEMPLATE: &str = include_str!("ui/index.html");
+
+/// Build-time git metadata stamped by `build.rs` (`CGL_GIT_HASH` falls back
+/// to `"dev"` and `CGL_GIT_DATE` to `""` when git isn't available at build
+/// time, e.g. a source tarball with no `.git` directory) rendered as the
+/// single version string shown in the Web UI and returned by
+/// `/api/ui/version`, e.g. `032b6c4 (2026-07-15)`.
+fn ui_version_string() -> String {
+    let hash = env!("CGL_GIT_HASH");
+    let date = env!("CGL_GIT_DATE");
+    if date.is_empty() {
+        hash.to_string()
+    } else {
+        format!("{hash} ({date})")
+    }
+}
+
+/// Strip a `?query` suffix the same way the protocol-proxy path matchers in
+/// `protocol_proxy.rs` do (`is_responses_proxy_path` and friends), so e.g.
+/// `/ui?foo=bar` still matches like a bare `/ui`.
+fn strip_query_string(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(path, _)| path)
+}
+
+/// `GET /` and `GET /ui`: the config Web UI's own page.
+fn is_local_ui_page_path(path: &str) -> bool {
+    matches!(strip_query_string(path), "/" | "/ui")
+}
+
+/// This feature's own JSON API routes (`/api/ui/*`). Always requires the
+/// bearer token, same as every other proxy route — only the two page paths
+/// above skip it.
+fn is_ui_api_path(path: &str) -> bool {
+    strip_query_string(path).starts_with("/api/ui/")
+}
+
+/// Whether `request` should bypass the local-proxy bearer-token check in
+/// `handle_protocol_proxy_connection` entirely. Only `GET /` and `GET /ui`
+/// qualify — every other path, including all of `/api/ui/*`, still requires
+/// the token like any other proxy endpoint.
+fn request_skips_local_proxy_token_check(method: &str, path: &str) -> bool {
+    method == "GET" && is_local_ui_page_path(path)
+}
+
+/// Extract just the hostname portion of a `Host` header value, discarding
+/// any `:port` suffix. Handles bracketed IPv6 (`[::1]`, `[::1]:port`) and
+/// the bare literal `::1` (whose colons are not a port separator) as
+/// special cases before falling back to the plain `host:port` / `host`
+/// forms used by IPv4 addresses and hostnames — a naive "split on the last
+/// colon" would otherwise mangle a bare `::1` into a bogus host.
+fn host_header_hostname(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        return rest.split_once(']').map_or(value, |(host, _)| host);
+    }
+    if value == "::1" {
+        return value;
+    }
+    value.rsplit_once(':').map_or(value, |(host, _)| host)
+}
+
+/// Whether `host` (already stripped of any port by `host_header_hostname`)
+/// names one of this proxy's own loopback addresses. Anything else — a real
+/// domain name, a LAN IP, `0.0.0.0`, etc. — fails closed: a `Host` value a
+/// browser wouldn't send on its own is exactly the DNS-rebinding shape this
+/// check exists to catch, and an attacker page can't make the browser send
+/// a `Host` header literally spelling out a loopback address.
+fn is_loopback_hostname(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+/// Validate the `Host` header on a config-UI request (both the page and the
+/// JSON API) names loopback. Missing header fails closed.
+fn request_host_is_loopback(request: &LiteHttpRequest) -> bool {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .is_some_and(|(_, value)| is_loopback_hostname(host_header_hostname(value)))
+}
+
+fn forbidden_response(message: &str) -> protocol_proxy::ProxyHttpResponse {
+    protocol_proxy::ProxyHttpResponse {
+        status: "403 Forbidden".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(&json!({
+            "error": { "message": message, "type": "forbidden" }
+        }))
+        .unwrap_or_default(),
+    }
+}
+
+fn bad_request_response(message: &str) -> protocol_proxy::ProxyHttpResponse {
+    protocol_proxy::ProxyHttpResponse {
+        status: "400 Bad Request".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(&json!({
+            "error": { "message": message, "type": "bad_request" }
+        }))
+        .unwrap_or_default(),
+    }
+}
+
+fn ui_api_not_found_response(path: &str) -> protocol_proxy::ProxyHttpResponse {
+    protocol_proxy::ProxyHttpResponse {
+        status: "404 Not Found".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(&json!({
+            "error": {
+                "message": format!("unsupported proxy path: {path}"),
+                "type": "not_found"
+            }
+        }))
+        .unwrap_or_default(),
+    }
+}
+
+fn ui_api_json_response(body: &Value) -> protocol_proxy::ProxyHttpResponse {
+    protocol_proxy::ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(body).unwrap_or_default(),
+    }
+}
+
+/// Serve the config Web UI's own page for `GET /` and `GET /ui`. This is
+/// the one route in the whole proxy that carries no bearer token, so it
+/// must do its own Host-header loopback check instead of relying on the
+/// token to keep remote requests out.
+fn local_ui_page_response(request: &LiteHttpRequest) -> protocol_proxy::ProxyHttpResponse {
+    if !request_host_is_loopback(request) {
+        return forbidden_response("Host 头不是本机回环地址，已拒绝访问配置页面");
+    }
+    let body = UI_INDEX_HTML_TEMPLATE
+        .replace("__CGL_TOKEN__", local_proxy_codex_bearer_token())
+        .replace("__CGL_VERSION__", &ui_version_string());
+    protocol_proxy::ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "text/html; charset=utf-8".to_string(),
+        body: body.into_bytes(),
+    }
+}
+
+/// Dispatch every `/api/ui/*` JSON route. The bearer-token check has
+/// already passed by the time a request reaches here (see
+/// `request_skips_local_proxy_token_check` — these paths are never in the
+/// bypass set), so this only adds the Host-header loopback check on top:
+/// defense in depth given this API can read/write config.json (API keys
+/// included) and can pull + reset local git state.
+async fn handle_ui_api_request(
+    request: LiteHttpRequest,
+    config_path: &Path,
+) -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    if !request_host_is_loopback(&request) {
+        return Ok(forbidden_response("Host 头不是本机回环地址，已拒绝访问"));
+    }
+    let path = strip_query_string(&request.path).to_string();
+    match path.as_str() {
+        "/api/ui/config" => match request.method.as_str() {
+            "GET" => handle_ui_config_get(config_path),
+            "POST" => handle_ui_config_post(&request.body, config_path),
+            _ => Ok(method_not_allowed_response()),
+        },
+        "/api/ui/version" => match request.method.as_str() {
+            "GET" => Ok(handle_ui_version_get()),
+            _ => Ok(method_not_allowed_response()),
+        },
+        "/api/ui/update/check" => match request.method.as_str() {
+            "POST" => handle_ui_update_check().await,
+            _ => Ok(method_not_allowed_response()),
+        },
+        "/api/ui/update/apply" => match request.method.as_str() {
+            "POST" => handle_ui_update_apply().await,
+            _ => Ok(method_not_allowed_response()),
+        },
+        "/api/ui/logs" => match request.method.as_str() {
+            "GET" => handle_ui_logs_get(&request.path).await,
+            _ => Ok(method_not_allowed_response()),
+        },
+        "/api/ui/restart" => match request.method.as_str() {
+            "POST" => handle_ui_restart_post().await,
+            _ => Ok(method_not_allowed_response()),
+        },
+        _ => Ok(ui_api_not_found_response(&request.path)),
+    }
+}
+
+/// Mask an API key for display: empty stays empty (nothing to hide), a key
+/// shorter than 14 characters is too short for a partial reveal to hide
+/// anything meaningful so it's fully replaced, and everything else keeps
+/// its first 7 and last 4 characters (enough to recognize *which* key it is
+/// at a glance) with the middle collapsed into a single ellipsis.
+fn redact_api_key(key: &str) -> String {
+    if key.is_empty() {
+        String::new()
+    } else if key.chars().count() < 14 {
+        "•••".to_string()
+    } else {
+        let chars: Vec<char> = key.chars().collect();
+        let prefix: String = chars[..7].iter().collect();
+        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        format!("{prefix}…{suffix}")
+    }
+}
+
+/// Mask every `apiKey` field in `config` (the active provider's own key and
+/// every saved profile's key under `providers[]`) before it's ever sent to
+/// the browser. The JSON shape is otherwise unchanged, so the frontend can
+/// render this exactly like the real config.
+fn redact_lite_config_api_keys(config: &LiteConfig) -> LiteConfig {
+    let mut redacted = config.clone();
+    redacted.provider.api_key = redact_api_key(&redacted.provider.api_key);
+    for profile in &mut redacted.providers {
+        profile.provider.api_key = redact_api_key(&profile.provider.api_key);
+    }
+    redacted
+}
+
+/// One field's worth of `merge_submitted_lite_config`'s rule: keep `current`
+/// when `submitted` is empty or is exactly what `redact_api_key(current)`
+/// would display (i.e. the browser just echoed back what `GET
+/// /api/ui/config` showed it, unedited); otherwise `submitted` is a
+/// deliberate edit and replaces it.
+fn merge_submitted_api_key(submitted: &str, current: &str) -> String {
+    if submitted.is_empty() || submitted == redact_api_key(current) {
+        current.to_string()
+    } else {
+        submitted.to_string()
+    }
+}
+
+/// Merge a POSTed config (from the browser) with what's currently on disk:
+/// every `apiKey` field gets `merge_submitted_api_key`'s treatment, so
+/// leaving a key untouched in the UI never blanks it out and never requires
+/// the browser to round-trip the real plaintext secret just to leave it
+/// alone. Saved profiles in `providers[]` are matched to their current
+/// counterpart by `id` (sanitized the same way `switch_active_provider`
+/// does); an id with no current match — a brand new profile, or one whose
+/// id itself just changed — has nothing to preserve, so its submitted key
+/// is used as-is.
+fn merge_submitted_lite_config(submitted: LiteConfig, current: &LiteConfig) -> LiteConfig {
+    let mut merged = submitted;
+    merged.provider.api_key =
+        merge_submitted_api_key(&merged.provider.api_key, &current.provider.api_key);
+    for profile in &mut merged.providers {
+        let current_key = current
+            .providers
+            .iter()
+            .find(|candidate| {
+                sanitize_provider_id(&candidate.provider.id)
+                    == sanitize_provider_id(&profile.provider.id)
+            })
+            .map(|candidate| candidate.provider.api_key.as_str())
+            .unwrap_or("");
+        profile.provider.api_key = merge_submitted_api_key(&profile.provider.api_key, current_key);
+    }
+    merged
+}
+
+fn handle_ui_config_get(config_path: &Path) -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let config = read_lite_config(config_path)?;
+    let redacted = redact_lite_config_api_keys(&config);
+    let body = serde_json::to_vec(&json!({
+        "config": redacted,
+        "configPath": config_path.display().to_string(),
+        "version": ui_version_string(),
+    }))?;
+    Ok(protocol_proxy::ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body,
+    })
+}
+
+fn handle_ui_config_post(
+    body: &str,
+    config_path: &Path,
+) -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let submitted: LiteConfig = match serde_json::from_str(body) {
+        Ok(config) => config,
+        Err(error) => {
+            return Ok(bad_request_response(&format!(
+                "请求体不是合法的配置 JSON：{error}"
+            )));
+        }
+    };
+    let current = read_lite_config(config_path)?;
+    // Deliberately NOT calling `validate_config` here: on top of serde's
+    // structural check above, it also does semantic checks (non-empty
+    // models list, a resolved API key via `apiKeyEnv`, ...) that would (a)
+    // reject a config the user might be mid-way through fixing across
+    // multiple saves, and (b) resolve `apiKeyEnv` against *this server
+    // process's* environment, which can differ from Codex's own process
+    // environment at actual request time. Structural validity is all this
+    // endpoint promises.
+    let merged = merge_submitted_lite_config(submitted, &current);
+    let backup_path = write_lite_config_from_ui(config_path, &merged)?;
+    let body = serde_json::to_vec(&json!({
+        "ok": true,
+        "backupPath": backup_path,
+        "message": "配置已保存，重启 Codex Gateway Lite 后生效",
+    }))?;
+    Ok(protocol_proxy::ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body,
+    })
+}
+
+/// Persist a UI-submitted config: back up whatever's on disk first (so a
+/// bad save is always one file copy away from undoing), then replace
+/// config.json with an atomic write (temp file + rename, so a crash or a
+/// concurrent read mid-write never observes a half-written file) matching
+/// its existing 0600 permissions.
+fn write_lite_config_from_ui(config_path: &Path, config: &LiteConfig) -> anyhow::Result<String> {
+    let backup_path = backup_lite_config_for_ui(config_path)?;
+    let contents = serde_json::to_string_pretty(config).context("序列化配置失败")?;
+    let extension = config_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("json");
+    let temp_path = config_path.with_extension(format!("{extension}.tmp-ui"));
+    fs::write(&temp_path, format!("{contents}\n"))
+        .with_context(|| format!("写入临时配置失败：{}", temp_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("设置临时配置权限失败：{}", temp_path.display()))?;
+    }
+    fs::rename(&temp_path, config_path).with_context(|| {
+        format!(
+            "替换配置失败：{} -> {}",
+            temp_path.display(),
+            config_path.display()
+        )
+    })?;
+    Ok(backup_path)
+}
+
+/// Copy the existing config.json to `config.json.bak-ui-<unix-seconds>`
+/// alongside it, matching its 0600 permissions, before a UI save overwrites
+/// it.
+fn backup_lite_config_for_ui(config_path: &Path) -> anyhow::Result<String> {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let extension = config_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("json");
+    let backup_path = config_path.with_extension(format!("{extension}.bak-ui-{timestamp}"));
+    fs::copy(config_path, &backup_path).with_context(|| {
+        format!(
+            "备份配置失败：{} -> {}",
+            config_path.display(),
+            backup_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("设置备份配置权限失败：{}", backup_path.display()))?;
+    }
+    Ok(backup_path.to_string_lossy().to_string())
+}
+
+fn handle_ui_version_get() -> protocol_proxy::ProxyHttpResponse {
+    ui_api_json_response(&json!({
+        "version": ui_version_string(),
+        "hash": env!("CGL_GIT_HASH"),
+        "date": env!("CGL_GIT_DATE"),
+    }))
+}
+
+/// Pure path arithmetic behind `project_root_from_running_exe`: a release
+/// build's executable lives at `<root>/target/release/<exe>`, so the root
+/// is three directory levels up from the executable file itself (exe file
+/// -> `release`/`debug` dir -> `target` dir -> project root).
+fn project_root_from_exe_path(exe: &Path) -> Option<PathBuf> {
+    Some(exe.parent()?.parent()?.parent()?.to_path_buf())
+}
+
+/// Locate the project's own git checkout from the running binary's path.
+/// Returns `None` if the computed root doesn't actually contain a `.git`
+/// directory, so a moved or packaged binary (release archive, `cargo
+/// install`, ...) fails cleanly instead of reporting on some unrelated
+/// directory.
+fn project_root_from_running_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let root = project_root_from_exe_path(&exe)?;
+    if root.join(".git").is_dir() {
+        Some(root)
+    } else {
+        None
+    }
+}
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const GIT_UPDATE_LOG_MAX_COMMITS: usize = 10;
+const GIT_ERROR_MAX_CHARS: usize = 2000;
+
+/// Run `program args...` inside `cwd` with a hard wall-clock timeout,
+/// killing the child and returning an error if it's still running once the
+/// timeout elapses. `std::process::Command` has no built-in timeout, so
+/// this polls `try_wait` in a short sleep loop instead of spinning up a
+/// dedicated reader thread — simpler, and just as safe to call
+/// `wait_with_output` on afterward (a `try_wait` that already observed exit
+/// doesn't make a later wait error out).
+///
+/// Both git-backed callers (`update/check`, `update/apply`) run this inside
+/// `tokio::task::spawn_blocking`, since every operation in here (spawn,
+/// `try_wait`, `wait_with_output`) is a blocking syscall that would
+/// otherwise stall a tokio worker thread for up to the whole timeout.
+fn run_command_with_timeout(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("启动 {program} {} 失败", args.join(" ")))?;
+
+    let start = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("等待 {program} {} 状态失败", args.join(" ")))?
+        {
+            Some(_status) => {
+                return child
+                    .wait_with_output()
+                    .with_context(|| format!("读取 {program} {} 输出失败", args.join(" ")));
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "{program} {} 超过 {}s 未完成，已终止",
+                        args.join(" "),
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Keep error text sent to the browser from ballooning if a subprocess ever
+/// dumps something huge to stderr (a verbose proxy/TLS failure, say).
+fn truncate_for_response(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}...（已截断）")
+    }
+}
+
+async fn handle_ui_update_check() -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let Some(root) = project_root_from_running_exe() else {
+        return Ok(ui_api_json_response(
+            &json!({ "ok": false, "error": "未找到 git 仓库" }),
+        ));
+    };
+    let body = tokio::task::spawn_blocking(move || ui_update_check_body(&root))
+        .await
+        .context("update/check 后台任务失败")?;
+    Ok(ui_api_json_response(&body))
+}
+
+/// Blocking half of `/api/ui/update/check`: `git fetch origin main`
+/// (refreshing what `origin/main` points at), then compare it against
+/// `HEAD` — how many commits behind, and a short log of them. Every failure
+/// path here returns `{"ok": false, "error": ...}` instead of propagating
+/// an `Err`, since "fetch failed" / "not a git repo" are expected,
+/// user-facing outcomes, not proxy malfunctions.
+fn ui_update_check_body(root: &Path) -> Value {
+    if let Err(message) = git_fetch_origin_main(root) {
+        return json!({ "ok": false, "error": message });
+    }
+    match git_update_status(root) {
+        Ok((behind, commits, current)) => json!({
+            "ok": true,
+            "behind": behind,
+            "commits": commits,
+            "current": current,
+        }),
+        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+/// `git fetch origin main` with the 60s hard timeout, returning a
+/// user-facing (truncated) error string on failure instead of propagating.
+fn git_fetch_origin_main(root: &Path) -> Result<(), String> {
+    match run_command_with_timeout(
+        root,
+        "git",
+        &["fetch", "origin", "main"],
+        GIT_COMMAND_TIMEOUT,
+    ) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(truncate_for_response(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            GIT_ERROR_MAX_CHARS,
+        )),
+        Err(error) => Err(truncate_for_response(
+            &error.to_string(),
+            GIT_ERROR_MAX_CHARS,
+        )),
+    }
+}
+
+/// How far `HEAD` is behind `origin/main` after a fetch, a short log of the
+/// missing commits, and `HEAD`'s own short hash.
+fn git_update_status(root: &Path) -> anyhow::Result<(u64, Vec<String>, String)> {
+    let behind_output = run_command_with_timeout(
+        root,
+        "git",
+        &["rev-list", "--count", "HEAD..origin/main"],
+        GIT_COMMAND_TIMEOUT,
+    )?;
+    if !behind_output.status.success() {
+        bail!(
+            "git rev-list 失败：{}",
+            String::from_utf8_lossy(&behind_output.stderr).trim()
+        );
+    }
+    let behind: u64 = String::from_utf8_lossy(&behind_output.stdout)
+        .trim()
+        .parse()
+        .context("解析 git rev-list 输出失败")?;
+
+    let max_count_arg = format!("--max-count={GIT_UPDATE_LOG_MAX_COMMITS}");
+    let log_output = run_command_with_timeout(
+        root,
+        "git",
+        &["log", "HEAD..origin/main", "--oneline", &max_count_arg],
+        GIT_COMMAND_TIMEOUT,
+    )?;
+    if !log_output.status.success() {
+        bail!(
+            "git log 失败：{}",
+            String::from_utf8_lossy(&log_output.stderr).trim()
+        );
+    }
+    let commits = String::from_utf8_lossy(&log_output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+
+    let current = git_short_head(root)?;
+    Ok((behind, commits, current))
+}
+
+fn git_short_head(root: &Path) -> anyhow::Result<String> {
+    let output = run_command_with_timeout(
+        root,
+        "git",
+        &["rev-parse", "--short", "HEAD"],
+        GIT_COMMAND_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn handle_ui_update_apply() -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let Some(root) = project_root_from_running_exe() else {
+        return Ok(ui_api_json_response(
+            &json!({ "ok": false, "error": "未找到 git 仓库" }),
+        ));
+    };
+    let body = tokio::task::spawn_blocking(move || ui_update_apply_body(&root))
+        .await
+        .context("update/apply 后台任务失败")?;
+    Ok(ui_api_json_response(&body))
+}
+
+/// Blocking half of `/api/ui/update/apply`: `git pull --ff-only origin
+/// main`. `--ff-only` refuses to create a merge commit or touch anything if
+/// the local branch has diverged (e.g. uncommitted local edits blocking a
+/// fast-forward), so this can never silently discard local state — any
+/// failure just passes git's own message straight back to the browser.
+fn ui_update_apply_body(root: &Path) -> Value {
+    let output = match run_command_with_timeout(
+        root,
+        "git",
+        &["pull", "--ff-only", "origin", "main"],
+        GIT_COMMAND_TIMEOUT,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": truncate_for_response(&error.to_string(), GIT_ERROR_MAX_CHARS),
+            });
+        }
+    };
+    if !output.status.success() {
+        return json!({
+            "ok": false,
+            "error": truncate_for_response(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                GIT_ERROR_MAX_CHARS,
+            ),
+        });
+    }
+    match git_short_head(root) {
+        Ok(hash) => json!({
+            "ok": true,
+            "message": format!(
+                "代码已更新到 {hash}，下次重启 Codex Gateway Lite 时会自动重新编译并生效"
+            ),
+        }),
+        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+// ---------------------------------------------------------------------
+// `/api/ui/logs` — incremental tail of `agent.terminal.log` for the Web
+// UI's live log viewer — and `/api/ui/restart` — trigger a full
+// rebuild-and-restart of the agent from the browser. Both reuse the same
+// auth/dispatch pattern as every other `/api/ui/*` route: the bearer token
+// is already checked by the time either handler runs, `handle_ui_api_request`
+// re-checks the Host header for loopback, and responses never carry a CORS
+// header (see the doc comment above this whole `/api/ui/*` section).
+// ---------------------------------------------------------------------
+
+/// Where the launch script (`Codex Gateway Lite.command`, in both its
+/// `--foreground` `tee -a` branch and its default background-child branch)
+/// accumulates `agent` stdout/stderr: `~/.codex-gateway-lite/agent.terminal.log`,
+/// alongside `config.json` / `agent.lock` (see `default_user_config_path`,
+/// `agent_lock_path`). This process only ever reads it — the launch script
+/// owns writing to it and rotating it (5MB threshold, two-generation
+/// rotation to `agent.terminal.log.1`).
+fn agent_terminal_log_path() -> PathBuf {
+    user_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex-gateway-lite")
+        .join("agent.terminal.log")
+}
+
+/// Size of the "fresh tail" window used whenever there's no usable offset
+/// to resume from (see `tail_window`). 64KB is generous for a
+/// terminal-style diagnostic log while staying cheap to read and to render
+/// in a browser tab.
+const LOG_TAIL_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Cap on `content` size for one incremental read (see `tail_window`'s
+/// `else` branch), so a client that hasn't polled in a while (backgrounded
+/// tab, laptop asleep) can't force a single response to carry an unbounded
+/// amount of catch-up data — it gets this much per response and, since the
+/// returned `offset` then lands short of the file's actual size, is
+/// expected to poll again immediately for the rest.
+const LOG_INCREMENTAL_MAX_BYTES: u64 = 256 * 1024;
+
+/// Whether `tail_window` should take its "fresh tail" branch: there is no
+/// usable offset to resume from. This covers both a genuine absence of one
+/// (`requested_offset == 0` — also what the caller uses for "no `?offset=`
+/// query param at all") and a stale offset left over from before the log
+/// was rotated or replaced out from under the client
+/// (`requested_offset > file_len`) — the launch script's 5MB rotation does
+/// exactly this: it moves the whole file to `.1` and starts a new, much
+/// shorter one, so a client still holding yesterday's large offset would
+/// otherwise try to read from a position past the end of the brand new
+/// file.
+fn logs_is_tail_read(file_len: u64, requested_offset: u64) -> bool {
+    requested_offset == 0 || requested_offset > file_len
+}
+
+/// Pure decision behind `GET /api/ui/logs?offset=N`, factored out so it's
+/// unit-testable without touching the filesystem: given the log file's
+/// current size and the offset the frontend last saw, decide where to
+/// start reading and whether this response counts as "truncated".
+///
+/// Fresh tail (`logs_is_tail_read`): start `LOG_TAIL_WINDOW_BYTES` back
+/// from the end (or the very beginning, via `saturating_sub`, if the whole
+/// file is smaller than that). Always reported as `truncated` — even on
+/// the rare response that happens to cover the entire file — because this
+/// branch's contract is "a recent snapshot", never "guaranteed complete
+/// since byte 0"; the caller should treat the returned `offset` (the
+/// file's current size) purely as a resume point for the *next* poll, not
+/// as proof nothing came before it.
+///
+/// Incremental continuation (`0 < requested_offset <= file_len`): start
+/// exactly at `requested_offset`. `truncated` is true iff the file has
+/// grown more than `LOG_INCREMENTAL_MAX_BYTES` past that offset, meaning
+/// the read this drives will be capped and the caller should poll again
+/// immediately rather than wait for its next regular interval.
+fn tail_window(file_len: u64, requested_offset: u64) -> (u64, bool) {
+    if logs_is_tail_read(file_len, requested_offset) {
+        (file_len.saturating_sub(LOG_TAIL_WINDOW_BYTES), true)
+    } else {
+        let remaining = file_len - requested_offset;
+        (requested_offset, remaining > LOG_INCREMENTAL_MAX_BYTES)
+    }
+}
+
+/// Trim a freshly read tail-window buffer down to a line boundary at its
+/// front, dropping whatever partial line the byte-counted `start` landed
+/// in the middle of. `start == 0` is exempt: the true beginning of the
+/// file is trivially already a line boundary, nothing to trim. If the
+/// buffer has no `\n` at all (a single line wider than the whole tail
+/// window — pathological, but not impossible), there's no boundary to cut
+/// at, so the buffer is returned whole rather than discarded; a UTF-8
+/// character straddling the very front of that fallback case is exactly
+/// what `ui_logs_get_body`'s `String::from_utf8_lossy` tolerates.
+fn align_tail_start(buffer: &[u8], start: u64) -> &[u8] {
+    if start == 0 {
+        return buffer;
+    }
+    match buffer.iter().position(|&byte| byte == b'\n') {
+        Some(index) => &buffer[index + 1..],
+        None => buffer,
+    }
+}
+
+/// Trim a capped incremental-read buffer down to a line boundary at its
+/// end, so a response cut off before reaching end-of-file never hands back
+/// half of a trailing line — the client's next request then resumes
+/// exactly at that boundary instead of mid-line. When the read actually
+/// reached end-of-file (`reached_eof`), no trimming happens: a
+/// half-written trailing line there is just the live tail of a file the
+/// agent is still appending to, and the next poll picks up the rest
+/// naturally. If the buffer has no `\n` at all despite being capped (one
+/// line wider than the whole `LOG_INCREMENTAL_MAX_BYTES` window), there's
+/// no boundary to cut at, so it's returned whole — better to occasionally
+/// split a pathological line than to wedge the offset in place forever.
+fn align_incremental_end(buffer: &[u8], reached_eof: bool) -> usize {
+    if reached_eof {
+        return buffer.len();
+    }
+    match buffer.iter().rposition(|&byte| byte == b'\n') {
+        Some(index) => index + 1,
+        None => buffer.len(),
+    }
+}
+
+/// Read the half-open byte range `[start, end)` out of `path`. Uses
+/// `Read::take` + `read_to_end` rather than `read_exact` so a file that
+/// shrank (rotated or truncated) between the caller's `fs::metadata` call
+/// and this read just yields fewer bytes than requested instead of
+/// erroring — there is no lock coordinating this read with the launch
+/// script's rotation, so "best effort, short read is fine" is simpler and
+/// safer than trying to make the two atomic with each other.
+fn read_log_window(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// The shared "nothing to show" response for both "the log file doesn't
+/// exist yet" (agent never started under this user) and "raced with a
+/// rotation between `fs::metadata` and the actual read" (treated as
+/// transient: the next poll a moment later sees the post-rotation file
+/// cleanly).
+fn empty_logs_response() -> Value {
+    json!({
+        "ok": true,
+        "content": "",
+        "offset": 0,
+        "size": 0,
+        "truncated": false,
+    })
+}
+
+/// Blocking half of `GET /api/ui/logs`: stats the log file, runs it
+/// through `tail_window` to decide the byte range, reads that range, and
+/// line-aligns it with `align_tail_start` / `align_incremental_end`. Runs
+/// inside `tokio::task::spawn_blocking` (see `handle_ui_logs_get`) since
+/// every step here — `fs::metadata`, `fs::File::open`, `seek`, `read` — is
+/// a blocking syscall.
+fn ui_logs_get_body(log_path: &Path, requested_offset: u64) -> Value {
+    let file_len = match fs::metadata(log_path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return empty_logs_response(),
+    };
+    let is_tail_read = logs_is_tail_read(file_len, requested_offset);
+    let (start, truncated) = tail_window(file_len, requested_offset);
+    let end = if is_tail_read {
+        file_len
+    } else {
+        file_len.min(start + LOG_INCREMENTAL_MAX_BYTES)
+    };
+    let buffer = match read_log_window(log_path, start, end) {
+        Ok(buffer) => buffer,
+        Err(_) => return empty_logs_response(),
+    };
+    if is_tail_read {
+        let content = align_tail_start(&buffer, start);
+        json!({
+            "ok": true,
+            "content": String::from_utf8_lossy(content),
+            "offset": file_len,
+            "size": file_len,
+            "truncated": truncated,
+        })
+    } else {
+        let reached_eof = end == file_len;
+        let trimmed_len = align_incremental_end(&buffer, reached_eof);
+        json!({
+            "ok": true,
+            "content": String::from_utf8_lossy(&buffer[..trimmed_len]),
+            "offset": start + trimmed_len as u64,
+            "size": file_len,
+            "truncated": truncated,
+        })
+    }
+}
+
+/// Parse one `key=value` pair's value as `u64` out of a request path that
+/// may carry a `?query` string, e.g. `offset` out of
+/// `/api/ui/logs?offset=123`. `None` covers every "not usable" case alike
+/// — no `?` at all, the key missing, an empty value, or a value that
+/// doesn't parse as `u64` (negative, non-numeric, overflowing) — so the
+/// caller can just `.unwrap_or(0)` and land on this endpoint's documented
+/// "no offset / offset=0" behavior without checking each failure mode
+/// separately. No percent-decoding: query values here are always plain
+/// decimal digits, matching how `strip_query_string` and every other
+/// caller in this file already treats query strings as opaque ASCII.
+fn query_param_u64(path: &str, key: &str) -> Option<u64> {
+    let (_, query) = path.split_once('?')?;
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+}
+
+async fn handle_ui_logs_get(path: &str) -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let requested_offset = query_param_u64(path, "offset").unwrap_or(0);
+    let body = tokio::task::spawn_blocking(move || {
+        ui_logs_get_body(&agent_terminal_log_path(), requested_offset)
+    })
+    .await
+    .context("logs 后台任务失败")?;
+    Ok(ui_api_json_response(&body))
+}
+
+/// Confirm `root` is actually a checkout `/api/ui/restart` can restart: it
+/// must have its own `.git` (belt-and-suspenders — `project_root_from_running_exe`
+/// already guarantees this, but this endpoint's error message should name
+/// the specific missing piece rather than leaking that function's internal
+/// contract) and the launch script `handle_ui_restart_post` is about to
+/// respawn must actually exist. Split out from `handle_ui_restart_post` so
+/// this existence check is unit-testable against a scratch temp directory
+/// without spawning any process.
+fn validate_restart_script(root: &Path) -> Result<PathBuf, String> {
+    let git_dir = root.join(".git");
+    if !git_dir.is_dir() {
+        return Err(format!("未找到 git 目录：{}", git_dir.display()));
+    }
+    let script_path = root.join("Codex Gateway Lite.command");
+    if !script_path.is_file() {
+        return Err(format!("未找到启动脚本：{}", script_path.display()));
+    }
+    Ok(script_path)
+}
+
+/// Fire-and-forget a fully detached re-run of the launch script — the
+/// entire restart mechanism; see the doc comment on `handle_ui_restart_post`
+/// for the full handoff story.
+///
+/// macOS ships no standalone `setsid`, so the usual Linux
+/// `setsid cmd &`-style full-session detach isn't available here. `nohup`
+/// + `sh -c '... &'` reaches the same practical end state on macOS: `sh`
+/// backgrounds the real command and returns almost immediately, so by the
+/// time this function returns, the relaunched script is no longer a direct
+/// child of this process — it's been reparented — and this process
+/// exiting or being killed afterward can't take the relaunch down with it.
+///
+/// `CGL_BACKGROUND_CHILD` is explicitly stripped from the spawned shell's
+/// environment. Without that, the new `sh`/script would inherit it as
+/// `"1"` whenever this very agent process happens to itself be running as
+/// the launch script's own background child (the default mode — see that
+/// script's top-of-file mode comment) — environment variables set via
+/// `CGL_BACKGROUND_CHILD=1 nohup "$0" ... &` propagate down through every
+/// process that script goes on to spawn, this Rust process included.
+/// Inheriting it here would make the relaunched script skip straight past
+/// its own default "silent background launch" branch (the one that does
+/// log rotation, writes the startup banner, and re-execs itself with
+/// output redirected into `agent.terminal.log`) and instead run directly
+/// with stdout/stderr going to `/dev/null` per this function's own
+/// redirect below — silently breaking the log viewer for the *new*
+/// process right after the very restart meant to keep it working.
+fn spawn_detached_restart(script_path: &Path) {
+    let script = script_path.display().to_string();
+    let command = format!("nohup \"{script}\" >/dev/null 2>&1 &");
+    if let Err(error) = ProcessCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env_remove("CGL_BACKGROUND_CHILD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        eprintln!("重启：拉起启动脚本失败：{error:#}");
+    }
+}
+
+/// `POST /api/ui/restart`: rebuild (if the source changed since the last
+/// build) and restart the whole agent by respawning its own launch script.
+///
+/// Timing/handoff contract, since this is easy to get backward: this
+/// handler never kills or exits the current process itself. It only
+/// spawns a fully detached copy of the launch script (`spawn_detached_restart`)
+/// and returns an "ok, restarting" response value — the actual socket
+/// write happens in the caller
+/// (`handle_protocol_proxy_connection`/`route_protocol_proxy_request`),
+/// strictly after this whole `async fn` returns. So whether
+/// `spawn_detached_restart` runs immediately before or immediately after
+/// this function builds its response `Value` makes no observable
+/// difference: either way, both happen microseconds apart, long before the
+/// relaunched script gets anywhere near killing this process. That
+/// relaunched script re-enters through its own default (background-launch)
+/// branch, which does a log-rotation check, a banner write, and *another*
+/// detached re-exec before its background child even starts on its own
+/// pre-launch `stop_stale_agent_processes` sweep — i.e. several distinct
+/// steps, none of them instant. This process's HTTP response has always
+/// already reached the browser's TCP stack long before that sweep runs.
+/// Once it does run, it kills this exact process by `pkill`-matching
+/// `<LITE_BIN> agent` in the command line — that is the only thing that
+/// ends this process, and it's expected to; nothing in this handler needs
+/// to, or should, exit on its own.
+async fn handle_ui_restart_post() -> anyhow::Result<protocol_proxy::ProxyHttpResponse> {
+    let Some(root) = project_root_from_running_exe() else {
+        return Ok(ui_api_json_response(&json!({
+            "ok": false,
+            "error": "未定位到项目根目录（当前运行的二进制找不到上级 .git 仓库，可能是打包或移动后的独立二进制）",
+        })));
+    };
+    let script_path = match validate_restart_script(&root) {
+        Ok(script_path) => script_path,
+        Err(error) => {
+            return Ok(ui_api_json_response(
+                &json!({ "ok": false, "error": error }),
+            ));
+        }
+    };
+    let response = ui_api_json_response(&json!({
+        "ok": true,
+        "message": "正在后台重启：先等待旧服务完全退出，再重新编译（如有更新）并拉起新服务；页面会自动恢复",
+    }));
+    spawn_detached_restart(&script_path);
+    Ok(response)
 }
 
 async fn run_agent(
@@ -14324,6 +15404,21 @@ model_catalog_json = "model-catalogs/gateway.json"
     }
 
     #[test]
+    fn native_openai_models_skip_the_400_strip_images_retry() {
+        // GPT traffic goes straight to OpenAI's own backend (see
+        // `protocol_proxy::is_native_openai_model`); a 400 there is a real
+        // rejection, not the third-party image-content-filter quirk the
+        // strip-and-retry fallback in `handle_streaming_responses_proxy`
+        // exists to work around.
+        assert!(!should_retry_400_with_images_stripped(Some(
+            "gpt-5.1-codex"
+        )));
+        assert!(!should_retry_400_with_images_stripped(Some("o4-mini")));
+        assert!(should_retry_400_with_images_stripped(Some("grok-4.5")));
+        assert!(should_retry_400_with_images_stripped(None));
+    }
+
+    #[test]
     fn no_proxy_merge_preserves_existing_and_adds_localhost() {
         let merged =
             merge_no_proxy_value("example.com;127.0.0.1", &["localhost", "127.0.0.1", "::1"]);
@@ -14507,6 +15602,61 @@ model_catalog_json = "model-catalogs/gateway.json"
         assert!(windows_script.contains(
             "winget 未能补齐 C++ 工作负载（已安装的 Build Tools 包判定为无需升级），改用官方安装器直接补装工作负载。"
         ));
+    }
+
+    #[test]
+    fn bootstrap_script_hands_off_from_old_instance_before_relaunch() {
+        // Regression guard for a restart-time race: the Web UI's one-click
+        // restart starts a brand new script instance while the old one is
+        // still fully alive. The old instance's `cleanup_agent_on_exit` trap
+        // only runs `stop-agent` (restoring Codex to the direct upstream)
+        // *after* its agent process dies — if that lands after the new
+        // instance's own `run_lite init` (which points Codex back at the
+        // local proxy), Codex's config briefly flips to direct and back
+        // with no visible error. Separately, the old agent only frees
+        // 127.0.0.1:57321 when it actually exits, so a new agent racing to
+        // bind that port before the release completes fails outright. These
+        // assertions pin down that the ordered handover wait — old agent
+        // gone, old script shell gone, old stop-agent cleanup gone, proxy
+        // port free — actually exists on the shared launch path, rather
+        // than relying on `stop_stale_agent_processes` alone.
+        let macos_script = include_str!("../Codex Gateway Lite.command");
+
+        assert!(macos_script.contains("wait_for_old_instance_handover() {"));
+        // Called immediately after `stop_stale_agent_processes`, on the one
+        // code path `main_foreground` and `main_background_child` share —
+        // i.e. every mode reaches it (mode 1 always re-execs into mode 2).
+        assert!(macos_script.contains(
+            "  stop_stale_agent_processes
+  wait_for_old_instance_handover
+"
+        ));
+        // Must exclude this process and its immediate parent from the
+        // "old script shell" pid match — in the default background-launch
+        // mode, the background child's own parent is briefly mode 1 of the
+        // very same launch, which also matches the script's own pgrep
+        // pattern and is expected to exit on its own momentarily.
+        assert!(macos_script.contains("[[ \"$pid\" == \"$$\" || \"$pid\" == \"$PPID\" ]]"));
+        // The proxy port is a named variable (matching
+        // `protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT` below), not a
+        // hardcoded literal scattered across the script.
+        assert!(macos_script.contains("PROXY_PORT=\"${CODEX_GATEWAY_LITE_PROXY_PORT:-57321}\""));
+        assert_eq!(
+            57321,
+            protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            "PROXY_PORT's hardcoded fallback in the bootstrap script must stay in sync \
+             with protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT"
+        );
+        assert!(macos_script.contains("lsof -iTCP:\"$1\" -sTCP:LISTEN"));
+        // The four steps, in order, each with their own timeout — never an
+        // unconditional wait.
+        assert!(macos_script.contains("1/4 确认旧 agent 进程已退出"));
+        assert!(
+            macos_script.contains("2/4 等待旧脚本 shell 退出（含它退出时的直连还原 trap 跑完）")
+        );
+        assert!(macos_script.contains("3/4 等待旧 trap 里的 stop-agent 清理子进程结束"));
+        assert!(macos_script.contains("4/4 等待本地协议代理端口 $PROXY_PORT 释放"));
+        assert!(macos_script.contains("旧实例已完全退出，开始拉起新服务"));
     }
 
     #[test]
@@ -17512,5 +18662,752 @@ mod responses_budget_tests {
         let report = crate::protocol_proxy::apply_responses_context_budget(&mut body, &budget);
         assert_eq!(report.stale_reasoning_items_stripped, 0);
         assert_eq!(body["input"].as_array().unwrap().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod ui_config_tests {
+    use super::*;
+
+    fn sample_config(api_key: &str, provider_id: &str) -> LiteConfig {
+        let json = format!(
+            r#"{{
+                "provider": {{
+                    "id": "{provider_id}",
+                    "name": "Test",
+                    "baseUrl": "https://example.test/v1",
+                    "apiKey": "{api_key}",
+                    "protocol": "responses"
+                }},
+                "model": "test-model",
+                "models": ["test-model"]
+            }}"#
+        );
+        serde_json::from_str(&json).expect("sample config parses")
+    }
+
+    fn sample_config_with_saved_provider(
+        active_key: &str,
+        saved_id: &str,
+        saved_key: &str,
+    ) -> LiteConfig {
+        let json = format!(
+            r#"{{
+                "provider": {{
+                    "id": "active",
+                    "name": "Active",
+                    "baseUrl": "https://active.example/v1",
+                    "apiKey": "{active_key}",
+                    "protocol": "responses"
+                }},
+                "model": "active-model",
+                "models": ["active-model"],
+                "providers": [
+                    {{
+                        "provider": {{
+                            "id": "{saved_id}",
+                            "name": "Saved",
+                            "baseUrl": "https://saved.example/v1",
+                            "apiKey": "{saved_key}",
+                            "protocol": "chat_completions"
+                        }},
+                        "model": "saved-model",
+                        "models": ["saved-model"]
+                    }}
+                ]
+            }}"#
+        );
+        serde_json::from_str(&json).expect("sample config with saved provider parses")
+    }
+
+    // --- redact_api_key ---
+
+    #[test]
+    fn redact_api_key_empty_stays_empty() {
+        assert_eq!(redact_api_key(""), "");
+    }
+
+    #[test]
+    fn redact_api_key_below_fourteen_chars_is_fully_masked() {
+        let short_key = "a".repeat(13);
+        assert_eq!(redact_api_key(&short_key), "•••");
+    }
+
+    #[test]
+    fn redact_api_key_at_fourteen_chars_uses_prefix_and_suffix() {
+        let boundary_key = "b".repeat(14);
+        assert_eq!(redact_api_key(&boundary_key), "bbbbbbb…bbbb");
+    }
+
+    #[test]
+    fn redact_api_key_long_key_keeps_first_seven_and_last_four() {
+        assert_eq!(
+            redact_api_key("sk-abcdefghijklmnopqrstuvwxyz"),
+            "sk-abcd…wxyz"
+        );
+    }
+
+    #[test]
+    fn redact_lite_config_api_keys_covers_active_and_saved_providers() {
+        let config = sample_config_with_saved_provider(
+            "sk-active-0123456789ab",
+            "beta",
+            "sk-saved-key-0123456789",
+        );
+        let redacted = redact_lite_config_api_keys(&config);
+        assert_eq!(
+            redacted.provider.api_key,
+            redact_api_key("sk-active-0123456789ab")
+        );
+        assert_eq!(
+            redacted.providers[0].provider.api_key,
+            redact_api_key("sk-saved-key-0123456789")
+        );
+        // Original untouched.
+        assert_eq!(config.provider.api_key, "sk-active-0123456789ab");
+    }
+
+    // --- merge_submitted_api_key / merge_submitted_lite_config ---
+
+    #[test]
+    fn merge_submitted_api_key_keeps_current_when_submitted_is_empty() {
+        assert_eq!(
+            merge_submitted_api_key("", "sk-real-secret-0123456789"),
+            "sk-real-secret-0123456789"
+        );
+    }
+
+    #[test]
+    fn merge_submitted_api_key_keeps_current_when_submitted_matches_redaction() {
+        let current = "sk-real-secret-0123456789";
+        let redacted = redact_api_key(current);
+        assert_eq!(merge_submitted_api_key(&redacted, current), current);
+    }
+
+    #[test]
+    fn merge_submitted_api_key_overrides_with_a_genuinely_new_value() {
+        assert_eq!(
+            merge_submitted_api_key("sk-brand-new-key-xyz", "sk-real-secret-0123456789"),
+            "sk-brand-new-key-xyz"
+        );
+    }
+
+    #[test]
+    fn merge_submitted_lite_config_preserves_unchanged_active_key_and_overrides_edited_one() {
+        let current = sample_config("sk-active-secret-0123456789", "alpha");
+
+        // Submitted body carries the *redacted* placeholder back for the
+        // active key, as if the browser round-tripped the GET response
+        // unmodified other than changing an unrelated field.
+        let redacted_active = redact_api_key("sk-active-secret-0123456789");
+        let mut submitted = sample_config(&redacted_active, "alpha");
+        submitted.model = "changed-model".to_string();
+        let merged = merge_submitted_lite_config(submitted, &current);
+        assert_eq!(merged.provider.api_key, "sk-active-secret-0123456789");
+        assert_eq!(merged.model, "changed-model");
+
+        // A real edit to the key is honored as-is.
+        let edited = sample_config("sk-new-active-key-0123456789", "alpha");
+        let merged_edit = merge_submitted_lite_config(edited, &current);
+        assert_eq!(merged_edit.provider.api_key, "sk-new-active-key-0123456789");
+    }
+
+    #[test]
+    fn merge_submitted_lite_config_covers_saved_provider_keys_too() {
+        let current = sample_config_with_saved_provider(
+            "sk-active-0123456789ab",
+            "beta",
+            "sk-saved-secret-0123456789",
+        );
+
+        // Submitted keeps the active key blank (unchanged) and gives the
+        // saved profile's key back as its redacted placeholder (also
+        // unchanged), while renaming the saved profile's model.
+        let redacted_saved = redact_api_key("sk-saved-secret-0123456789");
+        let mut submitted = sample_config_with_saved_provider("", "beta", &redacted_saved);
+        submitted.providers[0].model = "beta-model-renamed".to_string();
+
+        let merged = merge_submitted_lite_config(submitted, &current);
+        assert_eq!(merged.provider.api_key, "sk-active-0123456789ab");
+        assert_eq!(
+            merged.providers[0].provider.api_key,
+            "sk-saved-secret-0123456789"
+        );
+        assert_eq!(merged.providers[0].model, "beta-model-renamed");
+
+        // A genuine edit to the saved profile's key is honored.
+        let edited = sample_config_with_saved_provider("", "beta", "sk-brand-new-saved-key-999");
+        let merged_edit = merge_submitted_lite_config(edited, &current);
+        assert_eq!(
+            merged_edit.providers[0].provider.api_key,
+            "sk-brand-new-saved-key-999"
+        );
+    }
+
+    // --- Host loopback validation ---
+
+    #[test]
+    fn host_header_hostname_strips_ipv4_port() {
+        assert_eq!(host_header_hostname("127.0.0.1:57321"), "127.0.0.1");
+    }
+
+    #[test]
+    fn host_header_hostname_strips_hostname_port() {
+        assert_eq!(host_header_hostname("localhost:57321"), "localhost");
+    }
+
+    #[test]
+    fn host_header_hostname_handles_bare_ipv6_loopback() {
+        // A naive "split on the last colon" would mangle this into "1" with
+        // host "::" (wrong) instead of leaving it untouched.
+        assert_eq!(host_header_hostname("::1"), "::1");
+    }
+
+    #[test]
+    fn host_header_hostname_handles_bracketed_ipv6_with_and_without_port() {
+        assert_eq!(host_header_hostname("[::1]"), "::1");
+        assert_eq!(host_header_hostname("[::1]:57321"), "::1");
+    }
+
+    #[test]
+    fn host_header_hostname_leaves_bare_ipv4_without_port_untouched() {
+        assert_eq!(host_header_hostname("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn is_loopback_hostname_accepts_all_four_documented_forms() {
+        assert!(is_loopback_hostname("127.0.0.1"));
+        assert!(is_loopback_hostname("localhost"));
+        assert!(is_loopback_hostname("::1"));
+        assert!(is_loopback_hostname("LOCALHOST"));
+    }
+
+    #[test]
+    fn is_loopback_hostname_rejects_a_dns_rebinding_style_domain() {
+        assert!(!is_loopback_hostname("evil.example.com"));
+        assert!(!is_loopback_hostname("0.0.0.0"));
+    }
+
+    fn ui_request(headers: Vec<(&str, &str)>) -> LiteHttpRequest {
+        LiteHttpRequest {
+            method: "GET".to_string(),
+            path: "/ui".to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn request_host_is_loopback_reads_the_host_header_case_insensitively() {
+        let request = ui_request(vec![("Host", "127.0.0.1:57321")]);
+        assert!(request_host_is_loopback(&request));
+    }
+
+    #[test]
+    fn request_host_is_loopback_fails_closed_without_a_host_header() {
+        let request = ui_request(vec![]);
+        assert!(!request_host_is_loopback(&request));
+    }
+
+    #[test]
+    fn request_host_is_loopback_rejects_a_rebound_domain() {
+        let request = ui_request(vec![("host", "attacker.example:57321")]);
+        assert!(!request_host_is_loopback(&request));
+    }
+
+    // --- UI route token-exemption logic ---
+
+    #[test]
+    fn request_skips_local_proxy_token_check_only_for_get_root_and_ui() {
+        assert!(request_skips_local_proxy_token_check("GET", "/"));
+        assert!(request_skips_local_proxy_token_check("GET", "/ui"));
+        assert!(request_skips_local_proxy_token_check("GET", "/ui?foo=bar"));
+    }
+
+    #[test]
+    fn request_skips_local_proxy_token_check_rejects_wrong_method_or_path() {
+        assert!(!request_skips_local_proxy_token_check("POST", "/"));
+        assert!(!request_skips_local_proxy_token_check("POST", "/ui"));
+        assert!(!request_skips_local_proxy_token_check(
+            "GET",
+            "/api/ui/config"
+        ));
+        assert!(!request_skips_local_proxy_token_check(
+            "GET",
+            "/v1/responses"
+        ));
+        assert!(!request_skips_local_proxy_token_check("GET", "/index.html"));
+    }
+
+    #[test]
+    fn is_ui_api_path_matches_only_the_api_ui_prefix() {
+        assert!(is_ui_api_path("/api/ui/config"));
+        assert!(is_ui_api_path("/api/ui/version"));
+        assert!(is_ui_api_path("/api/ui/update/check"));
+        assert!(is_ui_api_path("/api/ui/config?x=1"));
+        assert!(!is_ui_api_path("/"));
+        assert!(!is_ui_api_path("/ui"));
+        assert!(!is_ui_api_path("/v1/responses"));
+    }
+
+    // --- version string ---
+
+    #[test]
+    fn ui_version_string_is_non_empty() {
+        assert!(!ui_version_string().is_empty());
+    }
+
+    // --- project root resolution ---
+
+    #[test]
+    fn project_root_from_exe_path_ascends_three_levels_from_the_binary() {
+        let exe = Path::new("/repo/codex-gateway-lite/target/release/codex-gateway-lite");
+        assert_eq!(
+            project_root_from_exe_path(exe),
+            Some(PathBuf::from("/repo/codex-gateway-lite"))
+        );
+    }
+
+    #[test]
+    fn project_root_from_exe_path_none_when_too_shallow() {
+        let exe = Path::new("/exe");
+        assert_eq!(project_root_from_exe_path(exe), None);
+    }
+
+    // --- truncate_for_response ---
+
+    #[test]
+    fn truncate_for_response_leaves_short_text_untouched() {
+        assert_eq!(truncate_for_response("short", 100), "short");
+    }
+
+    #[test]
+    fn truncate_for_response_truncates_long_text() {
+        let long = "x".repeat(50);
+        let result = truncate_for_response(&long, 10);
+        assert!(result.starts_with(&"x".repeat(10)));
+        assert!(result.contains("已截断"));
+    }
+
+    // --- write_lite_config_from_ui / backup_lite_config_for_ui ---
+
+    #[test]
+    fn write_lite_config_from_ui_backs_up_and_atomically_replaces() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codex-gateway-lite-ui-config-test-{unique}"));
+        fs::create_dir_all(&dir).expect("creates temp dir");
+        let config_path = dir.join("config.json");
+        let original = sample_config("sk-original-secret-0123456789", "orig");
+        write_lite_config(&config_path, &original).expect("seeds original config");
+
+        let updated = sample_config("sk-updated-secret-0123456789", "orig");
+        let backup_path =
+            write_lite_config_from_ui(&config_path, &updated).expect("writes via UI path");
+
+        // Backup captured the *original* contents before the overwrite, and
+        // is named per the `config.json.bak-ui-<timestamp>` convention.
+        let backup_contents = fs::read_to_string(&backup_path).expect("reads backup");
+        let backed_up: LiteConfig = serde_json::from_str(&backup_contents).expect("backup parses");
+        assert_eq!(backed_up.provider.api_key, "sk-original-secret-0123456789");
+        assert!(
+            Path::new(&backup_path)
+                .file_name()
+                .expect("backup has a file name")
+                .to_string_lossy()
+                .contains("config.json.bak-ui-")
+        );
+
+        // The live file now has the new contents.
+        let saved = read_lite_config(&config_path).expect("reads saved config");
+        assert_eq!(saved.provider.api_key, "sk-updated-secret-0123456789");
+
+        // No leftover temp file.
+        assert!(!dir.join("config.json.tmp-ui").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&config_path)
+                .expect("reads config metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            let backup_mode = fs::metadata(&backup_path)
+                .expect("reads backup metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(backup_mode, 0o600);
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- run_command_with_timeout ---
+
+    #[test]
+    fn run_command_with_timeout_returns_quick_success() {
+        let output = run_command_with_timeout(
+            &std::env::temp_dir(),
+            "git",
+            &["--version"],
+            Duration::from_secs(5),
+        )
+        .expect("git --version succeeds");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_a_hanging_process() {
+        let start = Instant::now();
+        let result = run_command_with_timeout(
+            &std::env::temp_dir(),
+            "sleep",
+            &["30"],
+            Duration::from_millis(300),
+        );
+        assert!(result.is_err(), "hanging process should time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout should cut the wait short, not actually wait 30s"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_with_timeout_kills_a_hanging_process() {
+        let start = Instant::now();
+        // No standalone `sleep` on Windows; `ping` against loopback with a
+        // large count is the standard cross-version substitute.
+        let result = run_command_with_timeout(
+            &std::env::temp_dir(),
+            "cmd",
+            &["/C", "ping -n 30 127.0.0.1 >NUL"],
+            Duration::from_millis(300),
+        );
+        assert!(result.is_err(), "hanging process should time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "timeout should cut the wait short, not actually wait ~29s"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ui_logs_tests {
+    use super::*;
+
+    // --- logs_is_tail_read / tail_window ---
+
+    #[test]
+    fn logs_is_tail_read_true_for_no_or_zero_offset() {
+        assert!(logs_is_tail_read(1000, 0));
+    }
+
+    #[test]
+    fn logs_is_tail_read_true_when_offset_exceeds_file_len_rotated() {
+        // Simulates the launch script's 5MB rotation swapping in a fresh,
+        // much smaller file out from under a client that still holds a
+        // large offset from before the rotation.
+        assert!(logs_is_tail_read(100, 5_000_000));
+    }
+
+    #[test]
+    fn logs_is_tail_read_false_for_a_valid_incremental_offset() {
+        assert!(!logs_is_tail_read(1000, 500));
+        // offset == file_len (caught up exactly) is still a valid
+        // incremental continuation, not a fresh tail.
+        assert!(!logs_is_tail_read(1000, 1000));
+    }
+
+    #[test]
+    fn tail_window_first_load_smaller_than_window_starts_at_zero() {
+        let (start, truncated) = tail_window(1000, 0);
+        assert_eq!(start, 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tail_window_first_load_larger_than_window_starts_64kb_back() {
+        let file_len = 200_000u64;
+        let (start, truncated) = tail_window(file_len, 0);
+        assert_eq!(start, file_len - LOG_TAIL_WINDOW_BYTES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tail_window_empty_file_does_not_underflow() {
+        // `file_len.saturating_sub(...)` must not panic on an empty file
+        // (a plain `-` would underflow-panic in debug builds).
+        let (start, truncated) = tail_window(0, 0);
+        assert_eq!(start, 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tail_window_rotated_offset_falls_back_to_fresh_tail() {
+        let (start, truncated) = tail_window(100, 5_000_000);
+        assert_eq!(start, 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tail_window_incremental_read_within_cap_is_not_truncated() {
+        let (start, truncated) = tail_window(1000, 500);
+        assert_eq!(start, 500);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn tail_window_incremental_read_at_exact_cap_boundary_is_not_truncated() {
+        let file_len = 500 + LOG_INCREMENTAL_MAX_BYTES;
+        let (start, truncated) = tail_window(file_len, 500);
+        assert_eq!(start, 500);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn tail_window_incremental_read_past_cap_is_truncated() {
+        let file_len = 500 + LOG_INCREMENTAL_MAX_BYTES + 1;
+        let (start, truncated) = tail_window(file_len, 500);
+        assert_eq!(start, 500);
+        assert!(truncated);
+    }
+
+    // --- align_tail_start ---
+
+    #[test]
+    fn align_tail_start_at_true_file_start_is_unchanged() {
+        let buffer = b"partial first line\nsecond\n";
+        assert_eq!(align_tail_start(buffer, 0), &buffer[..]);
+    }
+
+    #[test]
+    fn align_tail_start_mid_window_drops_the_partial_leading_line() {
+        let buffer = b"ial first line\nsecond\nthird\n";
+        assert_eq!(align_tail_start(buffer, 42), b"second\nthird\n");
+    }
+
+    #[test]
+    fn align_tail_start_with_no_newline_returns_buffer_whole() {
+        let buffer = b"one giant line with no newline at all";
+        assert_eq!(align_tail_start(buffer, 42), &buffer[..]);
+    }
+
+    // --- align_incremental_end ---
+
+    #[test]
+    fn align_incremental_end_at_eof_keeps_a_partial_trailing_line() {
+        let buffer = b"complete line\npartial tail";
+        assert_eq!(align_incremental_end(buffer, true), buffer.len());
+    }
+
+    #[test]
+    fn align_incremental_end_capped_trims_to_last_newline() {
+        let buffer = b"complete line\npartial tail-that-got-cut";
+        let trimmed = align_incremental_end(buffer, false);
+        assert_eq!(trimmed, "complete line\n".len());
+    }
+
+    #[test]
+    fn align_incremental_end_capped_with_no_newline_returns_buffer_whole() {
+        let buffer = b"one giant line wider than the whole cap";
+        assert_eq!(align_incremental_end(buffer, false), buffer.len());
+    }
+
+    // --- query_param_u64 ---
+
+    #[test]
+    fn query_param_u64_parses_the_named_value() {
+        assert_eq!(
+            query_param_u64("/api/ui/logs?offset=123", "offset"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn query_param_u64_finds_the_key_among_several_params() {
+        assert_eq!(
+            query_param_u64("/api/ui/logs?a=1&offset=42&b=2", "offset"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn query_param_u64_none_without_a_query_string() {
+        assert_eq!(query_param_u64("/api/ui/logs", "offset"), None);
+    }
+
+    #[test]
+    fn query_param_u64_none_for_missing_key_or_garbage_value() {
+        assert_eq!(query_param_u64("/api/ui/logs?foo=1", "offset"), None);
+        assert_eq!(query_param_u64("/api/ui/logs?offset=abc", "offset"), None);
+        assert_eq!(query_param_u64("/api/ui/logs?offset=-1", "offset"), None);
+        assert_eq!(query_param_u64("/api/ui/logs?offset=", "offset"), None);
+    }
+
+    // --- ui_logs_get_body: end-to-end against a real temp file ---
+
+    fn unique_temp_log_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "codex-gateway-lite-ui-logs-test-{label}-{unique}.log"
+        ))
+    }
+
+    #[test]
+    fn ui_logs_get_body_missing_file_reports_empty_not_an_error() {
+        let path = unique_temp_log_path("missing");
+        let body = ui_logs_get_body(&path, 0);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["content"], json!(""));
+        assert_eq!(body["offset"], json!(0));
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["truncated"], json!(false));
+    }
+
+    #[test]
+    fn ui_logs_get_body_empty_existing_file() {
+        let path = unique_temp_log_path("empty");
+        fs::write(&path, b"").expect("creates empty file");
+        let body = ui_logs_get_body(&path, 0);
+        assert_eq!(body["content"], json!(""));
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["offset"], json!(0));
+        // Distinguishes from the "file doesn't exist" case above: an
+        // existing (if empty) file still goes through the fresh-tail
+        // branch, whose contract always reports `truncated: true`.
+        assert_eq!(body["truncated"], json!(true));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ui_logs_get_body_first_load_returns_tail_and_full_offset() {
+        let path = unique_temp_log_path("first-load");
+        let mut content = String::new();
+        for line in 0..2000 {
+            content.push_str(&format!("line {line} of a long agent.terminal.log\n"));
+        }
+        fs::write(&path, content.as_bytes()).expect("writes fixture log");
+        let file_len = content.len() as u64;
+
+        let body = ui_logs_get_body(&path, 0);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["truncated"], json!(true));
+        assert_eq!(body["offset"], json!(file_len));
+        assert_eq!(body["size"], json!(file_len));
+        let returned = body["content"].as_str().expect("content is a string");
+        // Tail window is bounded by LOG_TAIL_WINDOW_BYTES...
+        assert!(returned.len() as u64 <= LOG_TAIL_WINDOW_BYTES);
+        // ...aligned to a line boundary (no partial line at the front)...
+        assert!(!returned.is_empty());
+        assert!(content.ends_with(returned));
+        assert!(
+            returned.starts_with("line "),
+            "expected the tail to start at a clean line boundary, got: {:?}",
+            &returned[..returned.len().min(40)]
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ui_logs_get_body_incremental_read_continues_from_a_prior_offset() {
+        let path = unique_temp_log_path("incremental");
+        fs::write(&path, b"first line\nsecond line\n").expect("writes fixture log");
+        let first = ui_logs_get_body(&path, 0);
+        let offset_after_first = first["offset"].as_u64().expect("offset is a number");
+
+        // Agent appends more output between polls.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopens fixture log for append");
+            file.write_all(b"third line\n")
+                .expect("appends more log output");
+        }
+
+        let second = ui_logs_get_body(&path, offset_after_first);
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(second["content"], json!("third line\n"));
+        assert_eq!(second["truncated"], json!(false));
+        let new_size = second["size"].as_u64().expect("size is a number");
+        assert_eq!(second["offset"], json!(new_size));
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ui_logs_get_body_offset_past_size_falls_back_to_fresh_tail() {
+        let path = unique_temp_log_path("rotated");
+        fs::write(&path, b"post-rotation content\n").expect("writes fixture log");
+        // Simulate a stale client offset from before the launch script's
+        // 5MB rotation swapped in a fresh, smaller file.
+        let body = ui_logs_get_body(&path, 5_000_000);
+        assert_eq!(body["truncated"], json!(true));
+        assert_eq!(body["content"], json!("post-rotation content\n"));
+        fs::remove_file(&path).ok();
+    }
+
+    // --- validate_restart_script ---
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("codex-gateway-lite-restart-test-{label}-{unique}"))
+    }
+
+    #[test]
+    fn validate_restart_script_ok_when_git_dir_and_script_exist() {
+        let dir = unique_temp_dir("ok");
+        fs::create_dir_all(dir.join(".git")).expect("creates fake .git dir");
+        let script_path = dir.join("Codex Gateway Lite.command");
+        fs::write(&script_path, "#!/bin/zsh\n").expect("creates fake script");
+
+        let result = validate_restart_script(&dir);
+        assert_eq!(result, Ok(script_path));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_restart_script_errors_when_git_dir_missing() {
+        let dir = unique_temp_dir("no-git");
+        fs::create_dir_all(&dir).expect("creates temp dir");
+        fs::write(dir.join("Codex Gateway Lite.command"), "#!/bin/zsh\n")
+            .expect("creates fake script");
+
+        let result = validate_restart_script(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(".git"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_restart_script_errors_when_script_missing() {
+        let dir = unique_temp_dir("no-script");
+        fs::create_dir_all(dir.join(".git")).expect("creates fake .git dir");
+
+        let result = validate_restart_script(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Codex Gateway Lite.command"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

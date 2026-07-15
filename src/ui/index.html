@@ -1,0 +1,1629 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Gateway Lite</title>
+<style>
+/* ============ Design tokens ============ */
+:root {
+  --bg: #1e1f24;
+  --bg-deep: #17181c;
+  --panel: rgba(255, 255, 255, 0.055);
+  --panel-strong: rgba(255, 255, 255, 0.08);
+  --panel-hover: rgba(255, 255, 255, 0.075);
+  --hairline: rgba(255, 255, 255, 0.08);
+  --text: #e8e9ed;
+  --text-secondary: #9a9ca6;
+  --text-tertiary: #6c6e78;
+  --accent: #0a84ff;
+  --accent-dim: rgba(10, 132, 255, 0.16);
+  --success: #32d74b;
+  --success-dim: rgba(50, 215, 75, 0.16);
+  --warning: #ffd60a;
+  --danger: #ff453a;
+  --danger-dim: rgba(255, 69, 58, 0.16);
+  --radius-window: 12px;
+  --radius-card: 10px;
+  --radius-btn: 6px;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --dur: 200ms;
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+/* ============ Base / reset ============ */
+* , *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 32px 16px;
+}
+button, input, select, textarea { font-family: inherit; color: inherit; }
+h1, p { margin: 0; }
+/* Author rules below set `display` on several top-level containers (.state-screen,
+   .window); without this, an author-origin `display` declaration beats the
+   user-agent stylesheet's [hidden]{display:none}, so the hidden attribute would be
+   silently ignored on those elements. */
+[hidden] { display: none !important; }
+
+/* ============ Loading / error states ============ */
+.state-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.spinner {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+.spinner-small { width: 16px; height: 16px; border-width: 2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.error-card {
+  background: var(--panel);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  padding: 32px;
+  max-width: 360px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.error-icon {
+  width: 36px; height: 36px; border-radius: 50%;
+  background: var(--danger-dim); color: var(--danger);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 600;
+}
+.error-title { font-size: 15px; font-weight: 600; }
+.error-detail { color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+
+/* ============ Window shell ============ */
+.window {
+  width: 100%;
+  max-width: 1080px;
+  height: 720px;
+  max-height: 88vh;
+  background: var(--bg);
+  border-radius: var(--radius-window);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.titlebar {
+  height: 44px; flex-shrink: 0;
+  display: flex; align-items: center;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+.traffic-lights { display: flex; gap: 8px; width: 120px; min-width: 120px; }
+.tl { width: 12px; height: 12px; border-radius: 50%; }
+.tl-red { background: #ff5f57; }
+.tl-yellow { background: #febc2e; }
+.tl-green { background: #28c840; }
+.titlebar-title { flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.titlebar-right { min-width: 120px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+
+.version-pill {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+  background: var(--panel-strong); border: 1px solid var(--hairline); border-radius: 20px;
+  padding: 3px 10px; display: inline-flex; align-items: center; gap: 6px;
+}
+.pending-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* ============ Buttons ============ */
+.btn {
+  font-size: 12px; font-weight: 500; border: none; border-radius: var(--radius-btn);
+  padding: 6px 14px; cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease), opacity var(--dur) var(--ease);
+}
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: #2a92ff; }
+.btn-primary.success { background: var(--success); }
+.btn-secondary { background: var(--panel-strong); color: var(--text); }
+.btn-secondary:hover { background: var(--panel-hover); }
+.btn-danger { background: var(--danger-dim); color: var(--danger); }
+.btn-danger:hover { background: rgba(255, 69, 58, 0.28); }
+.btn-small { padding: 4px 10px; font-size: 11px; }
+.btn:disabled { opacity: 0.6; cursor: default; }
+
+/* ============ Sidebar / content shell ============ */
+.shell { flex: 1; display: flex; min-height: 0; }
+.sidebar {
+  width: 200px; flex-shrink: 0; padding: 14px 10px;
+  display: flex; flex-direction: column; gap: 2px;
+  border-right: 1px solid var(--hairline);
+  overflow-y: auto;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 6px; text-align: left;
+  background: transparent; border: none;
+  color: var(--text-secondary); font-size: 13px;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.nav-item:hover { background: var(--panel); color: var(--text); }
+.nav-item.active { background: var(--accent); color: #fff; }
+.badge {
+  margin-left: auto; font-size: 10px; font-weight: 600;
+  background: var(--success-dim); color: var(--success);
+  border-radius: 8px; padding: 1px 7px;
+}
+.nav-item.active .badge { background: rgba(255, 255, 255, 0.25); color: #fff; }
+
+.content { flex: 1; overflow-y: auto; padding: 24px 28px 100px; }
+
+.page { display: none; }
+.page.active { display: block; animation: pageIn var(--dur) var(--ease); }
+@keyframes pageIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.page-title { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
+.page-desc { font-size: 12px; color: var(--text-secondary); margin-bottom: 18px; }
+
+/* ============ Cards / rows ============ */
+.card {
+  background: var(--panel);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  margin-bottom: 14px;
+  overflow: hidden;
+  transition: background var(--dur) var(--ease);
+}
+.card:hover { background: var(--panel-hover); }
+.card-title {
+  font-size: 11px; font-weight: 600; color: var(--text-tertiary);
+  text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 12px 16px 6px;
+}
+.card-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 11px 16px; border-top: 1px solid var(--hairline);
+}
+.card > .card-row:first-child { border-top: none; }
+.card-title + .card-row { border-top: none; }
+.card-row-block { flex-direction: column; align-items: stretch; }
+.row-info { flex: 1; min-width: 0; }
+.row-label { font-size: 13px; color: var(--text); }
+.row-caption { font-size: 11px; color: var(--text-secondary); margin-top: 2px; line-height: 1.5; }
+.row-control { flex-shrink: 0; display: flex; align-items: center; }
+.row-control.mono { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); max-width: 320px; text-align: right; word-break: break-all; }
+
+/* ============ Form controls ============ */
+.field-input, .field-select, .field-textarea {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 10px;
+  outline: none;
+  width: 220px;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.mono-input { font-family: var(--font-mono); }
+.field-input:focus, .field-select:focus, .field-textarea:focus {
+  border-color: var(--accent);
+  background: rgba(0, 0, 0, 0.35);
+}
+.field-input.changed { border-color: var(--warning); }
+.field-textarea { width: 100%; resize: vertical; line-height: 1.6; }
+
+.select-wrap { position: relative; display: inline-block; }
+.select-wrap::after {
+  content: '';
+  position: absolute; right: 10px; top: 50%; transform: translateY(-35%);
+  width: 0; height: 0;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-secondary);
+  pointer-events: none;
+}
+.field-select { appearance: none; -webkit-appearance: none; padding-right: 28px; cursor: pointer; }
+
+.switch { position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer; flex-shrink: 0; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch-track {
+  position: absolute; inset: 0; background: rgba(255, 255, 255, 0.18);
+  border-radius: 20px; transition: background var(--dur) var(--ease);
+}
+.switch-thumb {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: transform var(--dur) var(--ease);
+}
+.switch input:checked + .switch-track { background: var(--success); }
+.switch input:checked + .switch-track .switch-thumb { transform: translateX(16px); }
+
+/* ============ Link diagram (signature element) ============ */
+.diagram-card { padding: 28px 20px; }
+.link-diagram { display: flex; align-items: center; justify-content: space-between; }
+.link-node {
+  flex: 0 0 auto; width: 150px;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: var(--panel-strong); border: 1px solid var(--hairline);
+  border-radius: 16px; padding: 14px 10px; text-align: center;
+}
+.node-icon { font-size: 18px; color: var(--accent); line-height: 1; }
+.node-label {
+  font-size: 12px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px;
+}
+.node-sub {
+  font-size: 10px; color: var(--text-secondary); font-family: var(--font-mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px;
+}
+.node-badge {
+  font-size: 10px; color: var(--accent); background: var(--accent-dim);
+  border-radius: 6px; padding: 1px 6px; margin-top: 2px;
+}
+.link-line {
+  flex: 1 1 auto; height: 2px; background: var(--accent);
+  position: relative; margin: 0 -1px; opacity: 0.5;
+}
+.link-line .flow-dot {
+  position: absolute; top: 50%; left: 0; width: 6px; height: 6px; margin-top: -3px;
+  border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px var(--accent);
+  animation: flow 2.6s linear infinite;
+}
+@keyframes flow {
+  from { left: 0%; opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  to { left: 100%; opacity: 0; }
+}
+.link-diagram.proxy-bypassed .link-line {
+  background: repeating-linear-gradient(90deg, var(--text-tertiary) 0 6px, transparent 6px 12px);
+  opacity: 0.4;
+}
+.link-diagram.proxy-bypassed .flow-dot { display: none; }
+.link-diagram.proxy-bypassed #nodeProxy { opacity: 0.45; }
+.diagram-note { margin-top: 16px; font-size: 11px; color: var(--text-secondary); text-align: center; }
+
+/* ============ Overview summary grid ============ */
+.summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.summary-card { padding: 14px 16px; margin-bottom: 0; }
+.summary-label { font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; }
+.summary-value { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.summary-value.mono { font-family: var(--font-mono); font-size: 11px; font-weight: 400; color: var(--text-secondary); }
+
+/* ============ Provider cards / dashed add-cards ============ */
+.provider-card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--hairline);
+}
+.provider-card-title { font-size: 13px; font-weight: 600; }
+.dashed-card {
+  border: 1.5px dashed var(--hairline); background: transparent;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 16px; cursor: pointer; color: var(--text-secondary); font-size: 12px;
+  transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.dashed-card:hover { border-color: var(--accent); color: var(--accent); }
+.dashed-plus { font-size: 15px; }
+.empty-hint { padding: 20px 16px; text-align: center; color: var(--text-tertiary); font-size: 12px; }
+
+/* ============ Models table ============ */
+.models-table { width: 100%; border-collapse: collapse; }
+.models-table th {
+  text-align: left; font-size: 11px; color: var(--text-tertiary); font-weight: 600;
+  padding: 10px 16px; border-bottom: 1px solid var(--hairline);
+}
+.models-table td { padding: 8px 16px; border-bottom: 1px solid var(--hairline); }
+.models-table tr:last-child td { border-bottom: none; }
+.models-table .field-input { width: 100%; }
+
+/* ============ Save bar ============ */
+.save-bar {
+  position: absolute; left: 16px; right: 16px; bottom: -64px;
+  background: rgba(30, 31, 36, 0.92);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline); border-radius: 10px; padding: 12px 16px;
+  display: flex; align-items: center; justify-content: space-between;
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+  transition: bottom var(--dur) var(--ease);
+}
+.save-bar.visible { bottom: 16px; }
+.save-bar-text { font-size: 12px; color: var(--text-secondary); }
+.save-bar-actions { display: flex; gap: 8px; }
+
+/* ============ Toasts ============ */
+.toast-stack {
+  position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 8px; z-index: 1000; align-items: center;
+}
+.toast {
+  padding: 9px 18px; border-radius: 8px; font-size: 12px; color: #fff;
+  background: var(--panel-strong);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  animation: toastIn var(--dur) var(--ease);
+}
+.toast-success { background: rgba(50, 215, 75, 0.92); border-color: transparent; }
+.toast-error { background: rgba(255, 69, 58, 0.92); border-color: transparent; }
+.toast-out { animation: toastOut 0.4s var(--ease) forwards; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastOut { to { opacity: 0; transform: translateY(-12px); } }
+
+/* ============ Update modal ============ */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 2000; opacity: 0; transition: opacity var(--dur) var(--ease);
+}
+.modal-overlay.visible { opacity: 1; }
+.modal {
+  width: 380px; max-width: 90vw; max-height: 80vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--hairline); border-radius: 12px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  transform: scale(0.98); transition: transform var(--dur) var(--ease);
+}
+.modal-overlay.visible .modal { transform: scale(1); }
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--hairline);
+}
+.modal-title { font-size: 14px; font-weight: 600; }
+.modal-close {
+  background: transparent; border: none; color: var(--text-secondary);
+  font-size: 18px; cursor: pointer; line-height: 1; padding: 2px 6px;
+}
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 16px 18px; font-size: 12px; color: var(--text-secondary); }
+.modal-loading { display: flex; align-items: center; gap: 10px; justify-content: center; padding: 20px 0; }
+.modal-uptodate { text-align: center; padding: 12px 0; color: var(--success); }
+.modal-error { text-align: center; padding: 12px 0; color: var(--danger); }
+.modal-success { text-align: center; padding: 12px 0; color: var(--success); }
+.modal-behind { margin-bottom: 10px; color: var(--text); }
+.commit-list {
+  list-style: none; margin: 0 0 14px; padding: 0; max-height: 180px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.commit-list li {
+  font-size: 11px; font-family: var(--font-mono);
+  background: rgba(0, 0, 0, 0.25); border-radius: 6px; padding: 6px 10px;
+  word-break: break-all;
+}
+
+/* ============ Restart button (titlebar) ============ */
+.btn-secondary.btn-text-danger { color: var(--danger); }
+.btn-secondary.btn-text-danger:hover { background: var(--danger-dim); }
+
+/* ============ Generic modal footer (confirm dialogs) ============ */
+.modal-footer {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  padding: 12px 18px; border-top: 1px solid var(--hairline);
+}
+
+/* ============ Restart full-screen overlay ============ */
+.restart-overlay {
+  position: fixed; inset: 0; background: rgba(10, 10, 12, 0.72);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 3000; opacity: 0; transition: opacity var(--dur) var(--ease);
+}
+.restart-overlay.visible { opacity: 1; }
+.restart-card {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  background: var(--bg); border: 1px solid var(--hairline); border-radius: var(--radius-card);
+  padding: 32px 40px; max-width: 320px; text-align: center;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+}
+.restart-status-text { font-size: 13px; color: var(--text); line-height: 1.6; }
+.restart-status-sub { font-size: 11px; color: var(--text-secondary); }
+.restart-success-icon, .restart-error-icon {
+  width: 36px; height: 36px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700;
+}
+.restart-success-icon { background: var(--success-dim); color: var(--success); }
+.restart-error-icon { background: var(--danger-dim); color: var(--danger); }
+.restart-actions { display: flex; gap: 8px; margin-top: 4px; }
+
+/* ============ Logs page ============ */
+#page-logs.page.active { display: flex; flex-direction: column; height: 100%; }
+.content.compact-bottom { padding-bottom: 24px; }
+
+.logs-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px; margin-bottom: 10px; flex-shrink: 0;
+}
+.logs-toolbar-left { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-secondary); }
+.logs-toolbar-right { display: flex; gap: 8px; flex-shrink: 0; }
+.logs-meta { font-family: var(--font-mono); }
+.logs-truncated-hint { color: var(--warning); }
+
+.logs-status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-tertiary); flex-shrink: 0; }
+.logs-status-live { background: var(--success); box-shadow: 0 0 6px var(--success); animation: logsBreathe 1.6s ease-in-out infinite; }
+.logs-status-error { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.logs-status-paused { background: var(--text-tertiary); }
+@keyframes logsBreathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.logs-terminal {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  background: #131417; border: 1px solid var(--hairline); border-radius: var(--radius-card);
+  overflow-y: auto; padding: 12px 14px;
+}
+.logs-content {
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text);
+  white-space: pre-wrap; word-break: break-all;
+}
+.sgr-dim { opacity: 0.6; }
+.sgr-red { color: var(--danger); }
+.sgr-yellow { color: var(--warning); }
+
+.logs-scroll-bottom-btn {
+  position: absolute; right: 16px; bottom: 16px;
+  background: var(--accent); color: #fff; border: none; border-radius: 20px;
+  font-size: 11px; padding: 6px 14px; cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease);
+}
+.logs-scroll-bottom-btn:hover { background: #2a92ff; }
+
+/* ============ Reduced motion ============ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+</style>
+</head>
+<body>
+
+<div id="loadingState" class="state-screen">
+  <span class="spinner"></span>
+  <div>正在加载配置…</div>
+</div>
+
+<div id="errorState" class="state-screen" hidden>
+  <div class="error-card">
+    <div class="error-icon">!</div>
+    <div class="error-title">配置加载失败</div>
+    <div class="error-detail" id="errorDetail"></div>
+    <button class="btn btn-primary" data-action="retry">重试</button>
+  </div>
+</div>
+
+<div class="window" id="mainWindow" hidden>
+  <div class="titlebar">
+    <div class="traffic-lights">
+      <span class="tl tl-red"></span><span class="tl tl-yellow"></span><span class="tl tl-green"></span>
+    </div>
+    <div class="titlebar-title">Codex Gateway Lite</div>
+    <div class="titlebar-right">
+      <span class="version-pill">__CGL_VERSION__<span class="pending-dot" id="pendingDot" hidden></span></span>
+      <button class="btn btn-secondary btn-small" data-action="open-update">检查更新</button>
+      <button class="btn btn-secondary btn-small btn-text-danger" data-action="open-restart-confirm">重启服务</button>
+    </div>
+  </div>
+
+  <div class="shell">
+    <div class="sidebar">
+      <button class="nav-item active" data-action="nav" data-page="overview">概览</button>
+      <button class="nav-item" data-action="nav" data-page="provider">当前供应商</button>
+      <button class="nav-item" data-action="nav" data-page="providers">多供应商<span class="badge" id="aggregateBadge" hidden>生效中</span></button>
+      <button class="nav-item" data-action="nav" data-page="models">模型列表</button>
+      <button class="nav-item" data-action="nav" data-page="advanced">高级</button>
+      <button class="nav-item" data-action="nav" data-page="logs">日志</button>
+      <button class="nav-item" data-action="nav" data-page="about">关于</button>
+    </div>
+
+    <div class="content">
+      <section class="page active" id="page-overview">
+        <h1 class="page-title">概览</h1>
+        <p class="page-desc">Codex Gateway Lite 当前的转发链路与关键状态。</p>
+
+        <div class="card diagram-card">
+          <div class="link-diagram" id="linkDiagram">
+            <div class="link-node">
+              <div class="node-icon">●</div>
+              <div class="node-label">Codex App</div>
+            </div>
+            <div class="link-line"><span class="flow-dot"></span></div>
+            <div class="link-node" id="nodeProxy">
+              <div class="node-icon">⇄</div>
+              <div class="node-label">本地代理</div>
+              <div class="node-sub">127.0.0.1:57321</div>
+            </div>
+            <div class="link-line"><span class="flow-dot"></span></div>
+            <div class="link-node">
+              <div class="node-icon">☁</div>
+              <div class="node-label" id="providerNameLabel">—</div>
+              <div class="node-sub" id="providerHostLabel">—</div>
+              <div class="node-badge" id="providerProtocolBadge">—</div>
+            </div>
+          </div>
+          <div class="diagram-note" id="diagramNote"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-row">
+            <div class="row-info">
+              <div class="row-label">聚合多供应商</div>
+              <div class="row-caption">开启后按模型过滤规则合并所有已保存供应商的模型目录，自动路由请求。</div>
+            </div>
+            <div class="row-control">
+              <label class="switch">
+                <input type="checkbox" id="aggregateToggle" data-scope="active" data-field="aggregate">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="summary-grid">
+          <div class="card summary-card">
+            <div class="summary-label">当前供应商</div>
+            <div class="summary-value" id="summaryProviderName">—</div>
+          </div>
+          <div class="card summary-card">
+            <div class="summary-label">当前模型</div>
+            <div class="summary-value" id="summaryModel">—</div>
+          </div>
+          <div class="card summary-card">
+            <div class="summary-label">上下文窗口</div>
+            <div class="summary-value" id="summaryContextWindow">—</div>
+          </div>
+          <div class="card summary-card">
+            <div class="summary-label">配置文件</div>
+            <div class="summary-value mono" id="summaryConfigPath">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-provider">
+        <h1 class="page-title">当前供应商</h1>
+        <p class="page-desc">正在生效的上游供应商与路由参数，保存后重启生效。</p>
+        <div id="page-provider-body"></div>
+      </section>
+
+      <section class="page" id="page-providers">
+        <h1 class="page-title">多供应商</h1>
+        <p class="page-desc">保存多个供应商配置；开启概览页的"聚合多供应商"后，按各自的模型过滤前缀自动合并路由。</p>
+        <div id="providersList"></div>
+        <div class="card dashed-card" data-action="add-provider" role="button" tabindex="0">
+          <span class="dashed-plus">+</span><span>添加供应商</span>
+        </div>
+      </section>
+
+      <section class="page" id="page-models">
+        <h1 class="page-title">模型列表</h1>
+        <p class="page-desc">当前供应商的模型目录，用于展示与聚合路由。</p>
+        <div class="card">
+          <table class="models-table">
+            <thead><tr><th>模型 ID</th><th>上下文窗口</th><th></th></tr></thead>
+            <tbody id="modelsBody"></tbody>
+          </table>
+        </div>
+        <div class="card dashed-card" data-action="add-model" role="button" tabindex="0">
+          <span class="dashed-plus">+</span><span>添加模型</span>
+        </div>
+      </section>
+
+      <section class="page" id="page-advanced">
+        <h1 class="page-title">高级</h1>
+        <p class="page-desc">影响 Codex 客户端行为的额外设置，改动前建议了解其含义。</p>
+        <div class="card">
+          <div class="card-row">
+            <div class="row-info">
+              <div class="row-label">计划提示</div>
+              <div class="row-caption">开启后在系统提示中加入生成执行计划的引导，多数场景建议保持开启。</div>
+            </div>
+            <div class="row-control">
+              <label class="switch">
+                <input type="checkbox" id="planHintsToggle" data-scope="active" data-field="planHints">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">自定义配置片段</div>
+          <div class="card-row card-row-block">
+            <div class="row-info">
+              <div class="row-label">Common Config（TOML）</div>
+              <div class="row-caption">追加到 ~/.codex/config.toml 的自定义片段，用于覆盖 Codex 客户端的额外设置，留空则不追加。</div>
+            </div>
+          </div>
+          <textarea class="field-textarea mono-input" id="commonConfigTextarea" data-scope="active" data-field="commonConfig" rows="12" spellcheck="false"></textarea>
+        </div>
+      </section>
+
+      <section class="page" id="page-logs">
+        <h1 class="page-title">日志</h1>
+        <p class="page-desc">实时查看网关进程的运行日志。</p>
+        <div class="logs-toolbar">
+          <div class="logs-toolbar-left">
+            <span class="logs-status-dot logs-status-live" id="logsStatusDot"></span>
+            <span id="logsStatusLabel">实时</span>
+            <span class="logs-meta" id="logsLoadedMeta">— / —</span>
+            <span class="logs-truncated-hint" id="logsTruncatedHint" hidden>仅显示最近 64KB</span>
+          </div>
+          <div class="logs-toolbar-right">
+            <button class="btn btn-secondary btn-small" data-action="logs-toggle-pause" id="logsPauseBtn">暂停</button>
+            <button class="btn btn-secondary btn-small" data-action="logs-clear">清屏</button>
+            <button class="btn btn-secondary btn-small" data-action="logs-copy">复制全部</button>
+          </div>
+        </div>
+        <div class="logs-terminal" id="logsViewport">
+          <div class="logs-content" id="logsContent"></div>
+          <button class="logs-scroll-bottom-btn" id="logsScrollBottomBtn" data-action="logs-scroll-bottom" hidden>回到底部 ↓</button>
+        </div>
+      </section>
+
+      <section class="page" id="page-about">
+        <h1 class="page-title">关于</h1>
+        <p class="page-desc">Codex Gateway Lite 的版本信息与配置文件位置。</p>
+        <div class="card">
+          <div class="card-row">
+            <div class="row-info"><div class="row-label">版本</div></div>
+            <div class="row-control mono" id="aboutVersion">__CGL_VERSION__</div>
+          </div>
+          <div class="card-row">
+            <div class="row-info"><div class="row-label">提交哈希</div></div>
+            <div class="row-control mono" id="aboutHash">—</div>
+          </div>
+          <div class="card-row">
+            <div class="row-info"><div class="row-label">构建日期</div></div>
+            <div class="row-control mono" id="aboutDate">—</div>
+          </div>
+          <div class="card-row">
+            <div class="row-info"><div class="row-label">配置文件路径</div></div>
+            <div class="row-control mono" id="aboutConfigPath">—</div>
+          </div>
+        </div>
+        <button class="btn btn-secondary" data-action="open-update">检查更新</button>
+      </section>
+    </div>
+  </div>
+
+  <div class="save-bar" id="saveBar">
+    <span class="save-bar-text">有未保存的修改</span>
+    <div class="save-bar-actions">
+      <button class="btn btn-secondary" data-action="discard" id="discardBtn">放弃</button>
+      <button class="btn btn-primary" data-action="save" id="saveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toastStack"></div>
+
+<div class="modal-overlay" id="updateModal" hidden>
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">检查更新</div>
+      <button class="modal-close" data-action="close-update" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body" id="updateModalBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="restartConfirmModal" hidden>
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">重启 Codex Gateway Lite？</div>
+      <button class="modal-close" data-action="close-restart-confirm" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p>会短暂断开正在进行的 Codex 对话；若有代码或配置改动，重启时会自动重新编译并生效。</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" data-action="close-restart-confirm">取消</button>
+      <button class="btn btn-danger" data-action="confirm-restart">确认重启</button>
+    </div>
+  </div>
+</div>
+
+<div class="restart-overlay" id="restartOverlay" hidden>
+  <div class="restart-card" id="restartCard">
+    <span class="spinner" id="restartSpinner"></span>
+    <div class="restart-status-text" id="restartStatusText">正在重启服务…</div>
+    <div class="restart-status-sub" id="restartStatusSub">编译更新时可能需要一两分钟</div>
+    <div class="restart-actions" id="restartActions" hidden>
+      <button class="btn btn-secondary btn-small" data-action="restart-retry-probe">重试探活</button>
+      <button class="btn btn-secondary btn-small" data-action="restart-overlay-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+'use strict';
+
+/* ============ Injected constants ============ */
+var TOKEN = "__CGL_TOKEN__";
+var VERSION = "__CGL_VERSION__";
+
+/* ============ State ============ */
+var state = {
+  raw: null,
+  original: null,
+  configPath: '',
+  version: '',
+  dirty: false,
+  updatePending: false
+};
+var versionLoaded = false;
+
+/* ============ Logs page state ============ */
+var LOG_POLL_INTERVAL_MS = 1500;
+var LOG_BUFFER_CHAR_LIMIT = 2 * 1024 * 1024;
+var LOG_MAX_CATCHUP_FETCHES = 20;
+var logState = {
+  offset: 0,
+  size: 0,
+  truncated: false,
+  timer: null,
+  paused: false,
+  stickToBottom: true,
+  totalChars: 0,
+  fetching: false,
+  failCount: 0
+};
+
+/* ============ Restart flow state ============ */
+var RESTART_PROBE_INTERVAL_MS = 2000;
+var RESTART_PROBE_TIMEOUT_MS = 3 * 60 * 1000;
+var restartState = { probeTimer: null, deadlineTimer: null };
+
+/* ============ DOM helpers ============ */
+function byId(id) { return document.getElementById(id); }
+function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+/* ============ Domain helpers (mirror backend parsing rules) ============ */
+var BUDGET_DISABLED_WORDS = { '': 1, '0': 1, 'off': 1, 'none': 1, 'no': 1, 'false': 1, 'disable': 1, 'disabled': 1 };
+function isBudgetDisabled(value) {
+  if (value === null || value === undefined) return true;
+  var t = String(value).trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(BUDGET_DISABLED_WORDS, t);
+}
+
+function normalizeModelEntry(entry) {
+  if (typeof entry === 'string') return { id: entry, contextWindow: '' };
+  if (entry && typeof entry === 'object') return { id: entry.id || '', contextWindow: entry.contextWindow || '' };
+  return { id: '', contextWindow: '' };
+}
+
+function setDeep(obj, path, value) {
+  var parts = path.split('.');
+  var cur = obj;
+  for (var i = 0; i < parts.length - 1; i++) {
+    var p = parts[i];
+    if (cur[p] === undefined || cur[p] === null) cur[p] = {};
+    cur = cur[p];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+function splitFilterList(text) {
+  return text.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+}
+
+function modelsToText(models) {
+  return (models || []).map(function (m) {
+    var n = normalizeModelEntry(m);
+    return n.contextWindow ? (n.id + ' | ' + n.contextWindow) : n.id;
+  }).join('\n');
+}
+
+function textToModels(text) {
+  return text.split('\n').map(function (line) { return line.trim(); }).filter(function (l) { return l.length > 0; }).map(function (line) {
+    var idx = line.indexOf('|');
+    if (idx === -1) return { id: line.trim(), contextWindow: '' };
+    return { id: line.slice(0, idx).trim(), contextWindow: line.slice(idx + 1).trim() };
+  });
+}
+
+/* ============ Shape normalization (providers / modelFilter may be absent from JSON) ============ */
+function ensureProviderShape(p) {
+  p = p || {};
+  p.id = p.id || '';
+  p.name = p.name || '';
+  p.baseUrl = p.baseUrl || '';
+  p.apiKey = p.apiKey || '';
+  p.apiKeyEnv = p.apiKeyEnv || '';
+  p.mode = p.mode || 'mixed_api';
+  p.protocol = p.protocol || 'responses';
+  p.contextBudget = p.contextBudget || '';
+  p.modelFilter = Array.isArray(p.modelFilter) ? p.modelFilter : [];
+  return p;
+}
+
+function ensureProfileShape(obj) {
+  obj = obj || {};
+  obj.provider = ensureProviderShape(obj.provider);
+  obj.model = obj.model || '';
+  obj.models = Array.isArray(obj.models) ? obj.models.map(normalizeModelEntry) : [];
+  obj.contextWindow = obj.contextWindow || '';
+  obj.autoCompactTokenLimit = obj.autoCompactTokenLimit || '';
+  return obj;
+}
+
+function ensureShape(config) {
+  ensureProfileShape(config);
+  config.commonConfig = config.commonConfig || '';
+  config.planHints = config.planHints !== undefined ? config.planHints : true;
+  config.providers = Array.isArray(config.providers) ? config.providers.map(ensureProfileShape) : [];
+  config.aggregate = !!config.aggregate;
+  return config;
+}
+
+/* ============ Fetch wrapper ============ */
+function api(path, options) {
+  options = options || {};
+  var headers = { 'Authorization': 'Bearer ' + TOKEN };
+  if (options.body) headers['Content-Type'] = 'application/json';
+  Object.keys(options.headers || {}).forEach(function (k) { headers[k] = options.headers[k]; });
+  var fetchOpts = { method: options.method || 'GET', headers: headers };
+  if (options.body) fetchOpts.body = options.body;
+
+  return fetch(path, fetchOpts).catch(function () {
+    return Promise.reject({ friendly: '网络请求失败，请确认网关进程是否仍在运行' });
+  }).then(function (res) {
+    return res.json().catch(function () { return null; }).then(function (data) {
+      if (res.status === 401) return Promise.reject({ friendly: '鉴权失败：Token 无效或已过期，请重新打开此页面', status: 401 });
+      if (!res.ok) {
+        var msg = (data && (data.error || data.message)) || ('请求失败（HTTP ' + res.status + '）');
+        return Promise.reject({ friendly: msg, status: res.status, raw: data });
+      }
+      return data;
+    });
+  });
+}
+
+/* ============ Load flow ============ */
+function loadConfig() {
+  showLoading();
+  return api('/api/ui/config').then(function (data) {
+    var cfg = ensureShape((data && data.config) || {});
+    state.raw = cfg;
+    state.original = deepClone(cfg);
+    state.configPath = (data && data.configPath) || '';
+    state.version = (data && data.version) || '';
+    renderAll();
+    state.dirty = false;
+    updateSaveBar();
+    showMain();
+  }).catch(function (err) {
+    showError((err && err.friendly) || '未知错误');
+  });
+}
+
+function showLoading() {
+  byId('loadingState').hidden = false;
+  byId('errorState').hidden = true;
+  byId('mainWindow').hidden = true;
+}
+function showError(msg) {
+  byId('loadingState').hidden = true;
+  byId('errorState').hidden = false;
+  byId('mainWindow').hidden = true;
+  byId('errorDetail').textContent = msg;
+}
+function showMain() {
+  byId('loadingState').hidden = true;
+  byId('errorState').hidden = true;
+  byId('mainWindow').hidden = false;
+}
+
+/* ============ Render orchestration ============ */
+function renderAll() {
+  renderProviderFields();
+  renderModelsTable();
+  renderProvidersList();
+  renderAdvanced();
+  updateOverview();
+  updateAggregateBadge();
+}
+
+function notifyChanged() {
+  state.dirty = JSON.stringify(state.raw) !== JSON.stringify(state.original);
+  updateOverview();
+  updateAggregateBadge();
+  updateSaveBar();
+}
+
+function updateSaveBar() {
+  byId('saveBar').classList.toggle('visible', state.dirty);
+}
+
+function updateOverview() {
+  var cfg = state.raw;
+  var p = cfg.provider;
+  byId('summaryProviderName').textContent = p.name || p.id || '—';
+  byId('summaryModel').textContent = cfg.model || '（未指定，使用目录默认）';
+  byId('summaryContextWindow').textContent = cfg.contextWindow || '（未设置）';
+  byId('summaryConfigPath').textContent = state.configPath || '—';
+  byId('aboutConfigPath').textContent = state.configPath || '—';
+  byId('aggregateToggle').checked = !!cfg.aggregate;
+  updateLinkDiagram();
+}
+
+function updateLinkDiagram() {
+  var p = state.raw.provider;
+  var bypassed = p.protocol === 'responses' && isBudgetDisabled(p.contextBudget);
+  byId('linkDiagram').classList.toggle('proxy-bypassed', bypassed);
+  byId('providerNameLabel').textContent = p.name || p.id || '未命名供应商';
+  var host = p.baseUrl || '—';
+  try { var u = new URL(p.baseUrl); if (u.host) host = u.host; } catch (e) { /* keep raw string */ }
+  byId('providerHostLabel').textContent = host;
+  byId('providerProtocolBadge').textContent = p.protocol === 'chat_completions' ? 'Chat Completions' : 'Responses';
+  byId('diagramNote').textContent = bypassed
+    ? 'Responses 直连模式且未设置上下文预算：本地协议代理 127.0.0.1:57321 不会启动，请求直连上游。'
+    : '本地协议代理 127.0.0.1:57321 正在参与转发与上下文裁剪。';
+}
+
+function updateAggregateBadge() {
+  byId('aggregateBadge').hidden = !state.raw.aggregate;
+}
+
+function renderAdvanced() {
+  byId('planHintsToggle').checked = !!state.raw.planHints;
+  byId('commonConfigTextarea').value = state.raw.commonConfig || '';
+}
+
+/* ============ Shared field template (active provider + saved profiles) ============ */
+function fieldRow(label, caption, controlHtml) {
+  return '<div class="card-row">' +
+    '<div class="row-info"><div class="row-label">' + label + '</div><div class="row-caption">' + caption + '</div></div>' +
+    '<div class="row-control">' + controlHtml + '</div>' +
+    '</div>';
+}
+
+function textInput(scope, idx, field, value, opts) {
+  opts = opts || {};
+  var idxAttr = (idx === null || idx === undefined || idx === '') ? '' : (' data-index="' + idx + '"');
+  var cls = 'field-input' + (opts.mono ? ' mono-input' : '');
+  var placeholder = opts.placeholder ? (' placeholder="' + escapeHtml(opts.placeholder) + '"') : '';
+  var apikeyAttr = opts.apikey ? ' data-apikey="1"' : '';
+  var originalAttr = opts.apikey ? (' data-original="' + escapeHtml(value) + '"') : '';
+  return '<input type="text" class="' + cls + '" data-scope="' + scope + '"' + idxAttr + ' data-field="' + field + '" value="' + escapeHtml(value) + '"' + placeholder + apikeyAttr + originalAttr + '>';
+}
+
+function selectInput(scope, idx, field, value, options) {
+  var idxAttr = (idx === null || idx === undefined || idx === '') ? '' : (' data-index="' + idx + '"');
+  var opts = options.map(function (o) {
+    return '<option value="' + o.value + '"' + (o.value === value ? ' selected' : '') + '>' + escapeHtml(o.label) + '</option>';
+  }).join('');
+  return '<span class="select-wrap"><select class="field-select" data-scope="' + scope + '"' + idxAttr + ' data-field="' + field + '">' + opts + '</select></span>';
+}
+
+function profileFieldsHtml(scope, index, obj) {
+  var p = obj.provider;
+  var modelFilterText = (p.modelFilter || []).join(', ');
+  var idx = (index === null || index === undefined) ? '' : index;
+  var html = '';
+
+  html += '<div class="card"><div class="card-title">供应商信息</div>' +
+    fieldRow('供应商 ID', '用于内部标识该供应商，同一份配置内不要重复。', textInput(scope, idx, 'provider.id', p.id)) +
+    fieldRow('显示名称', '展示在概览与列表中的名字，留空则显示 ID。', textInput(scope, idx, 'provider.name', p.name)) +
+    fieldRow('Base URL', '上游服务的基础地址，例如 https://api.example.com/v1。', textInput(scope, idx, 'provider.baseUrl', p.baseUrl, { mono: true, placeholder: 'https://...' })) +
+    '</div>';
+
+  html += '<div class="card"><div class="card-title">认证</div>' +
+    fieldRow('API Key', '重新粘贴完整密钥即可更换；聚焦后会自动全选，不修改则保留现有密钥。', textInput(scope, idx, 'provider.apiKey', p.apiKey, { mono: true, apikey: true })) +
+    fieldRow('环境变量名', '若填写，登录时优先从该环境变量读取密钥，忽略上面的 API Key。', textInput(scope, idx, 'provider.apiKeyEnv', p.apiKeyEnv, { mono: true, placeholder: '例如 CODEX_GATEWAY_API_KEY' })) +
+    fieldRow('转发模式', 'Mixed API 为推荐模式；Pure API 已废弃，可能覆盖 Codex 登录态。', selectInput(scope, idx, 'provider.mode', p.mode, [
+      { value: 'mixed_api', label: 'Mixed API（推荐）' },
+      { value: 'pure_api', label: 'Pure API（已废弃）' }
+    ])) +
+    fieldRow('协议', '决定网关与上游之间使用的请求协议格式。', selectInput(scope, idx, 'provider.protocol', p.protocol, [
+      { value: 'responses', label: 'Responses' },
+      { value: 'chat_completions', label: 'Chat Completions' }
+    ])) +
+    '</div>';
+
+  html += '<div class="card"><div class="card-title">路由参数</div>' +
+    fieldRow('上下文预算', '为上下文预留的裁剪余量，如 200K；支持 K/KB/M/MB 后缀，留空或填 off 关闭裁剪。', textInput(scope, idx, 'provider.contextBudget', p.contextBudget, { mono: true, placeholder: '例如 200K，留空关闭' })) +
+    fieldRow('模型过滤前缀', '按前缀过滤该供应商提供的模型，刷新目录时生效（非聚合模式下也生效）；逗号分隔，留空不过滤。', textInput(scope, idx, 'provider.modelFilter', modelFilterText, { mono: true, placeholder: '例如 claude, gpt-5' })) +
+    '</div>';
+
+  html += '<div class="card"><div class="card-title">模型与上下文</div>' +
+    fieldRow('模型 ID', '指定使用的模型 ID，留空则使用目录中的第一个模型。', textInput(scope, idx, 'model', obj.model, { mono: true })) +
+    fieldRow('上下文窗口', '模型的上下文窗口大小，如 1M / 200K，支持整数或 K/M 后缀。', textInput(scope, idx, 'contextWindow', obj.contextWindow, { mono: true, placeholder: '例如 1M' })) +
+    fieldRow('自动压缩阈值', '触发自动压缩上下文的 token 阈值，格式同上，留空使用模型默认值。', textInput(scope, idx, 'autoCompactTokenLimit', obj.autoCompactTokenLimit, { mono: true, placeholder: '留空使用默认值' })) +
+    '</div>';
+
+  if (scope === 'profile') {
+    html += '<div class="card"><div class="card-title">模型目录</div>' +
+      '<div class="card-row card-row-block"><div class="row-info"><div class="row-label">模型列表</div>' +
+      '<div class="row-caption">每行一个模型，格式为「模型 ID」或「模型 ID | 上下文窗口」，例如 claude-sonnet-5 | 1M。</div></div></div>' +
+      '<textarea class="field-textarea mono-input" data-scope="profile" data-index="' + idx + '" data-field="__models_text" rows="4" placeholder="claude-sonnet-5 | 1M">' + escapeHtml(modelsToText(obj.models)) + '</textarea>' +
+      '</div>';
+  }
+  return html;
+}
+
+function renderProviderFields() {
+  byId('page-provider-body').innerHTML = profileFieldsHtml('active', null, state.raw);
+}
+
+function renderProvidersList() {
+  var list = state.raw.providers;
+  var wrap = byId('providersList');
+  if (!list.length) {
+    wrap.innerHTML = '<div class="empty-hint">还没有已保存的供应商，点击下方"添加供应商"创建一个。</div>';
+    return;
+  }
+  wrap.innerHTML = list.map(function (prof, i) {
+    return '<div class="card provider-card">' +
+      '<div class="provider-card-header"><div class="provider-card-title">' + escapeHtml(prof.provider.name || prof.provider.id || '未命名供应商') + '</div>' +
+      '<button class="btn btn-danger btn-small" data-action="delete-provider" data-index="' + i + '">删除</button></div>' +
+      profileFieldsHtml('profile', i, prof) +
+      '</div>';
+  }).join('');
+}
+
+function renderModelsTable() {
+  var rows = state.raw.models;
+  var body = byId('modelsBody');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="3" class="empty-hint">还没有模型，点击下方"添加模型"创建一行。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(function (m, i) {
+    return '<tr>' +
+      '<td><input type="text" class="field-input mono-input" data-scope="active" data-field="models.' + i + '.id" value="' + escapeHtml(m.id) + '" placeholder="模型 ID"></td>' +
+      '<td><input type="text" class="field-input mono-input" data-scope="active" data-field="models.' + i + '.contextWindow" value="' + escapeHtml(m.contextWindow) + '" placeholder="如 1M"></td>' +
+      '<td><button class="btn btn-danger btn-small" data-action="delete-model" data-index="' + i + '">删除</button></td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* ============ Mutations ============ */
+function resolveTarget(scope, index) {
+  if (scope === 'active') return state.raw;
+  if (scope === 'profile') return state.raw.providers[Number(index)];
+  return null;
+}
+
+function handleFieldEvent(e) {
+  var el = e.target;
+  if (!el.matches('[data-field]')) return;
+  var scope = el.dataset.scope;
+  var index = el.dataset.index;
+  var field = el.dataset.field;
+  var target = resolveTarget(scope, index);
+  if (!target) return;
+
+  if (field === '__models_text') {
+    target.models = textToModels(el.value);
+    notifyChanged();
+    return;
+  }
+
+  var value = el.type === 'checkbox' ? el.checked : el.value;
+  if (field === 'provider.modelFilter') value = splitFilterList(el.value);
+  setDeep(target, field, value);
+  if (el.dataset.apikey) el.classList.toggle('changed', el.value !== el.dataset.original);
+  notifyChanged();
+}
+
+function addProvider() {
+  state.raw.providers.push(ensureProfileShape({
+    provider: { id: 'provider-' + (state.raw.providers.length + 1), name: '', baseUrl: '', apiKey: '', apiKeyEnv: '', mode: 'mixed_api', protocol: 'responses', contextBudget: '', modelFilter: [] },
+    model: '', models: [], contextWindow: '', autoCompactTokenLimit: ''
+  }));
+  renderProvidersList();
+  notifyChanged();
+}
+
+function deleteProvider(i) {
+  if (!confirm('确定删除该供应商配置吗？此操作不可撤销。')) return;
+  state.raw.providers.splice(i, 1);
+  renderProvidersList();
+  notifyChanged();
+}
+
+function addModel() {
+  state.raw.models.push({ id: '', contextWindow: '' });
+  renderModelsTable();
+  notifyChanged();
+}
+
+function deleteModel(i) {
+  state.raw.models.splice(i, 1);
+  renderModelsTable();
+  notifyChanged();
+}
+
+/* ============ Save / discard ============ */
+function saveConfig() {
+  var btn = byId('saveBtn');
+  var original = btn.textContent;
+  btn.disabled = true;
+  api('/api/ui/config', { method: 'POST', body: JSON.stringify(state.raw) }).then(function (res) {
+    btn.textContent = '已保存 ✓';
+    btn.classList.add('success');
+    showToast('success', (res && res.message) || '配置已保存');
+    return loadConfig();
+  }).catch(function (err) {
+    showToast('error', (err && err.friendly) || '保存失败');
+  }).then(function () {
+    setTimeout(function () {
+      btn.textContent = original;
+      btn.classList.remove('success');
+      btn.disabled = false;
+    }, 1500);
+  });
+}
+
+function discardChanges() {
+  state.raw = deepClone(state.original);
+  renderAll();
+  state.dirty = false;
+  updateSaveBar();
+  showToast('success', '已放弃未保存的修改');
+}
+
+/* ============ Toasts ============ */
+function showToast(type, message) {
+  var stack = byId('toastStack');
+  var el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = message;
+  stack.appendChild(el);
+  setTimeout(function () { el.classList.add('toast-out'); }, 3700);
+  setTimeout(function () { el.remove(); }, 4200);
+}
+
+/* ============ Update modal ============ */
+function openUpdateModal() {
+  var modal = byId('updateModal');
+  modal.hidden = false;
+  requestAnimationFrame(function () { modal.classList.add('visible'); });
+  checkForUpdates();
+}
+
+function closeUpdateModal() {
+  var modal = byId('updateModal');
+  modal.classList.remove('visible');
+  setTimeout(function () { modal.hidden = true; }, 200);
+}
+
+function checkForUpdates() {
+  var body = byId('updateModalBody');
+  body.innerHTML = '<div class="modal-loading"><span class="spinner spinner-small"></span><span>正在检查更新…</span></div>';
+  api('/api/ui/update/check', { method: 'POST' }).then(function (res) {
+    if (!res || !res.ok) {
+      body.innerHTML = '<div class="modal-error">' + escapeHtml((res && res.error) || '检查更新失败') + '</div>';
+      return;
+    }
+    if (!res.behind) {
+      body.innerHTML = '<div class="modal-uptodate">已是最新版本（当前 ' + escapeHtml(res.current || '') + '）。</div>';
+      return;
+    }
+    var commits = (res.commits || []).map(function (c) { return '<li>' + escapeHtml(c) + '</li>'; }).join('');
+    body.innerHTML = '<div class="modal-behind">落后 ' + res.behind + ' 个提交：</div>' +
+      '<ul class="commit-list">' + commits + '</ul>' +
+      '<button class="btn btn-primary" data-action="confirm-update">更新并在下次重启生效</button>';
+  }).catch(function (err) {
+    body.innerHTML = '<div class="modal-error">' + escapeHtml((err && err.friendly) || '检查更新失败') + '</div>';
+  });
+}
+
+function applyUpdate() {
+  var body = byId('updateModalBody');
+  body.innerHTML = '<div class="modal-loading"><span class="spinner spinner-small"></span><span>正在更新…</span></div>';
+  api('/api/ui/update/apply', { method: 'POST' }).then(function (res) {
+    if (!res || !res.ok) {
+      body.innerHTML = '<div class="modal-error">' + escapeHtml((res && res.error) || '更新失败') + '</div>';
+      return;
+    }
+    body.innerHTML = '<div class="modal-success">' + escapeHtml(res.message || '更新成功') + '</div>' +
+      '<button class="btn btn-primary" data-action="restart-now">立即重启生效</button>';
+    state.updatePending = true;
+    byId('pendingDot').hidden = false;
+  }).catch(function (err) {
+    body.innerHTML = '<div class="modal-error">' + escapeHtml((err && err.friendly) || '更新失败') + '</div>';
+  });
+}
+
+/* ============ Logs page ============ */
+var ANSI_SGR_RE = /\x1b\[([0-9;]*)m|\x1b\[[0-9;]*[A-Za-z]/g;
+var ANSI_CLASS_MAP = { '2': 'sgr-dim', '31': 'sgr-red', '33': 'sgr-yellow' };
+
+function renderAnsiLog(text) {
+  var out = '';
+  var currentClass = null;
+  var openSpan = false;
+  var lastIndex = 0;
+  var match;
+
+  function flushPlain(plain) {
+    if (!plain) return;
+    if (currentClass && !openSpan) { out += '<span class="' + currentClass + '">'; openSpan = true; }
+    out += escapeHtml(plain);
+  }
+  function closeSpan() {
+    if (openSpan) { out += '</span>'; openSpan = false; }
+  }
+
+  ANSI_SGR_RE.lastIndex = 0;
+  while ((match = ANSI_SGR_RE.exec(text)) !== null) {
+    flushPlain(text.slice(lastIndex, match.index));
+    lastIndex = ANSI_SGR_RE.lastIndex;
+    var params = match[1];
+    if (params !== undefined) {
+      var codes = params === '' ? ['0'] : params.split(';');
+      codes.forEach(function (code) {
+        if (code === '0' || code === '') {
+          closeSpan();
+          currentClass = null;
+        } else if (Object.prototype.hasOwnProperty.call(ANSI_CLASS_MAP, code)) {
+          closeSpan();
+          currentClass = ANSI_CLASS_MAP[code];
+        }
+        /* unrecognized SGR codes are silently ignored (stripped, no class change) */
+      });
+    }
+    /* non-SGR CSI sequences (params undefined) are stripped entirely, no text emitted */
+  }
+  flushPlain(text.slice(lastIndex));
+  closeSpan();
+  return out;
+}
+
+function formatLogBytes(n) {
+  if (typeof n !== 'number' || isNaN(n)) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function updateLogMeta() {
+  byId('logsLoadedMeta').textContent = '已加载 ' + formatLogBytes(logState.offset) + ' / ' + formatLogBytes(logState.size);
+  byId('logsTruncatedHint').hidden = !logState.truncated;
+}
+
+function updateLogStatusDot() {
+  var dot = byId('logsStatusDot');
+  var label = byId('logsStatusLabel');
+  if (logState.paused) {
+    dot.className = 'logs-status-dot logs-status-paused';
+    label.textContent = '已暂停';
+  } else if (logState.failCount > 0) {
+    dot.className = 'logs-status-dot logs-status-error';
+    label.textContent = '连接断开，重试中…';
+  } else {
+    dot.className = 'logs-status-dot logs-status-live';
+    label.textContent = '实时';
+  }
+}
+
+function appendLogChunk(text) {
+  if (!text) return;
+  var container = byId('logsContent');
+  var wrapper = document.createElement('span');
+  wrapper.className = 'log-chunk';
+  wrapper.innerHTML = renderAnsiLog(text);
+  container.appendChild(wrapper);
+  logState.totalChars += text.length;
+  while (logState.totalChars > LOG_BUFFER_CHAR_LIMIT && container.childNodes.length > 1) {
+    var first = container.firstChild;
+    logState.totalChars -= (first.textContent || '').length;
+    container.removeChild(first);
+  }
+}
+
+function isLogsNearBottom(el, threshold) {
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) < (threshold || 40);
+}
+
+function handleLogsScroll() {
+  var el = byId('logsViewport');
+  var atBottom = isLogsNearBottom(el, 40);
+  logState.stickToBottom = atBottom;
+  byId('logsScrollBottomBtn').hidden = atBottom;
+}
+
+function maybeAutoScrollLogs() {
+  if (!logState.stickToBottom) return;
+  var el = byId('logsViewport');
+  el.scrollTop = el.scrollHeight;
+}
+
+function scrollLogsToBottom() {
+  var el = byId('logsViewport');
+  el.scrollTop = el.scrollHeight;
+  logState.stickToBottom = true;
+  byId('logsScrollBottomBtn').hidden = true;
+}
+
+function clearLogsView() {
+  byId('logsContent').innerHTML = '';
+  logState.totalChars = 0;
+}
+
+function copyLogsToClipboard() {
+  var text = byId('logsContent').textContent || '';
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () {
+      showToast('success', '已复制到剪贴板');
+    }).catch(function () {
+      showToast('error', '复制失败，请手动选择文本复制');
+    });
+  } else {
+    showToast('error', '当前环境不支持自动复制');
+  }
+}
+
+function fetchLogsCycle(depth) {
+  if (logState.fetching) return;
+  logState.fetching = true;
+  depth = depth || 0;
+  var qs = logState.offset ? ('?offset=' + logState.offset) : '';
+  api('/api/ui/logs' + qs).then(function (res) {
+    logState.fetching = false;
+    if (!res || !res.ok) {
+      logState.failCount++;
+      updateLogStatusDot();
+      return;
+    }
+    logState.failCount = 0;
+    if (res.content) appendLogChunk(res.content);
+    if (typeof res.offset === 'number') logState.offset = res.offset;
+    if (typeof res.size === 'number') logState.size = res.size;
+    logState.truncated = !!res.truncated;
+    updateLogMeta();
+    updateLogStatusDot();
+    maybeAutoScrollLogs();
+    if (logState.offset < logState.size && depth < LOG_MAX_CATCHUP_FETCHES) {
+      fetchLogsCycle(depth + 1);
+    }
+  }).catch(function () {
+    logState.fetching = false;
+    logState.failCount++;
+    updateLogStatusDot();
+  });
+}
+
+function startLogInterval() {
+  if (logState.timer) return;
+  fetchLogsCycle();
+  logState.timer = setInterval(function () { fetchLogsCycle(); }, LOG_POLL_INTERVAL_MS);
+}
+
+function stopLogInterval() {
+  if (logState.timer) { clearInterval(logState.timer); logState.timer = null; }
+}
+
+function setLogPaused(paused) {
+  logState.paused = paused;
+  if (paused) stopLogInterval(); else startLogInterval();
+  updateLogStatusDot();
+  var btn = byId('logsPauseBtn');
+  if (btn) btn.textContent = paused ? '继续' : '暂停';
+}
+
+function enterLogsPage() {
+  document.querySelector('.content').classList.add('compact-bottom');
+  updateLogStatusDot();
+  if (!logState.paused) startLogInterval();
+}
+
+function leaveLogsPage() {
+  document.querySelector('.content').classList.remove('compact-bottom');
+  stopLogInterval();
+}
+
+/* ============ Restart flow ============ */
+function openRestartConfirm() {
+  var modal = byId('restartConfirmModal');
+  modal.hidden = false;
+  requestAnimationFrame(function () { modal.classList.add('visible'); });
+}
+
+function closeRestartConfirm() {
+  var modal = byId('restartConfirmModal');
+  modal.classList.remove('visible');
+  setTimeout(function () { modal.hidden = true; }, 200);
+}
+
+function clearRestartTimers() {
+  if (restartState.probeTimer) { clearInterval(restartState.probeTimer); restartState.probeTimer = null; }
+  if (restartState.deadlineTimer) { clearTimeout(restartState.deadlineTimer); restartState.deadlineTimer = null; }
+}
+
+function showRestartOverlay(mode, text, sub) {
+  var overlay = byId('restartOverlay');
+  overlay.hidden = false;
+  requestAnimationFrame(function () { overlay.classList.add('visible'); });
+  byId('restartStatusText').textContent = text;
+  byId('restartStatusSub').textContent = sub || '';
+  byId('restartSpinner').hidden = mode !== 'progress';
+  byId('restartActions').hidden = mode !== 'error';
+  var card = byId('restartCard');
+  var existingIcon = card.querySelector('.restart-success-icon, .restart-error-icon');
+  if (existingIcon) existingIcon.remove();
+  if (mode === 'success') {
+    var icon = document.createElement('div');
+    icon.className = 'restart-success-icon';
+    icon.textContent = '✓';
+    card.insertBefore(icon, byId('restartStatusText'));
+  } else if (mode === 'error') {
+    var eicon = document.createElement('div');
+    eicon.className = 'restart-error-icon';
+    eicon.textContent = '!';
+    card.insertBefore(eicon, byId('restartStatusText'));
+  }
+}
+
+function hideRestartOverlay() {
+  clearRestartTimers();
+  var overlay = byId('restartOverlay');
+  overlay.classList.remove('visible');
+  setTimeout(function () { overlay.hidden = true; }, 200);
+}
+
+function handleProbeSuccess() {
+  clearRestartTimers();
+  showRestartOverlay('success', '已恢复 ✓', '');
+  setTimeout(function () { location.reload(); }, 800);
+}
+
+function probeVersion() {
+  api('/api/ui/version').then(function (res) {
+    if (!res) return;
+    handleProbeSuccess();
+  }).catch(function (err) {
+    if (err && err.status === 401) {
+      /* Server responded (just rejected our now-stale token) — it's back up. */
+      handleProbeSuccess();
+      return;
+    }
+    /* still unreachable, keep polling silently */
+  });
+}
+
+function beginRestartProbe(message) {
+  showRestartOverlay('progress', '正在重启服务…', message || '编译更新时可能需要一两分钟');
+  clearRestartTimers();
+  restartState.probeTimer = setInterval(probeVersion, RESTART_PROBE_INTERVAL_MS);
+  restartState.deadlineTimer = setTimeout(function () {
+    clearRestartTimers();
+    showRestartOverlay('error', '探活超时，服务可能仍在重启或已失败。', '可以再试一次，或先关闭此提示手动检查。');
+  }, RESTART_PROBE_TIMEOUT_MS);
+  probeVersion();
+}
+
+function triggerRestart() {
+  closeRestartConfirm();
+  showRestartOverlay('progress', '正在重启服务…', '编译更新时可能需要一两分钟');
+  api('/api/ui/restart', { method: 'POST' }).then(function (res) {
+    if (!res || !res.ok) {
+      hideRestartOverlay();
+      showToast('error', (res && res.error) || '重启请求失败');
+      return;
+    }
+    /* Show the backend's actual message on the overlay itself — a toast fired here would
+       render underneath the full-screen restart overlay (z-index 3000 vs 1000) and never
+       be seen, since the overlay stays up straight into the probe phase. */
+    beginRestartProbe(res.message);
+  }).catch(function () {
+    /* The process may have already begun tearing itself down before responding — treat
+       it the same as a successful kickoff and start probing for recovery. */
+    beginRestartProbe();
+  });
+}
+
+/* ============ Nav ============ */
+function switchPage(pageId) {
+  qsa('.nav-item').forEach(function (btn) { btn.classList.toggle('active', btn.dataset.page === pageId); });
+  qsa('.page').forEach(function (sec) { sec.classList.toggle('active', sec.id === ('page-' + pageId)); });
+  if (pageId === 'about') loadVersionDetail();
+  if (pageId === 'logs') enterLogsPage(); else leaveLogsPage();
+}
+
+function loadVersionDetail() {
+  if (versionLoaded) return;
+  versionLoaded = true;
+  api('/api/ui/version').then(function (res) {
+    byId('aboutHash').textContent = (res && res.hash) || '—';
+    byId('aboutDate').textContent = (res && res.date) || '—';
+  }).catch(function () {
+    byId('aboutHash').textContent = '获取失败';
+    byId('aboutDate').textContent = '获取失败';
+  });
+}
+
+/* ============ Event delegation (single wiring point) ============ */
+document.addEventListener('click', function (e) {
+  if (e.target.id === 'updateModal') { closeUpdateModal(); return; }
+  if (e.target.id === 'restartConfirmModal') { closeRestartConfirm(); return; }
+  var btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  var action = btn.dataset.action;
+  if (action === 'nav') switchPage(btn.dataset.page);
+  else if (action === 'retry') loadConfig();
+  else if (action === 'save') saveConfig();
+  else if (action === 'discard') discardChanges();
+  else if (action === 'add-provider') addProvider();
+  else if (action === 'delete-provider') deleteProvider(Number(btn.dataset.index));
+  else if (action === 'add-model') addModel();
+  else if (action === 'delete-model') deleteModel(Number(btn.dataset.index));
+  else if (action === 'open-update') openUpdateModal();
+  else if (action === 'close-update') closeUpdateModal();
+  else if (action === 'confirm-update') applyUpdate();
+  else if (action === 'restart-now') { closeUpdateModal(); triggerRestart(); }
+  else if (action === 'logs-toggle-pause') setLogPaused(!logState.paused);
+  else if (action === 'logs-clear') clearLogsView();
+  else if (action === 'logs-copy') copyLogsToClipboard();
+  else if (action === 'logs-scroll-bottom') scrollLogsToBottom();
+  else if (action === 'open-restart-confirm') openRestartConfirm();
+  else if (action === 'close-restart-confirm') closeRestartConfirm();
+  else if (action === 'confirm-restart') triggerRestart();
+  else if (action === 'restart-retry-probe') beginRestartProbe();
+  else if (action === 'restart-overlay-close') hideRestartOverlay();
+});
+
+document.addEventListener('keydown', function (e) {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"][data-action]')) {
+    e.preventDefault();
+    e.target.click();
+  }
+});
+
+document.addEventListener('input', handleFieldEvent);
+document.addEventListener('change', handleFieldEvent);
+
+document.addEventListener('focus', function (e) {
+  if (e.target.matches && e.target.matches('input[data-apikey]')) e.target.select();
+}, true);
+
+byId('logsViewport').addEventListener('scroll', handleLogsScroll);
+
+/* ============ Boot ============ */
+loadConfig();
+
+})();
+</script>
+</body>
+</html>

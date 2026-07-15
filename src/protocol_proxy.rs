@@ -567,6 +567,7 @@ fn log_upstream_5xx_retry(
     };
     log_upstream_event_deduped(
         "upstream_5xx_retry",
+        LogLevel::Warn,
         format!(
             "上游返回 HTTP {status_code}{layer}{egress}；正在换新连接自动重试（第 {attempt}/{max_retries} 次）{next_hop}"
         ),
@@ -715,6 +716,7 @@ pub async fn send_upstream_request_with_header_timeout(
         Err(elapsed) => {
             log_upstream_event_deduped(
                 "upstream_header_timeout",
+                LogLevel::Error,
                 format!(
                     "上游等待 {} 秒仍未返回响应头（连一个字节都没有），已放弃本次请求；多半是隧道/上游整条链路挂死，不是本地代理的问题",
                     timeout.as_secs()
@@ -816,6 +818,7 @@ impl ChatSseToResponsesConverter {
             let (message, error_type) = extract_chat_sse_error(&chunk);
             log_upstream_event_deduped(
                 "chat_sse_upstream_failure_signal",
+                LogLevel::Error,
                 format!(
                     "Chat Completions 流里收到上游内嵌错误事件：{message}（type={}）",
                     error_type.as_deref().unwrap_or("unknown")
@@ -916,6 +919,7 @@ pub async fn open_responses_proxy_request(
                 attempts -= 1;
                 log_upstream_event_deduped(
                     "pooled_connection_refresh",
+                    LogLevel::Warn,
                     "复用的上游连接已失效，正在换新连接重发本次请求".to_string(),
                 );
                 continue;
@@ -1033,23 +1037,10 @@ pub async fn open_chat_completions_proxy_request(
     // `/v1/chat/completions` callers bypassing that conversion, so the
     // context budget has to be applied here too or it silently never runs
     // for those callers.
-    let report = apply_context_budget(&mut request_json, &relay.context_budget);
-    if report.was_trimmed {
-        log_upstream_event_deduped(
-            "chat_direct_budget_trim",
-            format!(
-                "Chat Completions 直连上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
-                report.original_estimated_tokens,
-                report.final_estimated_tokens,
-                report.images_stripped,
-                report.messages_removed,
-            ),
-        );
-    }
-    warn_if_still_over_budget(
-        "chat_direct_budget_still_over_after_trim",
-        &report,
-        relay.context_budget.max_input_tokens,
+    apply_chat_completions_direct_context_budget(
+        &mut request_json,
+        request_model.as_deref(),
+        &relay.context_budget,
     );
     let mut attempts: u32 = 0;
     let proxy_configured = egress_proxy_from_env().is_some();
@@ -1082,6 +1073,7 @@ pub async fn open_chat_completions_proxy_request(
                 attempts -= 1;
                 log_upstream_event_deduped(
                     "pooled_connection_refresh",
+                    LogLevel::Warn,
                     "复用的上游连接已失效，正在换新连接重发本次请求".to_string(),
                 );
                 continue;
@@ -1128,6 +1120,52 @@ pub async fn open_chat_completions_proxy_request(
         // passthrough path `crate::trace` covers.
         trace_seq: None,
     })
+}
+
+/// Apply the same context-budget trimming Codex's own `/v1/responses`
+/// traffic gets in `upstream_request_parts`, but for the direct
+/// `/v1/chat/completions` entry point (`open_chat_completions_proxy_request`)
+/// — a body that's already Chat-Completions-shaped instead of
+/// Responses-shaped. Split out as a plain `&mut Value` transform, independent
+/// of that function's network call, so it can be unit-tested without a mock
+/// upstream server. Native OpenAI models (see `is_native_openai_model`) skip
+/// trimming entirely, same as the Responses/Chat Completions branches in
+/// `upstream_request_parts`.
+fn apply_chat_completions_direct_context_budget(
+    request_json: &mut Value,
+    request_model: Option<&str>,
+    context_budget: &ContextBudgetConfig,
+) {
+    if request_model.is_some_and(is_native_openai_model) {
+        log_upstream_event_deduped(
+            "chat_direct_native_openai_skip",
+            LogLevel::Info,
+            format!(
+                "OpenAI 原生模型 {}，跳过 Chat Completions 直连的上下文预算裁剪",
+                request_model.unwrap_or("unknown"),
+            ),
+        );
+        return;
+    }
+    let report = apply_context_budget(request_json, context_budget);
+    if report.was_trimmed {
+        log_upstream_event_deduped(
+            "chat_direct_budget_trim",
+            LogLevel::Info,
+            format!(
+                "Chat Completions 直连上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
+                report.original_estimated_tokens,
+                report.final_estimated_tokens,
+                report.images_stripped,
+                report.messages_removed,
+            ),
+        );
+    }
+    warn_if_still_over_budget(
+        "chat_direct_budget_still_over_after_trim",
+        &report,
+        context_budget.max_input_tokens,
+    );
 }
 
 /// `None` for streaming requests: no application-level cap on how long we
@@ -1229,6 +1267,23 @@ const REPEATED_LOG_THROTTLE: Duration = Duration::from_secs(3);
 static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Severity of one diagnostic line, used only to pick its ANSI color in
+/// `render_log_line` — it has no effect on the throttling/dedup behavior
+/// above, which is keyed purely by the call site's `key`. Assigned per call
+/// site by what it means for the *current request*: `Error` for a request
+/// that has just failed or ended abnormally (upstream error status, stream
+/// cut off, header timeout, a reasoning-only dead end, ...), `Warn` for
+/// something degraded or risky but still in flight (an automatic retry, a
+/// trim that's still over budget, ...), and `Info` for routine bookkeeping
+/// (context trimming, reasoning-item cleanup, ...) that isn't on its own a
+/// sign of trouble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+}
+
 /// Print a diagnostic line to stderr, throttled per `key` to at most once
 /// every `REPEATED_LOG_THROTTLE`.
 ///
@@ -1245,7 +1300,7 @@ static REPEATED_LOG_STATE: LazyLock<Mutex<HashMap<&'static str, RepeatedLogState
 /// for the rest of the throttle window regardless of the exact wording, and
 /// on the next print folds in how many occurrences were suppressed in
 /// between so the user can still see the retry loop is active.
-pub fn log_upstream_event_deduped(key: &'static str, message: String) {
+pub fn log_upstream_event_deduped(key: &'static str, level: LogLevel, message: String) {
     let mut state = REPEATED_LOG_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1256,8 +1311,59 @@ pub fn log_upstream_event_deduped(key: &'static str, message: String) {
         std::time::Instant::now(),
         REPEATED_LOG_THROTTLE,
     ) {
-        eprintln!("{}{line}", current_log_prefix());
+        eprint!(
+            "{}",
+            render_log_line(&current_log_prefix(), level, &line, colors_enabled())
+        );
     }
+}
+
+/// Whether diagnostic lines should carry ANSI color. Deliberately *not* an
+/// `isatty` check: the launch script (`Codex Gateway Lite.command`) always
+/// runs the agent as `run_lite agent ... 2>&1 | tee -a agent.terminal.log`,
+/// so stderr is piped straight into `tee`, never a real TTY — checking
+/// `isatty` here would read "not a terminal" on every single run and colors
+/// would never turn on, even though both the terminal the user is watching
+/// and `tee`'s passthrough render ANSI escapes just fine on the other end of
+/// that pipe. So colors default to **on** unconditionally, and only the
+/// explicit opt-out convention from https://no-color.org turns them off:
+/// `NO_COLOR` set to any non-empty value.
+fn colors_enabled() -> bool {
+    match std::env::var_os("NO_COLOR") {
+        Some(value) => value.is_empty(),
+        None => true,
+    }
+}
+
+/// Pure formatter behind `log_upstream_event_deduped`'s stderr line, split
+/// out so the coloring rules and line-spacing can be unit-tested
+/// deterministically instead of capturing real stderr (mirrors
+/// `throttle_repeated_log_line`'s split from the same function). `prefix` is
+/// the already-built `[HH:MM:SS model · session]` string (see
+/// `current_log_prefix`); `line` is the already throttle-deduped message
+/// body.
+///
+/// The prefix is always dimmed — it's context, not the point. The message
+/// body is colored by `level`: red for `Error`, yellow for `Warn`, and left
+/// completely uncolored for `Info` (most lines are routine, so only the two
+/// levels worth a second look get tinted). A trailing blank line is always
+/// appended, colors or not, as the visual separator between consecutive
+/// diagnostics — `colors_enabled = false` (i.e. `NO_COLOR` is set) strips
+/// every ANSI escape but never that spacing.
+fn render_log_line(prefix: &str, level: LogLevel, line: &str, colors_enabled: bool) -> String {
+    if !colors_enabled {
+        return format!("{prefix}{line}\n\n");
+    }
+    const DIM: &str = "\x1b[2m";
+    const RED: &str = "\x1b[31m";
+    const YELLOW: &str = "\x1b[33m";
+    const RESET: &str = "\x1b[0m";
+    let colored_body = match level {
+        LogLevel::Error => format!("{RED}{line}{RESET}"),
+        LogLevel::Warn => format!("{YELLOW}{line}{RESET}"),
+        LogLevel::Info => line.to_string(),
+    };
+    format!("{DIM}{prefix}{RESET}{colored_body}\n\n")
 }
 
 /// Pure decision logic behind `log_upstream_event_deduped`, separated out so
@@ -1318,6 +1424,7 @@ fn warn_if_still_over_budget(
     }
     log_upstream_event_deduped(
         event_key,
+        LogLevel::Warn,
         format!(
             "上下文预算裁剪后仍超出预算：{} > {} tokens（可能被上游以 context overflow 拒绝，建议减小单轮内容或调大 contextWindow/contextBudget）",
             report.final_estimated_tokens, max_input_tokens
@@ -1412,6 +1519,7 @@ fn upstream_request_parts(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let is_native_openai = request_model.as_deref().is_some_and(is_native_openai_model);
     let (routed_base_url, routed_api_key) = resolve_model_upstream(relay, request_model.as_deref());
     let routed_base_url = routed_base_url.to_string();
     let routed_api_key = routed_api_key.to_string();
@@ -1424,10 +1532,15 @@ fn upstream_request_parts(
     // unchanged — and through the Chat Completions path even worse, since a
     // `function_call_output.output` array is JSON-serialized straight into
     // message text, base64 and all (see `response_output_text`).
-    let images_over_budget_replaced = enforce_input_image_budget(&mut request_json);
+    let images_over_budget_replaced = if is_native_openai {
+        0
+    } else {
+        enforce_input_image_budget(&mut request_json)
+    };
     if images_over_budget_replaced > 0 {
         log_upstream_event_deduped(
             "input_image_budget_strip",
+            LogLevel::Warn,
             format!(
                 "历史图片总体积超出 {}MB 预算，已将 {} 张较旧的历史图片替换为文本占位，避免上游因请求体过大拒绝（400 invalid_request_error）",
                 INPUT_IMAGE_TOTAL_BUDGET_BYTES / (1024 * 1024),
@@ -1435,9 +1548,27 @@ fn upstream_request_parts(
             ),
         );
     }
+    if is_native_openai {
+        log_upstream_event_deduped(
+            "native_openai_skip_cleanup",
+            LogLevel::Info,
+            format!(
+                "OpenAI 原生模型 {}，跳过图片预算、reasoning 清理与上下文裁剪",
+                request_model.as_deref().unwrap_or("unknown"),
+            ),
+        );
+    }
     match relay.protocol {
         RelayProtocol::Responses => {
             let mut body = request_json;
+            if is_native_openai {
+                return Ok((
+                    responses_url(&routed_base_url),
+                    body,
+                    UpstreamWireApi::Responses,
+                    routed_api_key,
+                ));
+            }
             let internal_items_normalized = body
                 .get_mut("input")
                 .and_then(Value::as_array_mut)
@@ -1446,6 +1577,7 @@ fn upstream_request_parts(
             if internal_items_normalized > 0 {
                 log_upstream_event_deduped(
                     "responses_internal_item_normalize",
+                    LogLevel::Info,
                     format!(
                         "Responses 已把 {internal_items_normalized} 条 Codex 内部历史项（agent_message/custom_tool_call/加密块）转换为标准项，避免第三方上游 422 拒绝",
                     ),
@@ -1455,6 +1587,7 @@ fn upstream_request_parts(
             if report.stale_reasoning_items_stripped > 0 {
                 log_upstream_event_deduped(
                     "responses_reasoning_strip",
+                    LogLevel::Info,
                     format!(
                         "Responses 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
                         report.stale_reasoning_items_stripped,
@@ -1464,6 +1597,7 @@ fn upstream_request_parts(
             if report.was_trimmed {
                 log_upstream_event_deduped(
                     "responses_budget_trim",
+                    LogLevel::Info,
                     format!(
                         "Responses 上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条项目）",
                         report.original_estimated_tokens,
@@ -1486,6 +1620,15 @@ fn upstream_request_parts(
             ))
         }
         RelayProtocol::ChatCompletions => {
+            if is_native_openai {
+                let chat_body = responses_to_chat_completions(request_json)?;
+                return Ok((
+                    chat_completions_url(&routed_base_url),
+                    chat_body,
+                    UpstreamWireApi::ChatCompletions,
+                    routed_api_key,
+                ));
+            }
             let stale_reasoning_items_stripped = request_json
                 .get_mut("input")
                 .and_then(Value::as_array_mut)
@@ -1494,6 +1637,7 @@ fn upstream_request_parts(
             if stale_reasoning_items_stripped > 0 {
                 log_upstream_event_deduped(
                     "chat_reasoning_strip",
+                    LogLevel::Info,
                     format!(
                         "Chat Completions 已清理 {} 条历史轮次里的过期 reasoning/thinking 块，避免切换模型后被上游拒绝",
                         stale_reasoning_items_stripped,
@@ -1505,6 +1649,7 @@ fn upstream_request_parts(
             if report.was_trimmed {
                 log_upstream_event_deduped(
                     "chat_budget_trim",
+                    LogLevel::Info,
                     format!(
                         "上下文预算裁剪：{} → {} tokens（剥离 {} 张图片，移除 {} 条消息）",
                         report.original_estimated_tokens,
@@ -1894,6 +2039,7 @@ pub async fn handle_responses_upstream(
             upstream_error_attribution(&server_header, &cf_ray, attempts, status_code);
         log_upstream_event_deduped(
             "upstream_error_status",
+            LogLevel::Error,
             format!("上游返回 HTTP {status_code}: {message}{attribution}"),
         );
         // An error response never carries a `response.completed` event, so
@@ -2126,6 +2272,7 @@ pub fn scan_responses_passthrough_chunk_for_upstream_failure(chunk: &[u8]) {
     let detail: String = text.chars().take(500).collect();
     log_upstream_event_deduped(
         "responses_passthrough_upstream_failure_signal",
+        LogLevel::Error,
         format!(
             "Responses 透传流里检测到上游内嵌失败/错误信号（HTTP 200 但流内容标记失败），原始片段（截断至 500 字符）：{detail}"
         ),
@@ -2408,6 +2555,7 @@ fn format_reasoning_only_message(details: &ReasoningOnlyDetails) -> String {
 pub fn log_reasoning_only_warning(details: &ReasoningOnlyDetails) {
     log_upstream_event_deduped(
         "responses_reasoning_only_completion",
+        LogLevel::Error,
         format_reasoning_only_message(details),
     );
 }
@@ -5749,6 +5897,21 @@ fn is_openai_o_series(model: &str) -> bool {
             .is_some_and(|byte| byte.is_ascii_digit())
 }
 
+/// GPT/o-series/embedding/image-gen models are served by OpenAI's own
+/// backend, where Codex's native history/reasoning item shapes already work
+/// unmodified. The Codex-internal item rewriting, stale-reasoning stripping
+/// and context-budget trimming `upstream_request_parts` otherwise applies
+/// exist only to keep third-party (CPA-translated) upstreams from rejecting
+/// those shapes — running them against a native OpenAI request just adds
+/// rewrite/retry churn for nothing.
+pub(crate) fn is_native_openai_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt")
+        || model.starts_with("text-embedding")
+        || model.starts_with("dall-e")
+        || is_openai_o_series(&model)
+}
+
 // ===== Context Budget Management =====
 
 const ESTIMATE_CHARS_PER_TOKEN: f64 = 3.5;
@@ -6806,6 +6969,57 @@ mod repeated_log_tests {
     use std::time::Instant;
 
     #[test]
+    fn render_log_line_wraps_error_body_in_red() {
+        let rendered = render_log_line("[12:00:00] ", LogLevel::Error, "上游 500", true);
+        assert!(rendered.contains("\x1b[31m上游 500\x1b[0m"));
+        // 前缀本身单独用暗淡色包裹，和消息体的颜色互不干扰。
+        assert!(rendered.starts_with("\x1b[2m[12:00:00] \x1b[0m"));
+    }
+
+    #[test]
+    fn render_log_line_wraps_warn_body_in_yellow() {
+        let rendered = render_log_line("[12:00:00] ", LogLevel::Warn, "重试中", true);
+        assert!(rendered.contains("\x1b[33m重试中\x1b[0m"));
+        assert!(rendered.starts_with("\x1b[2m[12:00:00] \x1b[0m"));
+    }
+
+    #[test]
+    fn render_log_line_leaves_info_body_uncolored() {
+        let rendered = render_log_line("[12:00:00] ", LogLevel::Info, "已裁剪", true);
+        // Info 只有前缀带暗淡色，消息正文本身不额外包一层颜色码。
+        assert!(rendered.starts_with("\x1b[2m[12:00:00] \x1b[0m"));
+        assert!(rendered.ends_with("已裁剪\n\n"));
+        assert!(!rendered.contains("\x1b[31m"));
+        assert!(!rendered.contains("\x1b[33m"));
+    }
+
+    #[test]
+    fn render_log_line_no_color_strips_every_ansi_escape() {
+        let rendered = render_log_line("[12:00:00] ", LogLevel::Error, "上游 500", false);
+        assert_eq!(rendered, "[12:00:00] 上游 500\n\n");
+        assert!(!rendered.contains('\x1b'));
+    }
+
+    #[test]
+    fn render_log_line_always_appends_blank_line_separator() {
+        for (level, colors_enabled) in [
+            (LogLevel::Error, true),
+            (LogLevel::Warn, true),
+            (LogLevel::Info, true),
+            (LogLevel::Error, false),
+            (LogLevel::Warn, false),
+            (LogLevel::Info, false),
+        ] {
+            let rendered = render_log_line("[p] ", level, "msg", colors_enabled);
+            assert!(
+                rendered.ends_with("\n\n"),
+                "level {level:?} (colors_enabled={colors_enabled}) should end with a blank-line \
+                 separator so consecutive log lines have a blank line between them, got: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn throttle_prints_first_occurrence_immediately() {
         let mut state: HashMap<&'static str, RepeatedLogState> = HashMap::new();
         let now = Instant::now();
@@ -7183,6 +7397,192 @@ mod grok_review_fix_tests {
         assert!(
             !carries_stale_reasoning,
             "stale reasoning from a completed turn must not reach the Chat Completions body: {chat_body:?}"
+        );
+    }
+
+    #[test]
+    fn is_native_openai_model_matches_openai_native_prefixes_case_insensitively() {
+        assert!(is_native_openai_model("gpt-5.1-codex"));
+        assert!(is_native_openai_model("GPT-5.1-Codex"));
+        assert!(is_native_openai_model("gpt-4o-mini"));
+        assert!(is_native_openai_model("gpt-image-1"));
+        assert!(is_native_openai_model("o3"));
+        assert!(is_native_openai_model("o4-mini"));
+        assert!(is_native_openai_model("text-embedding-3-large"));
+        assert!(is_native_openai_model("dall-e-3"));
+        assert!(!is_native_openai_model("grok-4.5"));
+        assert!(!is_native_openai_model("claude-sonnet-5"));
+        assert!(!is_native_openai_model("glm-4.7"));
+        // Prefix match only — a namespaced third-party model that merely
+        // contains "gpt" elsewhere in its id must not false-positive.
+        assert!(!is_native_openai_model("openrouter/gpt-oss-120b"));
+    }
+
+    #[test]
+    fn responses_relay_passes_native_openai_models_through_untouched() {
+        // Native GPT traffic goes straight to OpenAI's own Responses
+        // backend, which already understands Codex-internal item shapes and
+        // never rejects stale reasoning items — normalizing/stripping them
+        // anyway (as done for third-party CPA-translated upstreams below)
+        // only adds needless rewrite/retry churn. See
+        // `is_native_openai_model`.
+        let request_json = json!({
+            "model": "gpt-5.1-codex",
+            "input": [
+                { "role": "user", "content": "old question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_stale",
+                    "summary": [{ "type": "summary_text", "text": "stale thinking" }]
+                },
+                { "role": "assistant", "content": "old answer" },
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "hi" },
+                    { "type": "encrypted_content", "data": "AAAA" }
+                ] },
+                { "type": "custom_tool_call", "name": "apply_patch",
+                  "input": "*** Begin Patch\n*** End Patch", "call_id": "call_1" },
+                { "type": "custom_tool_call_output", "call_id": "call_1", "output": "ok" }
+            ]
+        });
+        let relay = test_relay(RelayProtocol::Responses, ContextBudgetConfig::default());
+        let (_, body, wire_api, _) = upstream_request_parts(&relay, request_json.clone()).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::Responses);
+        assert_eq!(
+            body, request_json,
+            "a native OpenAI model's Responses body must pass through byte-for-byte: {body:?}"
+        );
+    }
+
+    #[test]
+    fn chat_completions_relay_skips_stale_reasoning_strip_for_native_openai_models() {
+        // Same fixture as `chat_completions_relay_strips_stale_reasoning_items_too`
+        // above, but for a native GPT model: the wire-format conversion to
+        // Chat Completions still has to happen, just without the
+        // third-party-upstream stale-reasoning cleanup.
+        let request_json = json!({
+            "model": "gpt-5.1-codex",
+            "input": [
+                { "role": "user", "content": "old question" },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_stale",
+                    "summary": [{ "type": "summary_text", "text": "stale thinking" }]
+                },
+                { "role": "assistant", "content": "old answer" },
+                { "role": "user", "content": "new question after model switch" }
+            ]
+        });
+        let relay = test_relay(
+            RelayProtocol::ChatCompletions,
+            ContextBudgetConfig::default(),
+        );
+        let (_, chat_body, wire_api, _) = upstream_request_parts(&relay, request_json).unwrap();
+        assert_eq!(wire_api, UpstreamWireApi::ChatCompletions);
+        let messages = chat_body["messages"].as_array().unwrap();
+        let carries_stale_reasoning = messages.iter().any(|message| {
+            message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .map(|text| text.contains("stale thinking"))
+                .unwrap_or(false)
+        });
+        assert!(
+            carries_stale_reasoning,
+            "native OpenAI models must skip stale-reasoning stripping while still converting the wire format: {chat_body:?}"
+        );
+    }
+
+    #[test]
+    fn native_openai_model_skips_input_image_budget_enforcement() {
+        // Before the fix, `enforce_input_image_budget` ran unconditionally
+        // ahead of the native-OpenAI early return in `upstream_request_parts`,
+        // so an over-budget history image would still get silently rewritten
+        // to a placeholder even for GPT models that don't need any of this
+        // third-party-upstream handling.
+        let big_image = format!("data:image/png;base64,{}", "A".repeat(5 * 1024 * 1024));
+        let request_json = json!({
+            "model": "gpt-5.1-codex",
+            "input": [
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_image", "image_url": big_image }
+                ] }
+            ]
+        });
+        let relay = test_relay(RelayProtocol::Responses, ContextBudgetConfig::default());
+        let (_, body, _, _) =
+            upstream_request_parts(&relay, request_json.clone()).unwrap();
+        assert_eq!(
+            body, request_json,
+            "native OpenAI model's over-budget image must survive the image-budget pass untouched: {body:?}"
+        );
+    }
+
+    #[test]
+    fn third_party_model_still_enforces_input_image_budget() {
+        let big_image = format!("data:image/png;base64,{}", "A".repeat(5 * 1024 * 1024));
+        let request_json = json!({
+            "model": "grok-4.5",
+            "input": [
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_image", "image_url": big_image.clone() }
+                ] }
+            ]
+        });
+        let relay = test_relay(RelayProtocol::Responses, ContextBudgetConfig::default());
+        let (_, body, _, _) = upstream_request_parts(&relay, request_json).unwrap();
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains(&big_image),
+            "an over-budget image for a third-party model must still be replaced with a placeholder: {body:?}"
+        );
+    }
+
+    #[test]
+    fn chat_completions_direct_context_budget_skips_native_openai_but_trims_others() {
+        // Covers `apply_chat_completions_direct_context_budget`, called from
+        // `open_chat_completions_proxy_request` (the direct
+        // `/v1/chat/completions` entry point for non-Codex callers) — a
+        // separate code path from `upstream_request_parts` above that an
+        // earlier native-OpenAI passthrough pass missed.
+        fn body_with_three_user_turns(model: &str) -> Value {
+            let image = json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" }
+            });
+            json!({
+                "model": model,
+                "messages": [
+                    { "role": "user", "content": [image.clone()] },
+                    { "role": "user", "content": [image] },
+                    { "role": "user", "content": "final question" },
+                ]
+            })
+        }
+        let budget = ContextBudgetConfig::with_max_tokens(10);
+
+        let mut native_body = body_with_three_user_turns("gpt-5.1-codex");
+        let original_native = native_body.clone();
+        apply_chat_completions_direct_context_budget(
+            &mut native_body,
+            Some("gpt-5.1-codex"),
+            &budget,
+        );
+        assert_eq!(
+            native_body, original_native,
+            "native OpenAI model's Chat Completions direct body must pass through untouched: {native_body:?}"
+        );
+
+        let mut third_party_body = body_with_three_user_turns("grok-4.5");
+        apply_chat_completions_direct_context_budget(
+            &mut third_party_body,
+            Some("grok-4.5"),
+            &budget,
+        );
+        let serialized = third_party_body.to_string();
+        assert!(
+            !serialized.contains("data:image/png;base64,AAAA"),
+            "third-party model must still get budget trimming: {third_party_body:?}"
         );
     }
 
