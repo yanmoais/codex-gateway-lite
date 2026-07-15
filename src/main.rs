@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 mod codex_lite;
 mod protocol_proxy;
+mod trace;
 
 /// Fallback bearer token used only when the random per-install token cannot
 /// be generated or persisted. See `local_proxy_codex_bearer_token`.
@@ -4024,6 +4025,166 @@ fn parse_timestamp_millis(value: &str) -> Option<f64> {
     value.trim().parse::<f64>().ok().map(|value| value / 1000.0)
 }
 
+/// Cap on `SESSION_TITLE_CACHE`'s size; see `cached_session_title`. Well
+/// above how many distinct Codex threads a single proxy process realistically
+/// sees "live" at once, so this only ever trims a long-running process that's
+/// accumulated stale entries from threads that ended long ago.
+const SESSION_TITLE_CACHE_CAP: usize = 256;
+
+/// `session_id -> resolved thread title`, memoizing `thread_title_from_state_db`
+/// for `protocol_proxy::resolve_session_label` so a burst of requests on the
+/// same long-running Codex thread doesn't reopen `state_5.sqlite` on every
+/// single one. A miss is cached as `""` (see `cached_session_title`) rather
+/// than left unrecorded, so "looked up, no title found" also short-circuits
+/// future lookups for that id instead of retrying the sqlite query every
+/// request.
+static SESSION_TITLE_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Best-effort, cached lookup of a Codex thread's display title by
+/// `session_id` (see `protocol_proxy::resolve_session_label`), from Codex's
+/// own local thread database(s) (see `thread_state_db_paths`). Returns `None`
+/// uniformly for every failure mode (id not in any table, no state db on
+/// disk, database locked by the Codex app, ...) since this is only ever used
+/// for a diagnostic log label — never anything correctness-sensitive.
+fn cached_session_title(session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    {
+        let cache = SESSION_TITLE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(session_id) {
+            return non_empty_string(cached);
+        }
+    }
+    let title = thread_title_from_state_db(session_id).unwrap_or_default();
+    let mut cache = SESSION_TITLE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A per-entry LRU isn't worth the complexity for a diagnostic-only cache
+    // this small — just drop everything once the (generous) cap is hit and
+    // let it repopulate from whichever sessions are still actually active.
+    if cache.len() >= SESSION_TITLE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(session_id.to_string(), title.clone());
+    non_empty_string(&title)
+}
+
+/// One-shot (uncached) lookup behind `cached_session_title`. Tries `session_id`
+/// exactly as given first, then — since Codex thread ids are bare UUIDs but
+/// callers of `resolve_session_label` may hand this a decorated value — a
+/// UUID-shaped substring extracted from it (`extract_uuid_like`), so either
+/// form still lines up with the bare-UUID `threads.id` values Codex's state
+/// databases actually store.
+fn thread_title_from_state_db(session_id: &str) -> Option<String> {
+    let db_paths = thread_state_db_paths(&default_user_codex_home_dir());
+    if let Some(title) = thread_title_from_state_db_paths(&db_paths, session_id) {
+        return Some(title);
+    }
+    match extract_uuid_like(session_id) {
+        Some(normalized) if normalized != session_id => {
+            thread_title_from_state_db_paths(&db_paths, normalized)
+        }
+        _ => None,
+    }
+}
+
+/// Tries every candidate Codex state database in turn (same search Codex's
+/// own thread catalog sync uses — see `thread_state_db_paths`), returning the
+/// first title found. Split out from `thread_title_from_state_db` so a unit
+/// test can point it at a temp directory's databases directly instead of the
+/// real `~/.codex`.
+fn thread_title_from_state_db_paths(db_paths: &[PathBuf], id: &str) -> Option<String> {
+    db_paths
+        .iter()
+        .find_map(|db_path| thread_title_from_one_db(db_path, id))
+}
+
+fn thread_title_from_one_db(db_path: &Path, id: &str) -> Option<String> {
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    // The Codex app may hold this database open/locked at the same moment a
+    // request comes through; wait only a brief moment for it to clear rather
+    // than stall request handling on a struggling/locked database.
+    let _ = conn.busy_timeout(Duration::from_millis(50));
+    query_thread_title(&conn, id)
+}
+
+/// Same title-shaped fallback chain (`title` → `preview` → `first_user_message`)
+/// as `collect_thread_entries_from_state_dbs` uses for the thread catalog, so
+/// a thread with no explicit `title` set still gets a sensible label instead
+/// of `None`.
+///
+/// Not every `threads` table on disk actually has `preview`/`first_user_message`
+/// columns (older Codex state databases may only have `title`) — selecting a
+/// column that doesn't exist would fail the whole query, so this checks
+/// `sqlite_table_columns` first and substitutes `NULL AS <column>` for
+/// whichever of the three are missing, exactly like
+/// `collect_thread_entries_from_state_dbs` already does for the full catalog
+/// scan.
+fn query_thread_title(conn: &Connection, id: &str) -> Option<String> {
+    let columns = sqlite_table_columns(conn, "threads").ok()?;
+    let select_list = ["title", "preview", "first_user_message"]
+        .into_iter()
+        .map(|name| {
+            if columns.contains(name) {
+                name.to_string()
+            } else {
+                format!("NULL AS {name}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.query_row(
+        &format!("SELECT {select_list} FROM threads WHERE id = ?1"),
+        params![id],
+        |row| {
+            Ok(row_string(row, 0)
+                .or_else(|| row_string(row, 1))
+                .or_else(|| row_string(row, 2)))
+        },
+    )
+    .ok()
+    .flatten()
+}
+
+/// Canonical UUID string length (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+const UUID_TEXT_LEN: usize = 36;
+
+/// Extracts a UUID-shaped substring from `text` — Codex thread ids are bare
+/// UUIDs, but a session/conversation id sourced from elsewhere in a request
+/// body could plausibly be decorated (e.g. a prefix, or embedded in a
+/// path-shaped value); this pulls out just the UUID so either form can still
+/// be looked up against the bare-UUID `threads.id` values Codex's state
+/// databases store. No `regex` dependency in this project, so this is a
+/// small hand-rolled scan rather than a pattern match.
+fn extract_uuid_like(text: &str) -> Option<&str> {
+    if text.len() < UUID_TEXT_LEN {
+        return None;
+    }
+    (0..=text.len() - UUID_TEXT_LEN)
+        .filter_map(|start| text.get(start..start + UUID_TEXT_LEN))
+        .find(|candidate| is_uuid_shaped(candidate))
+}
+
+fn is_uuid_shaped(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    bytes.len() == UUID_TEXT_LEN
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 async fn doctor(config: &LiteConfig) -> anyhow::Result<()> {
     validate_config(config)?;
     let base_url = config.provider.base_url.trim().trim_end_matches('/');
@@ -6121,7 +6282,15 @@ async fn handle_streaming_responses_proxy(
         };
     let request_model = request_json.get("model").and_then(Value::as_str);
     let upstream_config = protocol_proxy_upstream_from_config(&config, request_model)?;
+    // Captured before `request` is moved into the task-local scope below —
+    // everything past this point only ever needs the byte length, not the
+    // full request (`request_json` above is the parsed, still-owned copy
+    // everything else actually operates on).
+    let request_body_len = request.body.len();
+    let log_model = request_model.unwrap_or("unknown").to_string();
+    let log_session = protocol_proxy::resolve_session_label(&request_json);
 
+    protocol_proxy::with_request_log_context(log_model, log_session, async move {
     // Slow-upstream handling: wait a short soft window for upstream response
     // headers; past it, commit an SSE response to Codex and keep the
     // connection warm with keepalive comments while continuing to wait.
@@ -6234,11 +6403,27 @@ async fn handle_streaming_responses_proxy(
             );
             stream.write_all(header.as_bytes()).await?;
         }
+        // Captured before `upstream.response` is moved out below (partial
+        // move: these are all `Copy` fields, so reading them afterwards
+        // would work too, but capturing them up front keeps every
+        // upstream-derived value used by the diagnosis/trace tail below in
+        // one place).
+        let status_code = upstream.status_code;
+        let attempts = upstream.attempts;
+        let trace_seq = upstream.trace_seq;
         let mut response = upstream.response;
+        // Reasoning-only-completion diagnosis (see
+        // `ResponsesPassthroughDiagnosis`) and the opt-in full trace dump
+        // both watch the exact bytes relayed to Codex, without altering
+        // what gets forwarded.
+        let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
+        let mut trace_dump = trace::ResponseDumpWriter::new(trace_seq);
         loop {
             match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
                 Ok(UpstreamChunkPoll::Chunk(chunk)) => {
                     protocol_proxy::scan_responses_passthrough_chunk_for_upstream_failure(&chunk);
+                    diagnosis.push_chunk(&chunk);
+                    trace_dump.append(&chunk);
                     write_http_chunk(&mut stream, &chunk).await?
                 }
                 Ok(UpstreamChunkPoll::End) => break,
@@ -6276,20 +6461,49 @@ async fn handle_streaming_responses_proxy(
             }
         }
         stream.write_all(b"0\r\n\r\n").await?;
+        let response_bytes = diagnosis.total_bytes();
+        let (outcome, details) = diagnosis.finish();
+        if let Some(details) = &details {
+            protocol_proxy::log_reasoning_only_warning(details);
+        }
+        protocol_proxy::record_responses_trace(
+            &upstream_config,
+            &request_json,
+            trace_seq,
+            request_body_len,
+            true,
+            status_code,
+            attempts,
+            response_bytes,
+            outcome.trace_label(),
+        );
     } else if can_stream {
         if !sse_header_sent {
             stream.write_all(sse_response_header_bytes()).await?;
         }
 
+        let status_code = upstream.status_code;
+        let attempts = upstream.attempts;
+        let trace_seq = upstream.trace_seq;
         let mut converter =
             protocol_proxy::ChatSseToResponsesConverter::with_request(&request_json);
         let mut response = upstream.response;
+        // Same reasoning-only-completion diagnosis and full trace dump as
+        // the passthrough branch above, but fed the *converted*
+        // Responses-shaped SSE bytes (exactly what gets forwarded to Codex)
+        // rather than the raw Chat Completions bytes coming from upstream —
+        // `diagnose_responses_sse_text` looks for a `response.completed`
+        // event, which only exists after conversion.
+        let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
+        let mut trace_dump = trace::ResponseDumpWriter::new(trace_seq);
 
         loop {
             match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
                 Ok(UpstreamChunkPoll::Chunk(chunk)) => {
                     let converted = converter.push_bytes(&chunk);
                     if !converted.is_empty() {
+                        diagnosis.push_chunk(&converted);
+                        trace_dump.append(&converted);
                         write_http_chunk(&mut stream, &converted).await?;
                     }
                 }
@@ -6300,6 +6514,8 @@ async fn handle_streaming_responses_proxy(
                         Some("upstream_error".to_string()),
                     );
                     if !error_data.is_empty() {
+                        diagnosis.push_chunk(&error_data);
+                        trace_dump.append(&error_data);
                         write_http_chunk(&mut stream, &error_data).await.ok();
                     }
                     break;
@@ -6313,6 +6529,8 @@ async fn handle_streaming_responses_proxy(
                         Some("upstream_timeout".to_string()),
                     );
                     if !error_data.is_empty() {
+                        diagnosis.push_chunk(&error_data);
+                        trace_dump.append(&error_data);
                         write_http_chunk(&mut stream, &error_data).await.ok();
                     }
                     break;
@@ -6324,14 +6542,33 @@ async fn handle_streaming_responses_proxy(
 
         let final_data = converter.finish();
         if !final_data.is_empty() {
+            diagnosis.push_chunk(&final_data);
+            trace_dump.append(&final_data);
             write_http_chunk(&mut stream, &final_data).await?;
         }
         stream.write_all(b"0\r\n\r\n").await?;
+        let response_bytes = diagnosis.total_bytes();
+        let (outcome, details) = diagnosis.finish();
+        if let Some(details) = &details {
+            protocol_proxy::log_reasoning_only_warning(details);
+        }
+        protocol_proxy::record_responses_trace(
+            &upstream_config,
+            &request_json,
+            trace_seq,
+            request_body_len,
+            true,
+            status_code,
+            attempts,
+            response_bytes,
+            outcome.trace_label(),
+        );
     } else {
         let status_code = upstream.status_code;
-        let response = protocol_proxy::handle_responses_upstream(upstream, &request_json)
-            .await
-            .unwrap_or_else(|error| protocol_proxy_error_response(&error));
+        let response =
+            protocol_proxy::handle_responses_upstream(upstream, &request_json, &upstream_config)
+                .await
+                .unwrap_or_else(|error| protocol_proxy_error_response(&error));
         if sse_header_sent {
             // The SSE response was already committed during the slow-open
             // wait; deliver whatever the upstream ultimately said in-band.
@@ -6358,6 +6595,8 @@ async fn handle_streaming_responses_proxy(
 
     stream.shutdown().await.ok();
     Ok(())
+    })
+    .await
 }
 
 async fn write_http_chunk(stream: &mut TcpStream, data: &[u8]) -> anyhow::Result<()> {
@@ -6460,14 +6699,12 @@ async fn route_protocol_proxy_request(
     }
 
     let config = read_lite_config(config_path)?;
-    let request_model: Option<String> =
-        serde_json::from_str::<Value>(&request.body)
-            .ok()
-            .and_then(|body| {
-                body.get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
+    let request_json: Option<Value> = serde_json::from_str::<Value>(&request.body).ok();
+    let request_model: Option<String> = request_json.as_ref().and_then(|body| {
+        body.get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let upstream = protocol_proxy_upstream_from_config(&config, request_model.as_deref())?;
     let user_agent = request
         .headers
@@ -6489,11 +6726,17 @@ async fn route_protocol_proxy_request(
         if request.method != "POST" {
             return Ok(method_not_allowed_response());
         }
-        return protocol_proxy::handle_responses_proxy_request(
-            &request.body,
-            &upstream,
-            user_agent,
-        )
+        // 非流式 /v1/responses 分支：请求上下文（模型 + 会话标签）只在这里确定一次，
+        // 供 log_upstream_event_deduped 打印诊断日志时加前缀使用。
+        let log_model = request_model.unwrap_or_else(|| "unknown".to_string());
+        let log_session = request_json
+            .as_ref()
+            .map(protocol_proxy::resolve_session_label)
+            .unwrap_or_else(|| "?".to_string());
+        return protocol_proxy::with_request_log_context(log_model, log_session, async move {
+            protocol_proxy::handle_responses_proxy_request(&request.body, &upstream, user_agent)
+                .await
+        })
         .await;
     }
 
@@ -6778,6 +7021,10 @@ async fn run_agent(
     let Some(_agent_lock) = acquire_agent_instance_lock()? else {
         return Ok(());
     };
+    // Best-effort prune of old full-trace dumps (`CODEX_GATEWAY_LITE_TRACE=full`)
+    // left over from a previous run, so leaving full tracing on indefinitely
+    // doesn't grow `~/.codex-gateway-lite/trace` without bound.
+    trace::cleanup_old_full_dumps();
     let config = read_lite_config(&config_path)
         .with_context(|| format!("读取 Lite 配置失败：{}", config_path.display()))?;
     validate_context_budget_for_config(&config.provider.context_budget)?;
@@ -13312,6 +13559,136 @@ CREATE TABLE threads (
                 .expect("counts mirrored catalog rows");
             assert_eq!(rows, 2, "{db_name} should mirror the sidebar catalog");
         }
+    }
+
+    #[test]
+    fn query_thread_title_works_when_preview_and_first_user_message_columns_are_missing() {
+        // 真实 Codex 状态库不保证 threads 表一定带 preview / first_user_message 列
+        // （较老的库可能只有 title）—— 这里特意造一张缺列的表，验证
+        // query_thread_title 是走 sqlite_table_columns 动态拼 SELECT 的路径，而不是
+        // 写死列名导致整条查询直接失败、每次都静默返回 None。
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-gateway-lite-session-title-narrow-schema-test-{unique}.sqlite"
+        ));
+        let conn = Connection::open(&db_path).expect("opens temp db");
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);")
+            .expect("creates narrow threads table");
+        conn.execute(
+            "INSERT INTO threads (id, title) VALUES (?1, ?2)",
+            params!["thread-narrow", "调试会话标题"],
+        )
+        .expect("inserts thread");
+
+        let title = query_thread_title(&conn, "thread-narrow");
+        assert_eq!(title.as_deref(), Some("调试会话标题"));
+
+        let missing = query_thread_title(&conn, "does-not-exist");
+        assert_eq!(missing, None);
+
+        drop(conn);
+        fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn query_thread_title_falls_back_through_preview_and_first_user_message() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-gateway-lite-session-title-fallback-test-{unique}.sqlite"
+        ));
+        let conn = Connection::open(&db_path).expect("opens temp db");
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                preview TEXT,
+                first_user_message TEXT
+            );",
+        )
+        .expect("creates full threads table");
+        conn.execute(
+            "INSERT INTO threads (id, title, preview, first_user_message) VALUES (?1, NULL, NULL, ?2)",
+            params!["thread-fallback", "第一条真实用户消息"],
+        )
+        .expect("inserts thread with only first_user_message set");
+
+        let title = query_thread_title(&conn, "thread-fallback");
+        assert_eq!(title.as_deref(), Some("第一条真实用户消息"));
+
+        drop(conn);
+        fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn thread_title_from_state_db_paths_checks_every_candidate_db_in_order() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-gateway-lite-session-title-multi-db-test-{unique}"
+        ));
+        fs::create_dir_all(&root).expect("creates scratch root");
+
+        let empty_db = root.join("empty.sqlite");
+        Connection::open(&empty_db)
+            .expect("opens empty db")
+            .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);")
+            .expect("creates empty threads table");
+
+        let match_db = root.join("match.sqlite");
+        let conn = Connection::open(&match_db).expect("opens match db");
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);")
+            .expect("creates threads table");
+        conn.execute(
+            "INSERT INTO threads (id, title) VALUES (?1, ?2)",
+            params!["thread-multi", "跨库命中的标题"],
+        )
+        .expect("inserts thread");
+        drop(conn);
+
+        // 第一个库没有这条 thread，必须继续尝试第二个库才能命中。
+        let title = thread_title_from_state_db_paths(&[empty_db, match_db], "thread-multi");
+        assert_eq!(title.as_deref(), Some("跨库命中的标题"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn is_uuid_shaped_validates_hyphen_positions_and_hex_digits() {
+        let valid = "5b1d9f4a-9c2b-4e33-8b7a-1f9d7c6a2b10";
+        // 自检一下手写的样例长度确实是 36，避免后面的断言因为数错字符而失去意义。
+        assert_eq!(valid.len(), UUID_TEXT_LEN);
+        assert!(is_uuid_shaped(valid));
+
+        let all_hex_no_hyphens = "0".repeat(UUID_TEXT_LEN);
+        assert!(!is_uuid_shaped(&all_hex_no_hyphens));
+
+        let wrong_length = "0".repeat(UUID_TEXT_LEN - 1);
+        assert!(!is_uuid_shaped(&wrong_length));
+
+        let mut bad_char: Vec<char> = valid.chars().collect();
+        bad_char[0] = 'g'; // 把一个合法的 hex 位换成非 hex 字符
+        let bad_char: String = bad_char.into_iter().collect();
+        assert!(!is_uuid_shaped(&bad_char));
+    }
+
+    #[test]
+    fn extract_uuid_like_finds_embedded_uuid_and_rejects_non_uuid_text() {
+        let valid = "5b1d9f4a-9c2b-4e33-8b7a-1f9d7c6a2b10";
+        assert_eq!(valid.len(), UUID_TEXT_LEN);
+
+        let decorated = format!("thread:{valid}:extra");
+        assert_eq!(extract_uuid_like(&decorated), Some(valid));
+        assert_eq!(extract_uuid_like(valid), Some(valid));
+        assert_eq!(extract_uuid_like("not-a-uuid-at-all"), None);
+        assert_eq!(extract_uuid_like(""), None);
     }
 
     #[test]

@@ -399,6 +399,14 @@ pub struct UpstreamProxyResponse {
     /// Total send attempts made for this response (1 = no retry).
     pub attempts: u32,
     pub response: reqwest::Response,
+    /// Trace sequence number allocated at request-open time (see
+    /// `crate::trace::next_seq`), `Some` only for requests opened through
+    /// `open_responses_proxy_request` — the only path the request/response
+    /// tracing feature (`crate::trace`) covers. Lets the caller (the
+    /// Responses streaming loop, or `handle_responses_upstream`) append
+    /// response bytes to, and later finish, the same numbered trace files
+    /// this request's request-body dump was written under.
+    pub trace_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -867,6 +875,13 @@ pub async fn open_responses_proxy_request(
     validate_upstream(relay)?;
     let (endpoint, upstream_body, wire_api, api_key) =
         upstream_request_parts(relay, request_json.clone())?;
+    // Allocate this request's trace sequence number as soon as the actual
+    // (cleaned) upstream body is known, and dump it immediately: this is the
+    // only place that has `upstream_body` before it goes out over the wire,
+    // and dumping here means even a request that never gets a response
+    // (connection failure, timeout) still leaves the outgoing body on disk.
+    let trace_seq = crate::trace::next_seq();
+    crate::trace::write_full_request_dump(trace_seq, &upstream_body);
     // First attempt rides the shared keep-alive pool to skip the per-turn
     // CONNECT + TLS handshake. 502/503/504 are commonly minted by an edge
     // gateway or a dead pooled connection without the origin ever seeing
@@ -942,6 +957,7 @@ pub async fn open_responses_proxy_request(
         cf_ray,
         attempts,
         response: upstream,
+        trace_seq: Some(trace_seq),
     })
 }
 
@@ -979,6 +995,9 @@ pub async fn open_models_proxy_request(
         cf_ray,
         attempts: 1,
         response: upstream,
+        // Models listing isn't on the Responses passthrough path `crate::
+        // trace` covers.
+        trace_seq: None,
     })
 }
 
@@ -1105,6 +1124,9 @@ pub async fn open_chat_completions_proxy_request(
         cf_ray,
         attempts,
         response: upstream,
+        // Direct `/v1/chat/completions` callers aren't on the Responses
+        // passthrough path `crate::trace` covers.
+        trace_seq: None,
     })
 }
 
@@ -1118,6 +1140,75 @@ fn response_header_timeout(is_stream: bool) -> Option<Duration> {
         None
     } else {
         Some(UPSTREAM_HEADER_TIMEOUT)
+    }
+}
+
+/// Request-scoped logging context — which model/session a proxied request
+/// belongs to — threaded through `tokio::task_local!` rather than an
+/// explicit parameter, so every `log_upstream_event_deduped` call anywhere
+/// in a request's call graph (context-budget trimming, reasoning-item
+/// stripping, upstream retries, ...) can tag its line without every one of
+/// those functions taking a context parameter just to pass it along.
+#[derive(Debug, Clone)]
+struct RequestLogContext {
+    model: String,
+    session_label: String,
+}
+
+tokio::task_local! {
+    static REQUEST_LOG_CONTEXT: RequestLogContext;
+}
+
+/// Run `fut` with `model`/`session_label` available to every diagnostic line
+/// logged anywhere underneath it (see `log_upstream_event_deduped`'s
+/// `[HH:MM:SS model · session_label]` prefix, built by `current_log_prefix`).
+///
+/// Must be called once per inbound proxy request, from within the single
+/// tokio task that owns that connection/request end-to-end — see
+/// `handle_streaming_responses_proxy` and the `/v1/responses` branch of
+/// `route_protocol_proxy_request` in `main.rs`, both of which run inside one
+/// `tokio::spawn`ed task per accepted connection (see
+/// `handle_protocol_proxy_connection`'s call sites). Task-local state never
+/// crosses a `tokio::spawn` boundary, which is exactly the isolation wanted
+/// here: concurrent Codex sessions proxied at the same time never see each
+/// other's label.
+pub async fn with_request_log_context<F: std::future::Future>(
+    model: String,
+    session_label: String,
+    fut: F,
+) -> F::Output {
+    REQUEST_LOG_CONTEXT
+        .scope(
+            RequestLogContext {
+                model,
+                session_label,
+            },
+            fut,
+        )
+        .await
+}
+
+/// `[HH:MM:SS model · session_label] ` (trailing space included) when called
+/// from inside `with_request_log_context`'s scope, or just `[HH:MM:SS] `
+/// outside of it (startup logging, or any diagnostic not tied to a single
+/// proxied request).
+fn current_log_prefix() -> String {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    match REQUEST_LOG_CONTEXT.try_with(|context| format_log_prefix(&now, Some(context))) {
+        Ok(prefix) => prefix,
+        Err(_) => format_log_prefix(&now, None),
+    }
+}
+
+/// Pure formatting behind `current_log_prefix`, split out so the prefix
+/// format itself can be unit-tested deterministically — mirrors
+/// `throttle_repeated_log_line`'s split from `log_upstream_event_deduped`
+/// for the same reason (no real wall-clock time or task-local machinery
+/// needed just to check the string shape).
+fn format_log_prefix(now_hms: &str, context: Option<&RequestLogContext>) -> String {
+    match context {
+        Some(context) => format!("[{now_hms} {} · {}] ", context.model, context.session_label),
+        None => format!("[{now_hms}] "),
     }
 }
 
@@ -1165,7 +1256,7 @@ pub fn log_upstream_event_deduped(key: &'static str, message: String) {
         std::time::Instant::now(),
         REPEATED_LOG_THROTTLE,
     ) {
-        eprintln!("{line}");
+        eprintln!("{}{line}", current_log_prefix());
     }
 }
 
@@ -1252,6 +1343,61 @@ fn resolve_model_upstream<'a>(
         Some(route) => (route.base_url.as_str(), route.api_key.as_str()),
         None => (relay.base_url.as_str(), relay.api_key.as_str()),
     }
+}
+
+/// Resolve the exact upstream URL a Responses request for `request_json`
+/// would be routed to. Exists so trace metadata (recorded well after
+/// `open_responses_proxy_request` already made this same routing decision)
+/// can report it without threading another field through
+/// `UpstreamProxyResponse` — this recomputes the same routing
+/// `upstream_request_parts` does, without any of its budget/cleanup side
+/// effects.
+fn resolve_responses_endpoint(relay: &ProtocolProxyUpstream, request_json: &Value) -> String {
+    let model = request_json.get("model").and_then(Value::as_str);
+    let (base_url, _api_key) = resolve_model_upstream(relay, model);
+    match relay.protocol {
+        RelayProtocol::Responses => responses_url(base_url),
+        RelayProtocol::ChatCompletions => chat_completions_url(base_url),
+    }
+}
+
+/// Build and append one `trace/requests.jsonl` metadata row for a Responses
+/// passthrough request, resolving `model`/`endpoint` from `relay`/
+/// `request_json` so callers don't have to duplicate that logic. Shared by
+/// the streaming passthrough loop (`main.rs`) and the buffered fallback
+/// (`handle_responses_upstream`), so "how do we describe this request" for
+/// tracing purposes lives in one place instead of two. Best-effort: see
+/// `crate::trace::record_responses_request`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_responses_trace(
+    relay: &ProtocolProxyUpstream,
+    request_json: &Value,
+    trace_seq: Option<u64>,
+    request_bytes: usize,
+    is_stream: bool,
+    status_code: u16,
+    attempts: u32,
+    response_bytes: u64,
+    diagnosis_label: &'static str,
+) {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let session = resolve_session_label(request_json);
+    let endpoint = resolve_responses_endpoint(relay, request_json);
+    crate::trace::record_responses_request(
+        trace_seq,
+        model,
+        &session,
+        &endpoint,
+        request_bytes,
+        is_stream,
+        status_code,
+        attempts,
+        response_bytes,
+        diagnosis_label,
+    );
 }
 
 fn upstream_request_parts(
@@ -1412,8 +1558,52 @@ fn validate_upstream(relay: &ProtocolProxyUpstream) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
-    for key in ["conversation", "conversation_id", "previous_response_id"] {
+/// Longest session label kept in a proxy diagnostic log line (see
+/// `with_request_log_context`'s `[HH:MM:SS model · session_label]` prefix)
+/// — long enough to stay recognizable, short enough that a long thread
+/// title or first message can't push the actual diagnostic text off a
+/// normal terminal width.
+const SESSION_LABEL_MAX_CHARS: usize = 24;
+
+/// Extract whichever request-scoped identifier is most likely to match a row
+/// in Codex's own thread database (`~/.codex/state_5.sqlite` et al.'s
+/// `threads` table — see `crate::cached_session_title`), trying fields in
+/// order of how reliable they are on the actual wire format Codex's HTTP
+/// Responses client sends (verified against Codex's own `codex-rs` client
+/// source, since none of this is documented on the wire-format side):
+///
+/// - `client_metadata.thread_id`: every Responses HTTP request Codex's
+///   `ModelClient` builds carries a `client_metadata` object with the
+///   thread's bare UUID under this key, and it is never overridden — this is
+///   exactly the value stored as `threads.id`.
+/// - `prompt_cache_key`: also the thread UUID by default (Codex's
+///   `ModelClient::prompt_cache_key()` falls back to the thread id), but it
+///   *can* be pinned to a different stable value across a manual/remote
+///   context-compaction turn, so it's a slightly less certain match than
+///   `client_metadata.thread_id`.
+/// - `conversation` / `conversation_id` / `previous_response_id`: not present
+///   on Codex's actual Responses HTTP request body at all (those only exist
+///   on its WebSocket-transport sibling struct) — kept only as a defensive
+///   fallback in case some other client speaks this same passthrough
+///   protocol.
+fn session_id_from_responses_request(body: &Value) -> Option<String> {
+    let nested_thread_id = body
+        .get("client_metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("thread_id"))
+        .and_then(Value::as_str);
+    if let Some(thread_id) = nested_thread_id {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            return Some(thread_id.to_string());
+        }
+    }
+    for key in [
+        "prompt_cache_key",
+        "conversation",
+        "conversation_id",
+        "previous_response_id",
+    ] {
         if let Some(value) = body.get(key).and_then(Value::as_str) {
             let value = value.trim();
             if !value.is_empty() {
@@ -1422,6 +1612,173 @@ fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Fallback tier of `resolve_session_label`: the first real user message in
+/// the request, skipping Codex's injected leading instruction turns
+/// (environment context, permissions, AGENTS.md, ...; see
+/// `item_is_instruction_message`/`LEADING_INSTRUCTION_MARKERS`). A thread's
+/// own title is itself normally derived from this same message, so this
+/// approximates the sqlite-lookup tier reasonably well on the paths where
+/// that tier can't run (id missing from the request, thread not yet
+/// committed to sqlite, database locked by the Codex app, ...).
+fn first_user_message_label(request_json: &Value) -> Option<String> {
+    let items = request_json.get("input")?.as_array()?;
+    let message = items.iter().find(|item| {
+        item.get("role").and_then(Value::as_str) == Some("user")
+            && !item_is_instruction_message(item)
+    })?;
+    let text = instruction_text(message.get("content")?);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(SESSION_LABEL_MAX_CHARS).collect())
+    }
+}
+
+/// Best-effort human-readable label for whichever Codex session/thread sent
+/// `request_json`, used only to tell proxy diagnostic log lines apart when
+/// several Codex conversations are proxied at once (see
+/// `with_request_log_context`). Always returns something — `"?"` if neither
+/// tier below produces anything — and is always at most
+/// `SESSION_LABEL_MAX_CHARS` characters with newlines flattened to spaces,
+/// so it can never break the one-line log format it's embedded in.
+///
+/// Two tiers, cheapest and most reliable first:
+/// 1. Resolve an id off the request body (`session_id_from_responses_request`)
+///    and look its title up in Codex's own thread database
+///    (`crate::cached_session_title`) — exactly the title Codex's own UI
+///    shows for that thread.
+/// 2. Otherwise, the first 24 characters of the request's own first real
+///    user message (`first_user_message_label`).
+pub fn resolve_session_label(request_json: &Value) -> String {
+    let label = session_id_from_responses_request(request_json)
+        .and_then(|id| crate::cached_session_title(&id))
+        .or_else(|| first_user_message_label(request_json));
+    normalize_session_label(label.as_deref().unwrap_or("?"))
+}
+
+/// Enforces `resolve_session_label`'s output contract (see its doc comment)
+/// regardless of which tier produced `label` — a thread title pulled from
+/// sqlite is free-form text a user typed/generated and isn't pre-truncated
+/// the way the `first_user_message_label` fallback already is, so this is
+/// the one place both tiers' output is guaranteed to converge.
+fn normalize_session_label(label: &str) -> String {
+    let flattened = label.replace(['\n', '\r'], " ");
+    let trimmed = flattened.trim();
+    let truncated: String = trimmed.chars().take(SESSION_LABEL_MAX_CHARS).collect();
+    if truncated.is_empty() {
+        "?".to_string()
+    } else {
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod request_log_context_tests {
+    use super::*;
+
+    #[test]
+    fn format_log_prefix_without_context_is_bare_timestamp() {
+        assert_eq!(format_log_prefix("22:39:41", None), "[22:39:41] ");
+    }
+
+    #[test]
+    fn format_log_prefix_with_context_includes_model_and_session() {
+        let context = RequestLogContext {
+            model: "grok-4.5".to_string(),
+            session_label: "会话摘要文本".to_string(),
+        };
+        assert_eq!(
+            format_log_prefix("22:39:41", Some(&context)),
+            "[22:39:41 grok-4.5 · 会话摘要文本] "
+        );
+    }
+
+    /// `current_log_prefix`/`with_request_log_context` 是异步的，但 task_local 的
+    /// `LocalKey::sync_scope` 允许在同步代码里临时搭一段作用域 —— 足够验证
+    /// `current_log_prefix` 确实读到了作用域里塞进去的模型/会话标签，不需要为此专门
+    /// 起一个 tokio runtime。
+    #[test]
+    fn current_log_prefix_reads_scoped_context() {
+        REQUEST_LOG_CONTEXT.sync_scope(
+            RequestLogContext {
+                model: "grok-4.5".to_string(),
+                session_label: "调试会话".to_string(),
+            },
+            || {
+                let prefix = current_log_prefix();
+                assert!(
+                    prefix.contains("grok-4.5 · 调试会话"),
+                    "前缀里应带上作用域内的模型和会话标签，实际是: {prefix}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn current_log_prefix_without_scope_is_bare_timestamp() {
+        let prefix = current_log_prefix();
+        assert!(
+            !prefix.contains('·'),
+            "作用域外不应该带模型/会话标签，实际是: {prefix}"
+        );
+        assert!(prefix.starts_with('['));
+        assert!(prefix.ends_with("] "));
+    }
+
+    /// 需求里点名的“resolve_session_label 兜底路径”单测：请求体里没有任何可用于
+    /// sqlite 反查的 id 字段，第一条 user 消息又是注入的环境说明（应被
+    /// `item_is_instruction_message` 跳过），因此必须落到第二条真实用户消息，取前
+    /// 24 个字符。
+    #[test]
+    fn resolve_session_label_falls_back_to_first_real_user_message() {
+        let request_json = json!({
+            "model": "grok-4.5",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>cwd=/tmp</environment_context>"
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "帮我看看这个 Rust 报错到底是哪里出的问题，我这边跑不通"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let label = resolve_session_label(&request_json);
+        let expected: String = "帮我看看这个 Rust 报错到底是哪里出的问题，我这边跑不通"
+            .chars()
+            .take(SESSION_LABEL_MAX_CHARS)
+            .collect();
+        assert_eq!(label, expected);
+    }
+
+    #[test]
+    fn resolve_session_label_defaults_to_placeholder_when_nothing_matches() {
+        let request_json = json!({ "model": "grok-4.5", "input": [] });
+        assert_eq!(resolve_session_label(&request_json), "?");
+    }
+
+    #[test]
+    fn normalize_session_label_flattens_newlines_and_truncates() {
+        let label =
+            normalize_session_label("第一行\n第二行带一些额外文字用来把它撑到超过二十四个字符");
+        assert!(!label.contains('\n'));
+        assert!(label.chars().count() <= SESSION_LABEL_MAX_CHARS);
+    }
 }
 
 fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option<&str>) -> String {
@@ -1443,7 +1800,7 @@ pub async fn handle_responses_proxy_request(
 ) -> anyhow::Result<ProxyHttpResponse> {
     let request_json: Value = serde_json::from_str(body)?;
     let upstream = open_responses_proxy_request(&request_json, relay, original_user_agent).await?;
-    handle_responses_upstream(upstream, &request_json).await
+    handle_responses_upstream(upstream, &request_json, relay).await
 }
 
 /// Read an upstream response body chunk-by-chunk, applying the idle timeout
@@ -1475,9 +1832,17 @@ async fn read_upstream_body_with_idle_timeout(
 
 /// Convert an already-opened upstream response into a buffered `ProxyHttpResponse`.
 /// Useful as a fallback when true streaming cannot be used.
+///
+/// Also runs the reasoning-only-completion diagnosis (see
+/// `ResponsesDiagnosisOutcome`) on whichever shape of body this branch ends
+/// up with, and records one `trace/requests.jsonl` row before returning —
+/// the streaming passthrough path (`main.rs`) does the equivalent via
+/// `ResponsesPassthroughDiagnosis` chunk-by-chunk instead, since it never
+/// buffers the whole body here.
 pub async fn handle_responses_upstream(
     mut upstream: UpstreamProxyResponse,
     request_json: &Value,
+    relay: &ProtocolProxyUpstream,
 ) -> anyhow::Result<ProxyHttpResponse> {
     let status_code = upstream.status_code;
     let upstream_content_type = upstream.content_type;
@@ -1486,7 +1851,36 @@ pub async fn handle_responses_upstream(
     let server_header = upstream.server_header;
     let cf_ray = upstream.cf_ray;
     let attempts = upstream.attempts;
+    let trace_seq = upstream.trace_seq;
     let upstream_body = read_upstream_body_with_idle_timeout(&mut upstream.response).await?;
+    let response_bytes = upstream_body.len() as u64;
+    // The raw outgoing request bytes aren't threaded down into this
+    // buffered path, so `request_bytes` is a re-serialized approximation
+    // rather than the exact wire size — acceptable for a diagnostic trace
+    // (the streaming passthrough path in main.rs uses the exact byte count
+    // instead, since it has the original request bytes in hand).
+    let request_bytes = serde_json::to_vec(request_json)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+
+    let record_trace = |outcome: ResponsesDiagnosisOutcome| {
+        record_responses_trace(
+            relay,
+            request_json,
+            trace_seq,
+            request_bytes,
+            is_stream,
+            status_code,
+            attempts,
+            response_bytes,
+            outcome.trace_label(),
+        );
+    };
+    let warn_if_reasoning_only = |details: &Option<ReasoningOnlyDetails>| {
+        if let Some(details) = details {
+            log_reasoning_only_warning(details);
+        }
+    };
 
     if !(200..300).contains(&status_code) {
         let error =
@@ -1502,6 +1896,9 @@ pub async fn handle_responses_upstream(
             "upstream_error_status",
             format!("上游返回 HTTP {status_code}: {message}{attribution}"),
         );
+        // An error response never carries a `response.completed` event, so
+        // there is nothing to diagnose beyond the error itself.
+        record_trace(ResponsesDiagnosisOutcome::NoCompletedEvent);
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
@@ -1510,6 +1907,23 @@ pub async fn handle_responses_upstream(
     }
 
     if wire_api == UpstreamWireApi::Responses {
+        // `is_stream` here reflects whether the upstream *actually* replied
+        // with SSE (see `open_responses_proxy_request`), independent of
+        // `wire_api` — a Responses-protocol upstream can still be buffered
+        // into raw SSE text when true passthrough streaming wasn't used, so
+        // `upstream_body` needs the same "find response.completed" scan as
+        // the streaming path rather than being parsed as bare JSON.
+        let (outcome, details) = if is_stream {
+            let text = String::from_utf8_lossy(&upstream_body);
+            diagnose_responses_sse_text(&text)
+        } else {
+            serde_json::from_slice::<Value>(&upstream_body)
+                .ok()
+                .map(|parsed| diagnose_response_object(&parsed))
+                .unwrap_or((ResponsesDiagnosisOutcome::NoCompletedEvent, None))
+        };
+        warn_if_reasoning_only(&details);
+        record_trace(outcome);
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: if upstream_content_type.is_empty() {
@@ -1523,15 +1937,22 @@ pub async fn handle_responses_upstream(
 
     if is_stream {
         let text = String::from_utf8_lossy(&upstream_body);
+        let converted = chat_sse_to_responses_sse_with_request(&text, request_json);
+        let (outcome, details) = diagnose_responses_sse_text(&converted);
+        warn_if_reasoning_only(&details);
+        record_trace(outcome);
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: chat_sse_to_responses_sse_with_request(&text, request_json).into_bytes(),
+            body: converted.into_bytes(),
         });
     }
 
     let chat_json: Value = serde_json::from_slice(&upstream_body)?;
     let response_json = chat_completion_to_response_with_request(chat_json, request_json)?;
+    let (outcome, details) = diagnose_response_object(&response_json);
+    warn_if_reasoning_only(&details);
+    record_trace(outcome);
     Ok(ProxyHttpResponse {
         status: "200 OK".to_string(),
         content_type: "application/json; charset=utf-8".to_string(),
@@ -1709,6 +2130,471 @@ pub fn scan_responses_passthrough_chunk_for_upstream_failure(chunk: &[u8]) {
             "Responses 透传流里检测到上游内嵌失败/错误信号（HTTP 200 但流内容标记失败），原始片段（截断至 500 字符）：{detail}"
         ),
     );
+}
+
+/// Buffer cap for `ResponsesPassthroughDiagnosis`. The failure mode this
+/// diagnoses (upstream returns HTTP 200, stream ends cleanly, but `output`
+/// contains only `reasoning` items — no message/tool call) always produces a
+/// small response: there is, by definition, no substantial message body.
+/// Anything this large is assumed to already contain a real message/tool
+/// call, so diagnosis is abandoned rather than pay to buffer arbitrarily
+/// large streams just to prove a negative.
+const RESPONSES_DIAGNOSIS_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Cap on the reasoning-text snippet included in the warning log line
+/// (`format_reasoning_only_message`), so a long chain-of-thought doesn't
+/// flood the terminal.
+const REASONING_SNIPPET_MAX_CHARS: usize = 300;
+
+/// Outcome of diagnosing one finished Responses passthrough stream (or
+/// buffered response) for the "HTTP 200, stream ended normally, but
+/// `output` contains only `reasoning` items" failure mode — Codex silently
+/// ends the turn in this case because there is no message/tool call to act
+/// on, but nothing in `agent.terminal.log` explains why. Also doubles as the
+/// label recorded in `trace/requests.jsonl` (`trace_label`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesDiagnosisOutcome {
+    /// Saw `response.completed` and its `output` either was empty or
+    /// contained at least one non-`reasoning` item — nothing suspicious.
+    Normal,
+    /// Saw `response.completed` and its `output` was non-empty but every
+    /// item had `type == "reasoning"` — the bug this diagnosis exists to
+    /// catch.
+    ReasoningOnly,
+    /// Buffered bytes would have exceeded `RESPONSES_DIAGNOSIS_MAX_BYTES`
+    /// before the stream finished, so diagnosis was abandoned (see that
+    /// constant's doc comment for why this is treated as "assumed healthy"
+    /// rather than as its own warning).
+    SkippedTooLarge,
+    /// The stream ended (cleanly or otherwise) without ever observing a
+    /// `response.completed` event — e.g. it was interrupted or idle-timed
+    /// out before completing. Existing logging already covers those cases
+    /// (`responses_passthrough_upstream_failure_signal`, idle-timeout /
+    /// read-error handling in the streaming loop), so this variant
+    /// deliberately never triggers its own warning.
+    NoCompletedEvent,
+}
+
+impl ResponsesDiagnosisOutcome {
+    /// Short machine-readable label recorded in `trace/requests.jsonl`'s
+    /// `diagnosis` field.
+    pub fn trace_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::ReasoningOnly => "reasoning_only",
+            Self::SkippedTooLarge => "skipped_too_large",
+            Self::NoCompletedEvent => "no_completed_event",
+        }
+    }
+}
+
+/// Details extracted from a `response.completed` event whose `output` was
+/// reasoning-only, used to build the warning log line — see
+/// `format_reasoning_only_message`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReasoningOnlyDetails {
+    pub response_id: String,
+    pub model: String,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// Best-effort text snippet pulled from the reasoning item(s)'
+    /// `summary`/`content` fields, already truncated to
+    /// `REASONING_SNIPPET_MAX_CHARS`.
+    pub reasoning_snippet: String,
+}
+
+/// Per-stream diagnosis state for the Responses passthrough path (raw bytes
+/// relayed verbatim, never parsed — see
+/// `scan_responses_passthrough_chunk_for_upstream_failure` above). Buffers
+/// raw SSE bytes as they arrive so `finish()` can, once the stream ends,
+/// look for a `response.completed` event and check whether its `output` was
+/// reasoning-only.
+///
+/// Independent of the stateless failure-marker scan above: that one catches
+/// embedded failure/error markers, this one catches a *different* shape of
+/// silent failure — HTTP 200, clean stream end, but an `output` with
+/// nothing actionable in it.
+pub struct ResponsesPassthroughDiagnosis {
+    buffer: Vec<u8>,
+    /// Total bytes observed, independent of `abandoned` — kept even after
+    /// buffering stops so callers can still report an accurate
+    /// `response_bytes` count in `trace/requests.jsonl`.
+    total_bytes: u64,
+    /// Set once buffering would exceed `RESPONSES_DIAGNOSIS_MAX_BYTES`; from
+    /// that point on `push_chunk` stops copying bytes (the outcome is
+    /// already decided) so a huge stream doesn't keep reallocating.
+    abandoned: bool,
+}
+
+impl ResponsesPassthroughDiagnosis {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            total_bytes: 0,
+            abandoned: false,
+        }
+    }
+
+    /// Feed one more raw chunk, exactly as relayed to Codex.
+    pub fn push_chunk(&mut self, chunk: &[u8]) {
+        self.total_bytes += chunk.len() as u64;
+        if self.abandoned {
+            return;
+        }
+        if self.buffer.len() + chunk.len() > RESPONSES_DIAGNOSIS_MAX_BYTES {
+            self.abandoned = true;
+            self.buffer.clear();
+            self.buffer.shrink_to_fit();
+            return;
+        }
+        self.buffer.extend_from_slice(chunk);
+    }
+
+    /// Total bytes observed so far, for `trace/requests.jsonl`'s
+    /// `response_bytes` field.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Finish the diagnosis once the stream has ended, returning the
+    /// outcome and — only for `ReasoningOnly` — the details to log.
+    pub fn finish(self) -> (ResponsesDiagnosisOutcome, Option<ReasoningOnlyDetails>) {
+        if self.abandoned {
+            return (ResponsesDiagnosisOutcome::SkippedTooLarge, None);
+        }
+        let text = String::from_utf8_lossy(&self.buffer);
+        diagnose_responses_sse_text(&text)
+    }
+}
+
+impl Default for ResponsesPassthroughDiagnosis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Split raw SSE text into event blocks, find the `response` object carried
+/// by the last `response.completed` event, and diagnose its `output`.
+/// Shared between the passthrough path (`ResponsesPassthroughDiagnosis::
+/// finish`, raw upstream bytes) and the buffered Chat-Completions-streaming
+/// fallback (`handle_responses_upstream`, after converting to
+/// Responses-shaped SSE text), so both funnel through the same decision
+/// logic instead of duplicating it.
+fn diagnose_responses_sse_text(
+    text: &str,
+) -> (ResponsesDiagnosisOutcome, Option<ReasoningOnlyDetails>) {
+    match find_responses_completed_event(text) {
+        Some(response) => diagnose_response_object(&response),
+        None => (ResponsesDiagnosisOutcome::NoCompletedEvent, None),
+    }
+}
+
+/// Scan `text` for the `response` object carried by the last
+/// `response.completed` SSE event (`{"type": "response.completed",
+/// "response": {...}}`, see `ChatSseState::finalize_into`). Blocks are
+/// separated per the SSE spec by a blank line — `take_sse_block` already
+/// implements that splitting and is shared with the streaming converter.
+/// Unparseable or irrelevant blocks are skipped silently: this is a
+/// best-effort diagnostic, not a strict parser, and real upstreams
+/// occasionally interleave comment/keepalive lines that are not JSON.
+fn find_responses_completed_event(text: &str) -> Option<Value> {
+    let mut buffer = text.to_string();
+    let mut found = None;
+    while let Some(block) = take_sse_block(&mut buffer) {
+        for line in block.lines() {
+            let Some(data) = strip_sse_field(line, "data") else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if parsed.get("type").and_then(Value::as_str) == Some("response.completed") {
+                if let Some(response) = parsed.get("response") {
+                    found = Some(response.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Given the `response` object from a `response.completed` event, decide
+/// whether its `output` array is reasoning-only.
+fn diagnose_response_object(
+    response: &Value,
+) -> (ResponsesDiagnosisOutcome, Option<ReasoningOnlyDetails>) {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return (ResponsesDiagnosisOutcome::Normal, None);
+    };
+    if output.is_empty() {
+        return (ResponsesDiagnosisOutcome::Normal, None);
+    }
+    let all_reasoning = output
+        .iter()
+        .all(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
+    if !all_reasoning {
+        return (ResponsesDiagnosisOutcome::Normal, None);
+    }
+
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let output_tokens = response
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64);
+    let reasoning_tokens = response
+        .pointer("/usage/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64);
+    // `extract_reasoning_summary_text` already knows how to pull readable
+    // text out of a reasoning item's `summary`/`content`/`reasoning_content`
+    // fields (see its use in `chat_reasoning_to_response_output_item`);
+    // reused here instead of duplicating that extraction logic.
+    let reasoning_snippet: String = output
+        .iter()
+        .find_map(extract_reasoning_summary_text)
+        .unwrap_or_default()
+        .chars()
+        .take(REASONING_SNIPPET_MAX_CHARS)
+        .collect();
+
+    (
+        ResponsesDiagnosisOutcome::ReasoningOnly,
+        Some(ReasoningOnlyDetails {
+            response_id,
+            model,
+            output_tokens,
+            reasoning_tokens,
+            reasoning_snippet,
+        }),
+    )
+}
+
+/// Pure formatter for the reasoning-only warning line, split out from
+/// `log_reasoning_only_warning` so the exact wording is unit-testable
+/// without capturing stderr (mirrors how `throttle_repeated_log_line` is
+/// tested separately from `log_upstream_event_deduped`).
+fn format_reasoning_only_message(details: &ReasoningOnlyDetails) -> String {
+    let output_tokens = details
+        .output_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "未知".to_string());
+    let reasoning_tokens = details
+        .reasoning_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "未知".to_string());
+    format!(
+        "Responses 上游流正常结束但输出只有 reasoning（模型只思考没答复）：model={}, response_id={}, output_tokens={}, reasoning_tokens={}, reasoning 片段={}",
+        details.model,
+        details.response_id,
+        output_tokens,
+        reasoning_tokens,
+        details.reasoning_snippet
+    )
+}
+
+/// Log (deduped, via the existing throttled logger) a reasoning-only
+/// diagnosis, so repeated hits across Codex's automatic retries collapse
+/// the same way other upstream diagnostics do. `pub` because the streaming
+/// passthrough loop in main.rs runs its own `ResponsesPassthroughDiagnosis`
+/// and needs to trigger this same warning directly (see
+/// `handle_streaming_responses_proxy`).
+pub fn log_reasoning_only_warning(details: &ReasoningOnlyDetails) {
+    log_upstream_event_deduped(
+        "responses_reasoning_only_completion",
+        format_reasoning_only_message(details),
+    );
+}
+
+#[cfg(test)]
+mod responses_diagnosis_tests {
+    use super::*;
+
+    /// Build a `response.completed` SSE block in the same shape
+    /// `ChatSseState::finalize_into` emits in real traffic, so these tests
+    /// exercise the same parsing path (`find_responses_completed_event`)
+    /// real streams do rather than a hand-simplified shape.
+    fn completed_event_sse(response: &Value) -> String {
+        let envelope = json!({
+            "type": "response.completed",
+            "response": response
+        });
+        format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+    }
+
+    fn reasoning_item(text: &str) -> Value {
+        json!({
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": text }]
+        })
+    }
+
+    #[test]
+    fn finish_flags_reasoning_only_completion_with_full_details() {
+        let response = json!({
+            "id": "resp_abc123",
+            "model": "gpt-5-codex",
+            "output": [reasoning_item("thinking hard about the problem")],
+            "usage": {
+                "output_tokens": 42,
+                "output_tokens_details": { "reasoning_tokens": 40 }
+            }
+        });
+        let sse = completed_event_sse(&response);
+
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        // Split across two chunks to mirror a real chunked upstream body
+        // where the `response.completed` event can straddle a chunk
+        // boundary — `finish()` only parses after all bytes are buffered,
+        // so this must behave identically to a single push.
+        let (first, second) = sse.split_at(sse.len() / 2);
+        diagnosis.push_chunk(first.as_bytes());
+        diagnosis.push_chunk(second.as_bytes());
+        assert_eq!(diagnosis.total_bytes(), sse.len() as u64);
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::ReasoningOnly);
+        assert_eq!(outcome.trace_label(), "reasoning_only");
+        let details = details.expect("reasoning-only outcome must carry details");
+        assert_eq!(
+            details,
+            ReasoningOnlyDetails {
+                response_id: "resp_abc123".to_string(),
+                model: "gpt-5-codex".to_string(),
+                output_tokens: Some(42),
+                reasoning_tokens: Some(40),
+                reasoning_snippet: "thinking hard about the problem".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn finish_leaves_message_bearing_completion_unflagged() {
+        let response = json!({
+            "id": "resp_def456",
+            "model": "gpt-5-codex",
+            "output": [
+                reasoning_item("thinking..."),
+                { "type": "message", "content": [{ "type": "output_text", "text": "here you go" }] }
+            ],
+            "usage": { "output_tokens": 10, "output_tokens_details": { "reasoning_tokens": 4 } }
+        });
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        diagnosis.push_chunk(completed_event_sse(&response).as_bytes());
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::Normal);
+        assert_eq!(outcome.trace_label(), "normal");
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn finish_leaves_empty_output_unflagged() {
+        let response = json!({
+            "id": "resp_empty",
+            "model": "gpt-5-codex",
+            "output": [],
+            "usage": { "output_tokens": 0 }
+        });
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        diagnosis.push_chunk(completed_event_sse(&response).as_bytes());
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::Normal);
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn finish_reports_no_completed_event_when_stream_never_completed() {
+        // Simulates an interrupted/timed-out stream: some in-progress delta
+        // events arrived, but no `response.completed` ever showed up — must
+        // not warn (see `ResponsesDiagnosisOutcome::NoCompletedEvent`'s doc
+        // comment).
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        diagnosis.push_chunk(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        );
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::NoCompletedEvent);
+        assert_eq!(outcome.trace_label(), "no_completed_event");
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn finish_reports_no_completed_event_for_an_empty_stream() {
+        let diagnosis = ResponsesPassthroughDiagnosis::new();
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::NoCompletedEvent);
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn push_chunk_abandons_buffering_past_the_size_cap_but_keeps_counting_bytes() {
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        let big_chunk = vec![b'a'; RESPONSES_DIAGNOSIS_MAX_BYTES + 1];
+        diagnosis.push_chunk(&big_chunk);
+        // Total byte count must stay accurate for `trace/requests.jsonl`'s
+        // `response_bytes` even once diagnosis itself is abandoned.
+        assert_eq!(
+            diagnosis.total_bytes(),
+            (RESPONSES_DIAGNOSIS_MAX_BYTES + 1) as u64
+        );
+
+        // Feeding a real `response.completed` afterwards must not resurrect
+        // diagnosis: once abandoned, always abandoned for this stream.
+        let response = json!({
+            "id": "resp_big",
+            "model": "gpt-5-codex",
+            "output": [reasoning_item("late arrival")],
+            "usage": { "output_tokens": 1, "output_tokens_details": { "reasoning_tokens": 1 } }
+        });
+        diagnosis.push_chunk(completed_event_sse(&response).as_bytes());
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::SkippedTooLarge);
+        assert_eq!(outcome.trace_label(), "skipped_too_large");
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn format_reasoning_only_message_includes_all_fields_when_present() {
+        let details = ReasoningOnlyDetails {
+            response_id: "resp_abc123".to_string(),
+            model: "gpt-5-codex".to_string(),
+            output_tokens: Some(42),
+            reasoning_tokens: Some(40),
+            reasoning_snippet: "thinking hard about the problem".to_string(),
+        };
+        assert_eq!(
+            format_reasoning_only_message(&details),
+            "Responses 上游流正常结束但输出只有 reasoning（模型只思考没答复）：model=gpt-5-codex, response_id=resp_abc123, output_tokens=42, reasoning_tokens=40, reasoning 片段=thinking hard about the problem"
+        );
+    }
+
+    #[test]
+    fn format_reasoning_only_message_uses_placeholder_for_missing_numbers() {
+        let details = ReasoningOnlyDetails {
+            response_id: "resp_xyz".to_string(),
+            model: "custom-model".to_string(),
+            output_tokens: None,
+            reasoning_tokens: None,
+            reasoning_snippet: String::new(),
+        };
+        assert_eq!(
+            format_reasoning_only_message(&details),
+            "Responses 上游流正常结束但输出只有 reasoning（模型只思考没答复）：model=custom-model, response_id=resp_xyz, output_tokens=未知, reasoning_tokens=未知, reasoning 片段="
+        );
+    }
 }
 
 #[derive(Debug, Default)]
