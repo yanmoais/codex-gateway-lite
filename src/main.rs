@@ -6925,9 +6925,10 @@ fn explicit_context_budget_limit(reserve_tokens: u64, context_window: &str) -> u
             // large window must not eat a small model's window whole: 200K
             // reserve on grok's 256K window left 56K usable — no request fit,
             // and Codex looped 502-retries forever. Cap the effective reserve
-            // at 30% of this model's window (a 1M window with a 200K reserve
-            // stays unchanged; a 256K window keeps ~179K usable).
-            let max_reserve = window_tokens.saturating_mul(30) / 100;
+            // at 15% of this model's window (a 1M window with a 200K reserve
+            // is now itself capped to 150K reserve / 850K usable; a 256K
+            // window keeps ~218K usable).
+            let max_reserve = window_tokens.saturating_mul(15) / 100;
             window_tokens.saturating_sub(reserve_tokens.min(max_reserve))
         }
         None => reserve_tokens,
@@ -16190,13 +16191,13 @@ not-a-pid garbage line without valid pid
 
         let caps = context_budget_caps_for_catalog(&config, &entries);
 
-        // claude-fable-5 keeps its 1M window largely intact (200K reserve is
-        // well under the model's own 30% cap), while gpt-5.5's much smaller
-        // 258400 window loses a proportionally bigger chunk to the same
-        // reserve — 180_880, the exact number from the bug's proxy log line
-        // ("上下文预算裁剪后仍超出预算：204519 > 180880").
-        assert_eq!(caps.get("claude-fable-5").copied(), Some(800_000));
-        assert_eq!(caps.get("gpt-5.5").copied(), Some(180_880));
+        // With the reserve capped at 15% of each model's own window,
+        // claude-fable-5's 200K reserve now exceeds the model's own 150K
+        // (15% of 1M) cap and gets clamped to it, while gpt-5.5's much
+        // smaller 258400 window loses a proportionally bigger chunk to the
+        // same reserve — 219_640 (258400 - 15% * 258400 = 258400 - 38760).
+        assert_eq!(caps.get("claude-fable-5").copied(), Some(850_000));
+        assert_eq!(caps.get("gpt-5.5").copied(), Some(219_640));
     }
 
     #[test]
@@ -18006,8 +18007,8 @@ mod context_budget_tests {
             aggregate: false,
         };
         let budget = resolve_context_budget(&config, None);
-        assert_eq!(budget.max_input_tokens, 800_000);
-        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 800_000);
+        assert_eq!(budget.max_input_tokens, 850_000);
+        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 850_000);
     }
 
     #[test]
@@ -18092,13 +18093,14 @@ mod context_budget_tests {
 
     #[test]
     fn explicit_context_budget_limit_caps_reserve_per_model_window_share() {
-        // A 200K reserve tuned for a 1M window applies unchanged there...
-        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 800_000);
-        // ...but on grok's 256K window the raw subtraction left only 56K
-        // usable (endless 502-retry loop); the 30% reserve cap keeps ~179K.
+        // A 200K reserve tuned for a 1M window now exceeds that model's own
+        // 15% cap (150K), so it gets clamped too...
+        assert_eq!(explicit_context_budget_limit(200_000, "1M"), 850_000);
+        // ...and on grok's 256K window the raw subtraction left only 56K
+        // usable (endless 502-retry loop); the 15% reserve cap keeps ~218K.
         assert_eq!(
             explicit_context_budget_limit(200_000, "256K"),
-            256_000 - 76_800
+            256_000 - 38_400
         );
     }
 
