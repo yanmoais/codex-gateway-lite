@@ -2142,8 +2142,8 @@ pub async fn handle_responses_upstream(
     }
 
     let first = single_responses_upstream_attempt(upstream, request_json).await?;
-    let is_grok_retry_candidate =
-        first.outcome == ResponsesDiagnosisOutcome::ReasoningOnly && request_targets_grok(request_json);
+    let is_grok_retry_candidate = first.outcome == ResponsesDiagnosisOutcome::ReasoningOnly
+        && request_targets_grok(request_json);
     let final_attempt = if is_grok_retry_candidate {
         retry_reasoning_only_buffered(first, request_json, relay, original_user_agent).await
     } else {
@@ -2273,13 +2273,34 @@ async fn single_responses_upstream_attempt(
     })
 }
 
+/// One buffered retry attempt: open a fresh connection and read+diagnose its
+/// response, factored out of `retry_reasoning_only_buffered`'s loop.
+/// `force_fresh_connection: true` — a reasoning-only completion can be
+/// caused by a poisoned pooled connection, so a retry must never reuse the
+/// one the previous attempt just used (see `open_responses_proxy_request`'s
+/// doc comment).
+async fn attempt_one_buffered_retry(
+    request_json: &Value,
+    relay: &ProtocolProxyUpstream,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<ResponsesUpstreamAttempt> {
+    let retry_upstream =
+        open_responses_proxy_request(request_json, relay, original_user_agent, true).await?;
+    single_responses_upstream_attempt(retry_upstream, request_json).await
+}
+
 /// Grok-only, buffered-path counterpart to the streaming path's
 /// `ReasoningOnlyRetryGate` retry: `first` was already diagnosed as
-/// `ReasoningOnly`, so re-send the same request once and use whichever
-/// attempt actually has a non-reasoning-only output. No id rewriting is
-/// needed here (unlike the streaming path) — the buffered path never
-/// streams partial events to Codex before the full response is diagnosed,
-/// so there is nothing that has already seen the first attempt's id.
+/// `ReasoningOnly`, so re-send the same request up to
+/// `REASONING_ONLY_MAX_RETRIES` times (short backoff between attempts, see
+/// `reasoning_only_retry_step`) and use whichever attempt actually has a
+/// non-reasoning-only output. No id rewriting is needed here (unlike the
+/// streaming path) — the buffered path never streams partial events to
+/// Codex before the full response is diagnosed, so there is nothing that
+/// has already seen the first attempt's id. If every attempt still comes
+/// back reasoning-only (or fails outright), `reasoning_only_retry_exhausted`
+/// rewrites `first`'s body with a synthetic failure message instead of
+/// silently forwarding it unmodified.
 async fn retry_reasoning_only_buffered(
     first: ResponsesUpstreamAttempt,
     request_json: &Value,
@@ -2289,75 +2310,119 @@ async fn retry_reasoning_only_buffered(
     let model = request_json
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
     let response_id = first
         .details
         .as_ref()
-        .map(|details| details.response_id.as_str())
-        .unwrap_or("");
+        .map(|details| details.response_id.clone())
+        .unwrap_or_default();
 
-    // `force_fresh_connection: true` — a reasoning-only completion can be
-    // caused by a poisoned pooled connection, so the retry must never reuse
-    // the one the first attempt just used (see `open_responses_proxy_request`'s
-    // doc comment).
-    let retry_upstream =
-        match open_responses_proxy_request(request_json, relay, original_user_agent, true).await {
-            Ok(upstream) => upstream,
-            Err(error) => {
+    let mut retries_attempted = 0usize;
+    for attempt_number in 1..=REASONING_ONLY_MAX_RETRIES {
+        retries_attempted = attempt_number;
+        log_upstream_event_deduped(
+            "responses_reasoning_only_retry_attempt",
+            LogLevel::Warn,
+            format!(
+                "model={model} response_id={response_id} 第 {attempt_number}/{REASONING_ONLY_MAX_RETRIES} 次 reasoning-only 重试开始"
+            ),
+        );
+
+        match attempt_one_buffered_retry(request_json, relay, original_user_agent).await {
+            Ok(retry_attempt)
+                if retry_attempt.outcome != ResponsesDiagnosisOutcome::ReasoningOnly =>
+            {
                 log_upstream_event_deduped(
-                    "responses_reasoning_only_retry_failed",
-                    LogLevel::Error,
+                    "responses_reasoning_only_retry_succeeded",
+                    LogLevel::Warn,
                     format!(
-                        "model={model} response_id={response_id} reasoning-only 重试请求失败: {error:#}，放行第一次的原始响应"
+                        "model={model} response_id={response_id} 第 {attempt_number}/{REASONING_ONLY_MAX_RETRIES} 次 reasoning-only 重试成功，已改用该次响应"
                     ),
                 );
                 return ResponsesUpstreamAttempt {
-                    outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-                    ..first
+                    outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetried,
+                    ..retry_attempt
                 };
             }
-        };
+            Ok(_) => {
+                log_upstream_event_deduped(
+                    "responses_reasoning_only_retry_attempt_failed",
+                    LogLevel::Error,
+                    format!(
+                        "model={model} response_id={response_id} 第 {attempt_number}/{REASONING_ONLY_MAX_RETRIES} 次 reasoning-only 重试仍是 reasoning-only"
+                    ),
+                );
+            }
+            Err(error) => {
+                log_upstream_event_deduped(
+                    "responses_reasoning_only_retry_attempt_failed",
+                    LogLevel::Error,
+                    format!(
+                        "model={model} response_id={response_id} 第 {attempt_number}/{REASONING_ONLY_MAX_RETRIES} 次 reasoning-only 重试请求/处理失败: {error:#}"
+                    ),
+                );
+            }
+        }
 
-    match single_responses_upstream_attempt(retry_upstream, request_json).await {
-        Ok(retry_attempt) if retry_attempt.outcome != ResponsesDiagnosisOutcome::ReasoningOnly => {
-            log_upstream_event_deduped(
-                "responses_reasoning_only_retry_succeeded",
-                LogLevel::Warn,
-                format!(
-                    "model={model} response_id={response_id} reasoning-only 重试成功，已改用第二次响应"
-                ),
-            );
-            ResponsesUpstreamAttempt {
-                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetried,
-                ..retry_attempt
+        if let ReasoningOnlyRetryStep::SleepThenRetry(backoff) =
+            reasoning_only_retry_step(attempt_number, REASONING_ONLY_MAX_RETRIES)
+        {
+            if backoff > Duration::ZERO {
+                tokio::time::sleep(backoff).await;
             }
         }
-        Ok(_) => {
-            log_upstream_event_deduped(
-                "responses_reasoning_only_retry_failed",
-                LogLevel::Error,
-                format!(
-                    "model={model} response_id={response_id} reasoning-only 重试仍失败（重试响应仍然只有 reasoning），放行第一次的原始响应"
-                ),
-            );
-            ResponsesUpstreamAttempt {
-                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-                ..first
-            }
-        }
-        Err(error) => {
-            log_upstream_event_deduped(
-                "responses_reasoning_only_retry_failed",
-                LogLevel::Error,
-                format!(
-                    "model={model} response_id={response_id} reasoning-only 重试响应处理失败: {error:#}，放行第一次的原始响应"
-                ),
-            );
-            ResponsesUpstreamAttempt {
-                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-                ..first
-            }
-        }
+    }
+
+    reasoning_only_retry_exhausted(first, &model, &response_id, retries_attempted)
+}
+
+/// All `REASONING_ONLY_MAX_RETRIES` buffered-path retry attempts failed:
+/// rewrite `first`'s already-buffered body to inject the synthetic failure
+/// message (see `inject_reasoning_only_synthetic_message_into_body`).
+/// Gracefully degrades to the pre-existing behavior — forwarding `first`
+/// completely unmodified — if the rewrite itself fails for any reason.
+fn reasoning_only_retry_exhausted(
+    first: ResponsesUpstreamAttempt,
+    model: &str,
+    response_id: &str,
+    retries_attempted: usize,
+) -> ResponsesUpstreamAttempt {
+    let injected = inject_reasoning_only_synthetic_message_into_body(
+        &first.response.body,
+        first.is_stream,
+        retries_attempted,
+    );
+    if let Some(body) = injected {
+        log_upstream_event_deduped(
+            "responses_reasoning_only_synthetic_message_injected",
+            LogLevel::Error,
+            format!(
+                "model={model} response_id={response_id} reasoning-only 重试 {retries_attempted} 次全部失败，已注入合成消息告知用户"
+            ),
+        );
+        let response = ProxyHttpResponse {
+            status: first.response.status.clone(),
+            content_type: first.response.content_type.clone(),
+            body,
+        };
+        return ResponsesUpstreamAttempt {
+            response,
+            outcome: ResponsesDiagnosisOutcome::ReasoningOnlySyntheticMessage,
+            ..first
+        };
+    }
+
+    log_upstream_event_deduped(
+        "responses_reasoning_only_retry_failed",
+        LogLevel::Error,
+        format!(
+            "model={model} response_id={response_id} reasoning-only 重试 {retries_attempted} 次全部失败，且合成消息注入也失败，放行第一次的原始响应"
+        ),
+    );
+    ResponsesUpstreamAttempt {
+        outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+        ..first
     }
 }
 
@@ -2597,6 +2662,15 @@ pub enum ResponsesDiagnosisOutcome {
     /// `deterministic_incomplete_reason`, mirroring the same exclusion
     /// xAI's own `grok-build` CLI applies before its retry).
     ReasoningOnlyTruncated,
+    /// Grok-only: every one of `REASONING_ONLY_MAX_RETRIES` retries also
+    /// came back reasoning-only (or failed outright), but unlike
+    /// `ReasoningOnlyRetryFailed` the first attempt's withheld
+    /// `response.completed` was *not* forwarded unmodified — a synthetic
+    /// assistant `message` item explaining the failure was appended to its
+    /// `output` array instead (see `inject_reasoning_only_synthetic_message`),
+    /// so Codex sees a visible explanation rather than silently ending the
+    /// turn with a hung-looking UI.
+    ReasoningOnlySyntheticMessage,
 }
 
 impl ResponsesDiagnosisOutcome {
@@ -2611,6 +2685,7 @@ impl ResponsesDiagnosisOutcome {
             Self::ReasoningOnlyRetried => "reasoning_only_retried",
             Self::ReasoningOnlyRetryFailed => "reasoning_only_retry_failed",
             Self::ReasoningOnlyTruncated => "reasoning_only_truncated",
+            Self::ReasoningOnlySyntheticMessage => "reasoning_only_synthetic_message",
         }
     }
 }
@@ -2905,6 +2980,257 @@ pub fn log_reasoning_only_warning(details: &ReasoningOnlyDetails) {
     );
 }
 
+/// Maximum number of reasoning-only retry attempts, shared by both the
+/// streaming path (`attempt_grok_reasoning_retry` in main.rs) and the
+/// buffered path (`retry_reasoning_only_buffered` below). xAI's own
+/// `grok-build` CLI retries a reasoning-only completion up to 15 times with
+/// exponential backoff — but that's the direct client, retrying against its
+/// own conversation state. This gateway is a middle layer sitting between
+/// Codex and the upstream, holding the Codex-facing connection open for the
+/// whole retry loop; a much smaller, fixed budget is the conservative
+/// choice here.
+pub(crate) const REASONING_ONLY_MAX_RETRIES: usize = 3;
+
+/// Backoff to wait after retry attempt `attempt_number` (1-based) has just
+/// failed, before making the next attempt. Fixed schedule per the task spec
+/// (2s after attempt 1, 4s after attempt 2) rather than exponential —
+/// unlike grok-build's 15-attempt budget, 3 attempts don't need a curve.
+/// Returns `Duration::ZERO` past the last attempt that still has a retry
+/// coming (callers only consult this when `reasoning_only_retry_step` says
+/// to sleep-then-retry, so this arm is never actually reached in practice).
+pub(crate) fn reasoning_only_retry_backoff(attempt_number: usize) -> Duration {
+    match attempt_number {
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        _ => Duration::ZERO,
+    }
+}
+
+/// What to do after retry attempt `attempt_number` (1-based) has just
+/// failed, given `max_retries` total attempts are allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningOnlyRetryStep {
+    SleepThenRetry(Duration),
+    GiveUp,
+}
+
+pub(crate) fn reasoning_only_retry_step(
+    attempt_number: usize,
+    max_retries: usize,
+) -> ReasoningOnlyRetryStep {
+    if attempt_number >= max_retries {
+        ReasoningOnlyRetryStep::GiveUp
+    } else {
+        ReasoningOnlyRetryStep::SleepThenRetry(reasoning_only_retry_backoff(attempt_number))
+    }
+}
+
+/// User-visible Chinese text injected into a synthetic assistant `message`
+/// item once every reasoning-only retry has failed (see
+/// `inject_reasoning_only_synthetic_message`). Deliberately never includes
+/// any reasoning-summary snippet text — the upstream's actual reasoning
+/// content must stay gateway-log-only (see `ReasoningOnlyDetails::
+/// reasoning_snippet` / `log_reasoning_only_warning`) and never reach Codex
+/// framed as if it were the model's real answer.
+fn reasoning_only_synthetic_message_text(retries_attempted: usize) -> String {
+    format!(
+        "⚠️ 上游模型连续 {retries_attempted} 次只返回思考过程、未给出正文（reasoning-only 故障，已自动重试 {retries_attempted} 次）。请重新发送这条消息；若反复出现可换用其他模型。"
+    )
+}
+
+/// Build the synthetic `message` output item appended to a reasoning-only
+/// completion's `output` array once every retry has failed. Field shapes
+/// copied verbatim from `ChatSseState::finalize_text_into`'s real message
+/// item shape (`{"type":"message","status":"completed","role":"assistant",
+/// "content":[{"type":"output_text","text":...,"annotations":[]}]}`) so
+/// Codex parses this exactly like a normal assistant message.
+fn reasoning_only_synthetic_message_item(response_id: &str, retries_attempted: usize) -> Value {
+    json!({
+        "id": format!("msg_synthetic_{response_id}"),
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": reasoning_only_synthetic_message_text(retries_attempted),
+            "annotations": []
+        }]
+    })
+}
+
+/// Mutate `response` (the `response` object carried by a `response.completed`
+/// event, or an already-unwrapped bare Responses JSON body — both have an
+/// `id` and an `output` array at the top level) in place, appending the
+/// synthetic failure message to its `output` array. The existing item(s)
+/// (the reasoning item(s) — Codex needs the full structure) and every other
+/// field (`usage`, etc.) are left completely untouched.
+///
+/// Returns the new item's `output_index` (its position in the array) on
+/// success. Returns `None` if `response` doesn't have the `id`/`output`
+/// shape this function expects — callers must treat `None` as "leave
+/// `response` alone" and fall back to forwarding the original completed
+/// event/body completely unmodified (the pre-existing behavior), per the
+/// "兜底的兜底" requirement: a failed synthesis must never panic or produce
+/// a malformed/truncated response.
+pub(crate) fn inject_reasoning_only_synthetic_message(
+    response: &mut Value,
+    retries_attempted: usize,
+) -> Option<u64> {
+    let response_id = response.get("id").and_then(Value::as_str)?.to_string();
+    let output = response.get_mut("output").and_then(Value::as_array_mut)?;
+    let output_index = output.len() as u64;
+    output.push(reasoning_only_synthetic_message_item(
+        &response_id,
+        retries_attempted,
+    ));
+    Some(output_index)
+}
+
+/// Streaming-path counterpart: build the full SSE bytes to forward to Codex
+/// once every reasoning-only retry has failed, given the first attempt's
+/// withheld `response.completed` event bytes (`HeldCompletedEvent::bytes` —
+/// `"event: response.completed\ndata: {...}\n\n"`, see
+/// `ReasoningOnlyRetryGate::push_chunk`).
+///
+/// Emits the conservative precursor event sequence
+/// (`response.output_item.added` / `response.content_part.added` /
+/// `response.output_text.done` / `response.content_part.done` /
+/// `response.output_item.done`, shapes copied verbatim from
+/// `ChatSseState::push_text_delta_into` / `finalize_text_into`) for the
+/// synthetic message before the rewritten `response.completed` event. This
+/// codebase has no vendored copy of the Codex CLI's own SSE consumer to
+/// prove whether it requires a matching `output_item.added` before trusting
+/// an item that only appears in the final `completed.output` array —
+/// without that proof, synthesizing the same increments a genuine assistant
+/// message would have produced is the safer assumption than betting Codex
+/// accepts an item it never saw "added".
+///
+/// Returns `None` on any parse/shape failure — callers must fall back to
+/// forwarding `original_bytes` completely unmodified.
+pub(crate) fn build_reasoning_only_synthetic_completion_sse(
+    original_bytes: &[u8],
+    retries_attempted: usize,
+) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(original_bytes).ok()?;
+    let mut event = sse_block_data_json(text)?;
+    let response = event.get_mut("response")?;
+    let response_id = response.get("id").and_then(Value::as_str)?.to_string();
+    let output_index = inject_reasoning_only_synthetic_message(response, retries_attempted)?;
+
+    let item_id = format!("msg_synthetic_{response_id}");
+    let synthetic_text = reasoning_only_synthetic_message_text(retries_attempted);
+
+    let mut out = String::new();
+    push_sse(
+        &mut out,
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        }),
+    );
+    push_sse(
+        &mut out,
+        "response.content_part.added",
+        json!({
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "", "annotations": [] }
+        }),
+    );
+    push_sse(
+        &mut out,
+        "response.output_text.done",
+        json!({
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": synthetic_text
+        }),
+    );
+    push_sse(
+        &mut out,
+        "response.content_part.done",
+        json!({
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": synthetic_text, "annotations": [] }
+        }),
+    );
+    push_sse(
+        &mut out,
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": reasoning_only_synthetic_message_item(&response_id, retries_attempted)
+        }),
+    );
+    push_sse(&mut out, "response.completed", event);
+
+    Some(out.into_bytes())
+}
+
+/// Buffered-path counterpart to `build_reasoning_only_synthetic_completion_sse`.
+/// Rewrites `body` (a `ResponsesUpstreamAttempt::response.body`, one of the
+/// three shapes `single_responses_upstream_attempt` can produce — see its
+/// doc comment) in place, injecting the synthetic failure message. No
+/// precursor increment events are needed here, unlike the streaming path —
+/// the buffered path always returns one complete payload in a single
+/// response, never partial SSE events building up to it (per the task's own
+/// directive). `None` on any parse/shape failure.
+fn inject_reasoning_only_synthetic_message_into_body(
+    body: &[u8],
+    is_sse: bool,
+    retries_attempted: usize,
+) -> Option<Vec<u8>> {
+    if !is_sse {
+        let mut response: Value = serde_json::from_slice(body).ok()?;
+        inject_reasoning_only_synthetic_message(&mut response, retries_attempted)?;
+        return serde_json::to_vec(&response).ok();
+    }
+
+    let text = std::str::from_utf8(body).ok()?;
+    let mut buffer = text.to_string();
+    let mut rebuilt = String::new();
+    let mut modified = false;
+    while let Some(block) = take_sse_block(&mut buffer) {
+        if block.trim().is_empty() {
+            continue;
+        }
+        if !modified {
+            if let Some(mut event) = sse_block_data_json(&block) {
+                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    if let Some(response) = event.get_mut("response") {
+                        if inject_reasoning_only_synthetic_message(response, retries_attempted)
+                            .is_some()
+                        {
+                            push_sse(&mut rebuilt, "response.completed", event);
+                            modified = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        rebuilt.push_str(&block);
+        rebuilt.push_str("\n\n");
+    }
+    modified.then(|| rebuilt.into_bytes())
+}
+
 /// Whether `model` (a request's raw `model` field) identifies one of xAI's
 /// grok models — case-insensitively, and ignoring any `provider/` routing
 /// prefix a config might prepend (e.g. `"xai/grok-4.3"`). Gates the
@@ -2945,9 +3271,9 @@ pub struct HeldCompletedEvent {
 /// per-line scan `find_responses_completed_event` runs over a whole buffer,
 /// just narrowed to one already-isolated block.
 fn sse_block_data_json(block: &str) -> Option<Value> {
-    block
-        .lines()
-        .find_map(|line| strip_sse_field(line, "data").and_then(|data| serde_json::from_str::<Value>(data).ok()))
+    block.lines().find_map(|line| {
+        strip_sse_field(line, "data").and_then(|data| serde_json::from_str::<Value>(data).ok())
+    })
 }
 
 /// Event-level SSE gate for the Responses passthrough streaming path (see
@@ -3219,7 +3545,10 @@ mod responses_diagnosis_tests {
         assert_eq!(outcome, ResponsesDiagnosisOutcome::ReasoningOnlyTruncated);
         assert_eq!(outcome.trace_label(), "reasoning_only_truncated");
         let details = details.expect("truncated reasoning-only outcome still carries details");
-        assert_eq!(details.truncated_reason.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            details.truncated_reason.as_deref(),
+            Some("max_output_tokens")
+        );
     }
 
     #[test]
@@ -3568,7 +3897,310 @@ mod reasoning_only_retry_gate_tests {
     fn first_attempt_gate_forwards_opening_events_and_needs_no_id_rewrite() {
         let mut gate = ReasoningOnlyRetryGate::new();
         let forwarded = gate.push_chunk(created_event_sse("resp_a").as_bytes());
-        assert_eq!(String::from_utf8(forwarded).unwrap(), created_event_sse("resp_a"));
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            created_event_sse("resp_a")
+        );
+    }
+
+    #[test]
+    fn for_retry_targets_the_same_original_id_across_a_failed_then_succeeded_retry_pair() {
+        // Simulates `attempt_grok_reasoning_retry`'s loop in main.rs:
+        // `target_response_id` is captured once from the *first* attempt and
+        // passed unchanged to every `ReasoningOnlyRetryGate::for_retry` call,
+        // regardless of which numbered attempt it is — so a later retry's id
+        // rewrite target never drifts to an earlier, failed retry's own id.
+        let mut first_retry_gate = ReasoningOnlyRetryGate::for_retry("resp_original");
+        let first_retry_stream = format!(
+            "{}{}",
+            created_event_sse("resp_retry_1"),
+            completed_event_sse("resp_retry_1", reasoning_only_output())
+        );
+        first_retry_gate.push_chunk(first_retry_stream.as_bytes());
+        let (_, first_held) = first_retry_gate.finish();
+        let first_held = first_held.expect("first retry completed must have been captured");
+        // Still reasoning-only: the caller discards this attempt and retries
+        // again rather than forwarding it.
+        assert_eq!(first_held.outcome, ResponsesDiagnosisOutcome::ReasoningOnly);
+
+        let mut second_retry_gate = ReasoningOnlyRetryGate::for_retry("resp_original");
+        let second_retry_stream = format!(
+            "{}{}",
+            created_event_sse("resp_retry_2"),
+            completed_event_sse("resp_retry_2", message_output())
+        );
+        second_retry_gate.push_chunk(second_retry_stream.as_bytes());
+        let (_, second_held) = second_retry_gate.finish();
+        let second_held = second_held.expect("second retry completed must have been captured");
+        assert_eq!(second_held.outcome, ResponsesDiagnosisOutcome::Normal);
+
+        let completed_text = String::from_utf8(second_held.bytes).unwrap();
+        // The id rewrite target is `resp_original` — the *first* attempt's
+        // id — never `resp_retry_1` (the failed first retry) or any other
+        // intermediate value.
+        assert!(completed_text.contains("\"id\":\"resp_original\""));
+        assert!(!completed_text.contains("resp_retry_1"));
+        assert!(!completed_text.contains("resp_retry_2"));
+    }
+}
+
+mod reasoning_only_synthetic_message_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_only_retry_backoff_follows_the_fixed_2s_4s_schedule() {
+        assert_eq!(reasoning_only_retry_backoff(1), Duration::from_secs(2));
+        assert_eq!(reasoning_only_retry_backoff(2), Duration::from_secs(4));
+        assert_eq!(reasoning_only_retry_backoff(3), Duration::ZERO);
+    }
+
+    #[test]
+    fn reasoning_only_retry_step_sleeps_between_attempts_then_gives_up_at_max() {
+        assert_eq!(REASONING_ONLY_MAX_RETRIES, 3);
+        assert_eq!(
+            reasoning_only_retry_step(1, REASONING_ONLY_MAX_RETRIES),
+            ReasoningOnlyRetryStep::SleepThenRetry(Duration::from_secs(2))
+        );
+        assert_eq!(
+            reasoning_only_retry_step(2, REASONING_ONLY_MAX_RETRIES),
+            ReasoningOnlyRetryStep::SleepThenRetry(Duration::from_secs(4))
+        );
+        // The 3rd attempt is the last one allowed: no more sleeping, give up
+        // and let the caller finalize (synthesize the failure message).
+        assert_eq!(
+            reasoning_only_retry_step(3, REASONING_ONLY_MAX_RETRIES),
+            ReasoningOnlyRetryStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn inject_reasoning_only_synthetic_message_appends_after_the_reasoning_item() {
+        let mut response = json!({
+            "id": "resp_original",
+            "object": "response",
+            "output": [{
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "hmm, secret chain of thought" }]
+            }],
+            "usage": { "output_tokens": 5 }
+        });
+
+        let index = inject_reasoning_only_synthetic_message(&mut response, 3)
+            .expect("well-shaped response must inject successfully");
+        assert_eq!(index, 1);
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        // Original reasoning item is untouched, still first in the array.
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "hmm, secret chain of thought");
+
+        let message = &output[1];
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["status"], "completed");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["id"], "msg_synthetic_resp_original");
+        let text = message["content"][0]["text"].as_str().unwrap();
+        assert_eq!(message["content"][0]["type"], "output_text");
+        assert!(text.contains('3'));
+        // The actual reasoning summary text must never leak into the
+        // synthetic message — it stays gateway-log-only.
+        assert!(!text.contains("secret chain of thought"));
+
+        // Every other field (usage, etc.) is left completely untouched.
+        assert_eq!(response["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn inject_reasoning_only_synthetic_message_returns_none_for_malformed_shapes() {
+        let mut missing_output = json!({ "id": "resp_x" });
+        assert!(inject_reasoning_only_synthetic_message(&mut missing_output, 3).is_none());
+
+        let mut missing_id = json!({ "output": [] });
+        assert!(inject_reasoning_only_synthetic_message(&mut missing_id, 3).is_none());
+    }
+
+    fn reasoning_only_completed_sse(response_id: &str) -> Vec<u8> {
+        let envelope = json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "model": "grok-4.5",
+                "output": [{
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "hmm" }]
+                }],
+                "usage": { "output_tokens": 5 }
+            }
+        });
+        format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn build_reasoning_only_synthetic_completion_sse_emits_full_added_to_done_sequence() {
+        let original_bytes = reasoning_only_completed_sse("resp_original");
+
+        let synthetic = build_reasoning_only_synthetic_completion_sse(&original_bytes, 3)
+            .expect("well-shaped completed event must synthesize successfully");
+        let text = String::from_utf8(synthetic).unwrap();
+
+        let blocks: Vec<&str> = text.split("\n\n").filter(|b| !b.trim().is_empty()).collect();
+        // 5 precursor increment events, then the rewritten `response.completed`.
+        assert_eq!(blocks.len(), 6);
+        assert!(blocks[0].starts_with("event: response.output_item.added"));
+        assert!(blocks[1].starts_with("event: response.content_part.added"));
+        assert!(blocks[2].starts_with("event: response.output_text.done"));
+        assert!(blocks[3].starts_with("event: response.content_part.done"));
+        assert!(blocks[4].starts_with("event: response.output_item.done"));
+        assert!(blocks[5].starts_with("event: response.completed"));
+
+        for block in &blocks {
+            assert!(block.contains("msg_synthetic_resp_original"));
+        }
+
+        let final_event = sse_block_data_json(blocks[5]).expect("final block must parse as JSON");
+        assert_eq!(final_event["type"], "response.completed");
+        // usage from the original response.completed is preserved untouched.
+        assert_eq!(final_event["response"]["usage"]["output_tokens"], 5);
+        let output = final_event["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["id"], "msg_synthetic_resp_original");
+    }
+
+    #[test]
+    fn build_reasoning_only_synthetic_completion_sse_returns_none_for_malformed_bytes() {
+        assert!(build_reasoning_only_synthetic_completion_sse(b"not sse at all", 3).is_none());
+        assert!(build_reasoning_only_synthetic_completion_sse(b"", 3).is_none());
+    }
+
+    #[test]
+    fn inject_reasoning_only_synthetic_message_into_body_rewrites_a_plain_json_body() {
+        let body = json!({
+            "id": "resp_original",
+            "output": [{ "type": "reasoning", "summary": [] }]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        let rewritten = inject_reasoning_only_synthetic_message_into_body(&body_bytes, false, 3)
+            .expect("plain JSON body must rewrite successfully");
+        let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+        let output = rewritten["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["id"], "msg_synthetic_resp_original");
+    }
+
+    #[test]
+    fn inject_reasoning_only_synthetic_message_into_body_rewrites_only_the_completed_sse_block() {
+        let created = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({ "type": "response.created", "response": { "id": "resp_original" } })
+        );
+        let body_bytes = format!(
+            "{created}{}",
+            String::from_utf8(reasoning_only_completed_sse("resp_original")).unwrap()
+        )
+        .into_bytes();
+
+        let rewritten = inject_reasoning_only_synthetic_message_into_body(&body_bytes, true, 3)
+            .expect("sse body with a completed block must rewrite successfully");
+        let rewritten_text = String::from_utf8(rewritten).unwrap();
+
+        // The unrelated `response.created` block is carried through verbatim.
+        assert!(rewritten_text.starts_with("event: response.created"));
+        assert!(rewritten_text.contains("msg_synthetic_resp_original"));
+
+        let completed_block = rewritten_text
+            .split("\n\n")
+            .find(|block| block.contains("response.completed"))
+            .expect("rewritten body must still contain a response.completed block");
+        let event = sse_block_data_json(completed_block).unwrap();
+        let output = event["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn inject_reasoning_only_synthetic_message_into_body_falls_back_to_none_on_malformed_input() {
+        assert!(inject_reasoning_only_synthetic_message_into_body(b"not json", false, 3).is_none());
+
+        let no_completed = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({ "type": "response.created", "response": { "id": "resp_x" } })
+        )
+        .into_bytes();
+        assert!(
+            inject_reasoning_only_synthetic_message_into_body(&no_completed, true, 3).is_none()
+        );
+    }
+
+    fn responses_upstream_attempt_fixture(body: Vec<u8>, is_stream: bool) -> ResponsesUpstreamAttempt {
+        ResponsesUpstreamAttempt {
+            response: ProxyHttpResponse {
+                status: "200 OK".to_string(),
+                content_type: if is_stream {
+                    "text/event-stream".to_string()
+                } else {
+                    "application/json".to_string()
+                },
+                body,
+            },
+            status_code: 200,
+            is_stream,
+            attempts: 1,
+            trace_seq: None,
+            response_bytes: 0,
+            outcome: ResponsesDiagnosisOutcome::ReasoningOnly,
+            details: Some(ReasoningOnlyDetails {
+                response_id: "resp_original".to_string(),
+                model: "grok-4.5".to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn reasoning_only_retry_exhausted_injects_synthetic_message_on_success() {
+        let body = serde_json::to_vec(&json!({
+            "id": "resp_original",
+            "output": [{ "type": "reasoning", "summary": [] }]
+        }))
+        .unwrap();
+        let first = responses_upstream_attempt_fixture(body, false);
+
+        let result = reasoning_only_retry_exhausted(first, "grok-4.5", "resp_original", 3);
+        assert_eq!(
+            result.outcome,
+            ResponsesDiagnosisOutcome::ReasoningOnlySyntheticMessage
+        );
+        let rewritten: Value = serde_json::from_slice(&result.response.body).unwrap();
+        assert_eq!(rewritten["output"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            rewritten["output"][1]["id"],
+            "msg_synthetic_resp_original"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_retry_exhausted_falls_back_to_the_original_body_when_synthesis_fails() {
+        // Not valid JSON at all — `inject_reasoning_only_synthetic_message_into_body`
+        // must return `None`, and the caller must degrade to forwarding the
+        // original body completely unmodified rather than panicking or
+        // truncating the response.
+        let body = b"not valid json at all".to_vec();
+        let first = responses_upstream_attempt_fixture(body.clone(), false);
+
+        let result = reasoning_only_retry_exhausted(first, "grok-4.5", "resp_original", 3);
+        assert_eq!(
+            result.outcome,
+            ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed
+        );
+        assert_eq!(result.response.body, body);
     }
 }
 
@@ -7812,7 +8444,12 @@ mod repeated_log_tests {
 
     #[test]
     fn render_log_line_wraps_notice_body_in_cyan() {
-        let rendered = render_log_line("[12:00:00] ", LogLevel::Notice, "已提醒模型更新 update_plan", true);
+        let rendered = render_log_line(
+            "[12:00:00] ",
+            LogLevel::Notice,
+            "已提醒模型更新 update_plan",
+            true,
+        );
         assert!(rendered.contains("\x1b[36m已提醒模型更新 update_plan\x1b[0m"));
         assert!(rendered.starts_with("\x1b[2m[12:00:00] \x1b[0m"));
     }
@@ -8347,8 +8984,7 @@ mod grok_review_fix_tests {
             ]
         });
         let relay = test_relay(RelayProtocol::Responses, ContextBudgetConfig::default());
-        let (_, body, _, _) =
-            upstream_request_parts(&relay, request_json.clone()).unwrap();
+        let (_, body, _, _) = upstream_request_parts(&relay, request_json.clone()).unwrap();
         assert_eq!(
             body, request_json,
             "native OpenAI model's over-budget image must survive the image-budget pass untouched: {body:?}"
@@ -9189,10 +9825,7 @@ mod plan_nudge_tests {
         let last = items.last().unwrap();
         assert_eq!(last["role"], "user");
         assert!(
-            last["content"]
-                .as_str()
-                .unwrap()
-                .contains("update_plan"),
+            last["content"].as_str().unwrap().contains("update_plan"),
             "reminder must survive the Responses passthrough path unmodified: {items:?}"
         );
     }

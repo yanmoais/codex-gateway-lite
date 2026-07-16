@@ -7151,15 +7151,235 @@ enum GrokRetryResolution {
     },
 }
 
-/// Resend `request_json` to upstream exactly once (pure resend — no
-/// injected continuation, no `reasoning_effort`/`tool_choice` changes) after
-/// a grok request's first attempt came back reasoning-only, and relay the
-/// retry's stream into the same Codex-facing connection with id rewriting
-/// (see `ReasoningOnlyRetryGate::for_retry`). On any failure along the way —
-/// retry request/connection error, non-2xx retry status, id-extraction
-/// failure, retry stream error, or the retry itself still being
-/// reasoning-only — forwards `original`'s withheld `response.completed`
-/// unmodified instead: 宁可回到现状的静默断，也不能让 Codex 收到残缺流.
+/// Outcome of exactly one grok reasoning-only retry attempt (one iteration
+/// of `attempt_grok_reasoning_retry`'s loop), factored out of the loop so
+/// each attempt's "open connection, relay through the gate, inspect the
+/// held completed event" logic lives in one place. `Succeeded` already has
+/// its held bytes written to `stream` — callers just need to build the
+/// `GrokRetryResolution`.
+enum SingleGrokRetryOutcome {
+    Succeeded {
+        status_code: u16,
+        attempts: u32,
+        trace_seq: Option<u64>,
+        response_bytes: u64,
+    },
+    /// Human-readable failure reason, already relayed by the caller — this
+    /// attempt failed but more retries (or the final synthetic-message
+    /// fallback) may still follow.
+    Failed(String),
+    /// Codex hung up while relaying this attempt — no point retrying
+    /// further; nothing is left to forward either way.
+    ClientGone,
+}
+
+/// Run exactly one grok reasoning-only retry attempt: open a fresh
+/// connection (`force_fresh_connection: true`) and relay its stream into
+/// `stream` through a `ReasoningOnlyRetryGate::for_retry(target_response_id)`
+/// — note `target_response_id` is always the *first* original response's
+/// id, passed down unchanged from `attempt_grok_reasoning_retry`'s loop
+/// regardless of which retry attempt this is, so every attempt's id
+/// rewriting targets the same original id rather than a previous retry's.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_grok_streaming_retry(
+    stream: &mut TcpStream,
+    request_json: &Value,
+    upstream_config: &protocol_proxy::ProtocolProxyUpstream,
+    user_agent: Option<&str>,
+    needs_conversion: bool,
+    target_response_id: &str,
+    trace_dump: &mut trace::ResponseDumpWriter,
+) -> SingleGrokRetryOutcome {
+    let retry_upstream = match protocol_proxy::open_responses_proxy_request(
+        request_json,
+        upstream_config,
+        user_agent,
+        true,
+    )
+    .await
+    {
+        Ok(upstream) if upstream.is_success() => upstream,
+        Ok(upstream) => {
+            return SingleGrokRetryOutcome::Failed(format!(
+                "reasoning-only 重试请求返回 HTTP {}",
+                upstream.status_code
+            ));
+        }
+        Err(error) => {
+            return SingleGrokRetryOutcome::Failed(format!(
+                "reasoning-only 重试请求失败: {error:#}"
+            ));
+        }
+    };
+
+    let status_code = retry_upstream.status_code;
+    let attempts = retry_upstream.attempts;
+    let trace_seq = retry_upstream.trace_seq;
+    let mut response = retry_upstream.response;
+    let mut gate =
+        protocol_proxy::ReasoningOnlyRetryGate::for_retry(target_response_id.to_string());
+    let mut converter = needs_conversion
+        .then(|| protocol_proxy::ChatSseToResponsesConverter::with_request(request_json));
+    let mut response_bytes = 0u64;
+
+    let relay_end = relay_into_reasoning_only_gate(
+        &mut response,
+        stream,
+        &mut gate,
+        converter.as_mut(),
+        trace_dump,
+        &mut response_bytes,
+    )
+    .await;
+
+    match relay_end {
+        GrokRelayEnd::Clean => {}
+        GrokRelayEnd::ReadError(error) => {
+            return SingleGrokRetryOutcome::Failed(format!("reasoning-only 重试流中断: {error}"));
+        }
+        GrokRelayEnd::IdleTimeout => {
+            return SingleGrokRetryOutcome::Failed("reasoning-only 重试流空闲超时".to_string());
+        }
+        GrokRelayEnd::ClientGone => return SingleGrokRetryOutcome::ClientGone,
+    }
+
+    if flush_converter_through_gate(
+        stream,
+        converter.as_mut(),
+        &mut gate,
+        trace_dump,
+        &mut response_bytes,
+    )
+    .await
+    .is_err()
+    {
+        return SingleGrokRetryOutcome::ClientGone;
+    }
+
+    // Must read before `gate.finish()`, which consumes `gate` by value.
+    let id_extraction_failed = gate.id_extraction_failed();
+    let (trailing, held) = gate.finish();
+    if !trailing.is_empty() {
+        response_bytes += trailing.len() as u64;
+        trace_dump.append(&trailing);
+        write_http_chunk(stream, &trailing).await.ok();
+    }
+
+    if id_extraction_failed {
+        return SingleGrokRetryOutcome::Failed(
+            "reasoning-only 重试流未能提取 response_id，无法安全改写".to_string(),
+        );
+    }
+
+    match held {
+        Some(held) if held.outcome != protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnly => {
+            response_bytes += held.bytes.len() as u64;
+            trace_dump.append(&held.bytes);
+            if write_http_chunk(stream, &held.bytes).await.is_err() {
+                return SingleGrokRetryOutcome::ClientGone;
+            }
+            SingleGrokRetryOutcome::Succeeded {
+                status_code,
+                attempts,
+                trace_seq,
+                response_bytes,
+            }
+        }
+        _ => SingleGrokRetryOutcome::Failed(
+            "reasoning-only 重试仍失败（重试响应仍然只有 reasoning，或未正常收到 completed 事件）"
+                .to_string(),
+        ),
+    }
+}
+
+/// Forward `original`'s withheld `response.completed` unmodified — the
+/// pre-existing (方案A) fallback behavior, used both when retries can't even
+/// start (missing response_id) and as the "fallback of the fallback" when
+/// synthetic-message injection itself fails after every retry is exhausted:
+/// 宁可回到现状的静默断，也不能让 Codex 收到残缺流.
+async fn fall_back_to_original_grok_completion(
+    stream: &mut TcpStream,
+    trace_dump: &mut trace::ResponseDumpWriter,
+    model: &str,
+    response_id: &str,
+    original: protocol_proxy::HeldCompletedEvent,
+    message: &str,
+) -> GrokRetryResolution {
+    protocol_proxy::log_upstream_event_deduped(
+        "responses_reasoning_only_retry_failed",
+        protocol_proxy::LogLevel::Error,
+        format!("model={model} response_id={response_id} {message}，放行第一次的原始响应"),
+    );
+    trace_dump.append(&original.bytes);
+    write_http_chunk(stream, &original.bytes).await.ok();
+    GrokRetryResolution::FellBack {
+        outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+        details: original.details,
+    }
+}
+
+/// Every retry attempt in `attempt_grok_reasoning_retry`'s loop has been
+/// exhausted: try to rewrite `original`'s withheld `response.completed` to
+/// carry a synthetic failure message (see
+/// `protocol_proxy::build_reasoning_only_synthetic_completion_sse`) instead
+/// of silently forwarding it unmodified. Gracefully degrades to
+/// `fall_back_to_original_grok_completion` if the rewrite itself fails.
+async fn finalize_exhausted_grok_retry(
+    stream: &mut TcpStream,
+    trace_dump: &mut trace::ResponseDumpWriter,
+    model: &str,
+    response_id: &str,
+    original: protocol_proxy::HeldCompletedEvent,
+    retries_attempted: usize,
+) -> GrokRetryResolution {
+    match protocol_proxy::build_reasoning_only_synthetic_completion_sse(
+        &original.bytes,
+        retries_attempted,
+    ) {
+        Some(synthetic_bytes) => {
+            protocol_proxy::log_upstream_event_deduped(
+                "responses_reasoning_only_synthetic_message_injected",
+                protocol_proxy::LogLevel::Error,
+                format!(
+                    "model={model} response_id={response_id} reasoning-only 重试 {retries_attempted} 次全部失败，已注入合成消息告知用户"
+                ),
+            );
+            trace_dump.append(&synthetic_bytes);
+            write_http_chunk(stream, &synthetic_bytes).await.ok();
+            GrokRetryResolution::FellBack {
+                outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlySyntheticMessage,
+                details: original.details.clone(),
+            }
+        }
+        None => {
+            fall_back_to_original_grok_completion(
+                stream,
+                trace_dump,
+                model,
+                response_id,
+                original,
+                &format!(
+                    "reasoning-only 重试 {retries_attempted} 次全部失败，且合成消息注入也失败"
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// Resend `request_json` to upstream up to `protocol_proxy::
+/// REASONING_ONLY_MAX_RETRIES` times (short backoff between attempts, see
+/// `protocol_proxy::reasoning_only_retry_step` — kept alive on the
+/// Codex-facing connection via `await_with_client_keepalive`, same helper
+/// already used elsewhere in this function for the upstream-header soft
+/// wait) after a grok request's first attempt came back reasoning-only, and
+/// relay the first successful retry's stream into the same Codex-facing
+/// connection with id rewriting (see `ReasoningOnlyRetryGate::for_retry`).
+/// If every attempt fails — retry request/connection error, non-2xx retry
+/// status, id-extraction failure, retry stream error, or the retry itself
+/// still being reasoning-only — `finalize_exhausted_grok_retry` rewrites
+/// `original`'s withheld `response.completed` with a synthetic failure
+/// message instead of silently forwarding it unmodified.
 #[allow(clippy::too_many_arguments)]
 async fn attempt_grok_reasoning_retry(
     stream: &mut TcpStream,
@@ -7181,140 +7401,108 @@ async fn attempt_grok_reasoning_retry(
         .map(|details| details.response_id.clone())
         .unwrap_or_default();
 
-    macro_rules! fall_back {
-        ($message:expr) => {{
-            protocol_proxy::log_upstream_event_deduped(
-                "responses_reasoning_only_retry_failed",
-                protocol_proxy::LogLevel::Error,
-                format!(
-                    "model={model} response_id={response_id} {}，放行第一次的原始响应",
-                    $message
-                ),
-            );
-            trace_dump.append(&original.bytes);
-            write_http_chunk(stream, &original.bytes).await.ok();
-            return GrokRetryResolution::FellBack {
-                outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-                details: original.details,
-            };
-        }};
-    }
-
     if response_id.is_empty() {
-        fall_back!("reasoning-only 重试缺少 response_id，无法安全改写重试流的 id");
+        return fall_back_to_original_grok_completion(
+            stream,
+            trace_dump,
+            &model,
+            &response_id,
+            original,
+            "reasoning-only 重试缺少 response_id，无法安全改写重试流的 id",
+        )
+        .await;
     }
 
-    let retry_upstream = match protocol_proxy::open_responses_proxy_request(
-        request_json,
-        upstream_config,
-        user_agent,
-        true,
-    )
-    .await
-    {
-        Ok(upstream) if upstream.is_success() => upstream,
-        Ok(upstream) => {
-            fall_back!(format!(
-                "reasoning-only 重试请求返回 HTTP {}",
-                upstream.status_code
-            ))
-        }
-        Err(error) => fall_back!(format!("reasoning-only 重试请求失败: {error:#}")),
-    };
+    let max_retries = protocol_proxy::REASONING_ONLY_MAX_RETRIES;
+    for attempt_number in 1..=max_retries {
+        protocol_proxy::log_upstream_event_deduped(
+            "responses_reasoning_only_retry_attempt",
+            protocol_proxy::LogLevel::Warn,
+            format!(
+                "model={model} response_id={response_id} 第 {attempt_number}/{max_retries} 次 reasoning-only 重试开始"
+            ),
+        );
 
-    let status_code = retry_upstream.status_code;
-    let attempts = retry_upstream.attempts;
-    let trace_seq = retry_upstream.trace_seq;
-    let mut response = retry_upstream.response;
-    let mut gate = protocol_proxy::ReasoningOnlyRetryGate::for_retry(response_id.clone());
-    let mut converter = needs_conversion
-        .then(|| protocol_proxy::ChatSseToResponsesConverter::with_request(request_json));
-    let mut response_bytes = 0u64;
-
-    let relay_end = relay_into_reasoning_only_gate(
-        &mut response,
-        stream,
-        &mut gate,
-        converter.as_mut(),
-        trace_dump,
-        &mut response_bytes,
-    )
-    .await;
-
-    match relay_end {
-        GrokRelayEnd::Clean => {}
-        GrokRelayEnd::ReadError(error) => {
-            fall_back!(format!("reasoning-only 重试流中断: {error}"))
-        }
-        GrokRelayEnd::IdleTimeout => fall_back!("reasoning-only 重试流空闲超时"),
-        GrokRelayEnd::ClientGone => {
-            // Codex already hung up: nothing left to forward either way,
-            // but still report a real fallback rather than a fabricated
-            // retry success.
-            return GrokRetryResolution::FellBack {
-                outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-                details: original.details,
-            };
-        }
-    }
-
-    if flush_converter_through_gate(
-        stream,
-        converter.as_mut(),
-        &mut gate,
-        trace_dump,
-        &mut response_bytes,
-    )
-    .await
-    .is_err()
-    {
-        return GrokRetryResolution::FellBack {
-            outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
-            details: original.details,
-        };
-    }
-
-    // Must read before `gate.finish()`, which consumes `gate` by value.
-    let id_extraction_failed = gate.id_extraction_failed();
-    let (trailing, held) = gate.finish();
-    if !trailing.is_empty() {
-        response_bytes += trailing.len() as u64;
-        trace_dump.append(&trailing);
-        write_http_chunk(stream, &trailing).await.ok();
-    }
-
-    if id_extraction_failed {
-        fall_back!("reasoning-only 重试流未能提取 response_id，无法安全改写");
-    }
-
-    match held {
-        Some(held) if held.outcome != protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnly => {
-            protocol_proxy::log_upstream_event_deduped(
-                "responses_reasoning_only_retry_succeeded",
-                protocol_proxy::LogLevel::Warn,
-                format!(
-                    "model={model} response_id={response_id} reasoning-only 重试成功，已改用第二次响应"
-                ),
-            );
-            response_bytes += held.bytes.len() as u64;
-            trace_dump.append(&held.bytes);
-            if write_http_chunk(stream, &held.bytes).await.is_err() {
+        match run_one_grok_streaming_retry(
+            stream,
+            request_json,
+            upstream_config,
+            user_agent,
+            needs_conversion,
+            &response_id,
+            trace_dump,
+        )
+        .await
+        {
+            SingleGrokRetryOutcome::Succeeded {
+                status_code,
+                attempts,
+                trace_seq,
+                response_bytes,
+            } => {
+                protocol_proxy::log_upstream_event_deduped(
+                    "responses_reasoning_only_retry_succeeded",
+                    protocol_proxy::LogLevel::Warn,
+                    format!(
+                        "model={model} response_id={response_id} 第 {attempt_number}/{max_retries} 次 reasoning-only 重试成功，已改用该次响应"
+                    ),
+                );
+                return GrokRetryResolution::Retried {
+                    status_code,
+                    attempts,
+                    trace_seq,
+                    response_bytes,
+                };
+            }
+            SingleGrokRetryOutcome::ClientGone => {
+                // Codex already hung up: nothing left to forward either
+                // way, but still report a real fallback rather than a
+                // fabricated retry success.
                 return GrokRetryResolution::FellBack {
                     outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
                     details: original.details,
                 };
             }
-            GrokRetryResolution::Retried {
-                status_code,
-                attempts,
-                trace_seq,
-                response_bytes,
+            SingleGrokRetryOutcome::Failed(reason) => {
+                protocol_proxy::log_upstream_event_deduped(
+                    "responses_reasoning_only_retry_attempt_failed",
+                    protocol_proxy::LogLevel::Error,
+                    format!(
+                        "model={model} response_id={response_id} 第 {attempt_number}/{max_retries} 次 reasoning-only 重试失败: {reason}"
+                    ),
+                );
+                if let protocol_proxy::ReasoningOnlyRetryStep::SleepThenRetry(backoff) =
+                    protocol_proxy::reasoning_only_retry_step(attempt_number, max_retries)
+                {
+                    if backoff > Duration::ZERO {
+                        let sleep_fut = tokio::time::sleep(backoff);
+                        tokio::pin!(sleep_fut);
+                        if await_with_client_keepalive(sleep_fut.as_mut(), stream)
+                            .await
+                            .is_err()
+                        {
+                            // Codex hung up while we were backing off.
+                            return GrokRetryResolution::FellBack {
+                                outcome:
+                                    protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                                details: original.details,
+                            };
+                        }
+                    }
+                }
             }
         }
-        _ => fall_back!(
-            "reasoning-only 重试仍失败（重试响应仍然只有 reasoning，或未正常收到 completed 事件）"
-        ),
     }
+
+    finalize_exhausted_grok_retry(
+        stream,
+        trace_dump,
+        &model,
+        &response_id,
+        original,
+        max_retries,
+    )
+    .await
 }
 
 async fn route_protocol_proxy_request(
