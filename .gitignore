@@ -20,3 +20,6 @@ Thumbs.db
 # IDE/editor noise
 .vscode/
 .idea/
+
+# CodeGraph index (local artifact, per-machine)
+.codegraph/
