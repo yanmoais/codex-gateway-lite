@@ -877,6 +877,7 @@ pub async fn open_responses_proxy_request(
     request_json: &Value,
     relay: &ProtocolProxyUpstream,
     original_user_agent: Option<&str>,
+    force_fresh_connection: bool,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let is_stream = request_json
         .get("stream")
@@ -897,6 +898,16 @@ pub async fn open_responses_proxy_request(
     // gateway or a dead pooled connection without the origin ever seeing
     // the request, so every retry switches to a brand-new single-shot
     // client that guarantees no stale keep-alive reuse.
+    //
+    // `force_fresh_connection` overrides that pooled first attempt too:
+    // this is a fresh top-level call (its own `attempts` counter starts back
+    // at 1), so without this flag it would otherwise ride the very same
+    // shared pool as the call it's retrying — and a silently reasoning-only
+    // completion is exactly the kind of failure a poisoned/stale pooled
+    // HTTP/2 connection can cause. The grok reasoning-only retry
+    // (`retry_reasoning_only_buffered`, and the streaming equivalent in
+    // main.rs) always passes `true`; every other caller passes `false` and
+    // sees no change in pooling behavior.
     let mut attempts: u32 = 0;
     let proxy_configured = egress_proxy_from_env().is_some();
     let mut pooled_send_failed = false;
@@ -904,8 +915,8 @@ pub async fn open_responses_proxy_request(
         attempts += 1;
         let bypass_proxy = upstream_attempt_should_bypass_proxy(attempts, proxy_configured);
         let user_agent = effective_user_agent(&relay.user_agent, original_user_agent);
-        let use_pooled =
-            upstream_attempt_uses_pooled_client(attempts, bypass_proxy, pooled_send_failed);
+        let use_pooled = !force_fresh_connection
+            && upstream_attempt_uses_pooled_client(attempts, bypass_proxy, pooled_send_failed);
         let client = if use_pooled {
             pooled_upstream_client(&user_agent)?
         } else {
@@ -2031,8 +2042,9 @@ pub async fn handle_responses_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<ProxyHttpResponse> {
     let request_json: Value = serde_json::from_str(body)?;
-    let upstream = open_responses_proxy_request(&request_json, relay, original_user_agent).await?;
-    handle_responses_upstream(upstream, &request_json, relay).await
+    let upstream =
+        open_responses_proxy_request(&request_json, relay, original_user_agent, false).await?;
+    handle_responses_upstream(upstream, &request_json, relay, original_user_agent).await
 }
 
 /// Read an upstream response body chunk-by-chunk, applying the idle timeout
@@ -2075,17 +2087,14 @@ pub async fn handle_responses_upstream(
     mut upstream: UpstreamProxyResponse,
     request_json: &Value,
     relay: &ProtocolProxyUpstream,
+    original_user_agent: Option<&str>,
 ) -> anyhow::Result<ProxyHttpResponse> {
     let status_code = upstream.status_code;
-    let upstream_content_type = upstream.content_type;
-    let is_stream = upstream.is_stream;
-    let wire_api = upstream.wire_api;
-    let server_header = upstream.server_header;
-    let cf_ray = upstream.cf_ray;
+    let upstream_content_type = upstream.content_type.clone();
+    let server_header = upstream.server_header.clone();
+    let cf_ray = upstream.cf_ray.clone();
     let attempts = upstream.attempts;
     let trace_seq = upstream.trace_seq;
-    let upstream_body = read_upstream_body_with_idle_timeout(&mut upstream.response).await?;
-    let response_bytes = upstream_body.len() as u64;
     // The raw outgoing request bytes aren't threaded down into this
     // buffered path, so `request_bytes` is a re-serialized approximation
     // rather than the exact wire size — acceptable for a diagnostic trace
@@ -2095,26 +2104,9 @@ pub async fn handle_responses_upstream(
         .map(|bytes| bytes.len())
         .unwrap_or(0);
 
-    let record_trace = |outcome: ResponsesDiagnosisOutcome| {
-        record_responses_trace(
-            relay,
-            request_json,
-            trace_seq,
-            request_bytes,
-            is_stream,
-            status_code,
-            attempts,
-            response_bytes,
-            outcome.trace_label(),
-        );
-    };
-    let warn_if_reasoning_only = |details: &Option<ReasoningOnlyDetails>| {
-        if let Some(details) = details {
-            log_reasoning_only_warning(details);
-        }
-    };
-
     if !(200..300).contains(&status_code) {
+        let upstream_body = read_upstream_body_with_idle_timeout(&mut upstream.response).await?;
+        let response_bytes = upstream_body.len() as u64;
         let error =
             responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body);
         let message = error
@@ -2131,13 +2123,80 @@ pub async fn handle_responses_upstream(
         );
         // An error response never carries a `response.completed` event, so
         // there is nothing to diagnose beyond the error itself.
-        record_trace(ResponsesDiagnosisOutcome::NoCompletedEvent);
+        record_responses_trace(
+            relay,
+            request_json,
+            trace_seq,
+            request_bytes,
+            upstream.is_stream,
+            status_code,
+            attempts,
+            response_bytes,
+            ResponsesDiagnosisOutcome::NoCompletedEvent.trace_label(),
+        );
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
             body: serde_json::to_vec(&error)?,
         });
     }
+
+    let first = single_responses_upstream_attempt(upstream, request_json).await?;
+    let is_grok_retry_candidate =
+        first.outcome == ResponsesDiagnosisOutcome::ReasoningOnly && request_targets_grok(request_json);
+    let final_attempt = if is_grok_retry_candidate {
+        retry_reasoning_only_buffered(first, request_json, relay, original_user_agent).await
+    } else {
+        first
+    };
+
+    if let Some(details) = &final_attempt.details {
+        log_reasoning_only_warning(details);
+    }
+    record_responses_trace(
+        relay,
+        request_json,
+        final_attempt.trace_seq,
+        request_bytes,
+        final_attempt.is_stream,
+        final_attempt.status_code,
+        final_attempt.attempts,
+        final_attempt.response_bytes,
+        final_attempt.outcome.trace_label(),
+    );
+    Ok(final_attempt.response)
+}
+
+/// Result of diagnosing one finished, HTTP-successful upstream reply on the
+/// buffered Responses path (see `handle_responses_upstream`), before any
+/// grok reasoning-only retry logic runs.
+struct ResponsesUpstreamAttempt {
+    response: ProxyHttpResponse,
+    status_code: u16,
+    is_stream: bool,
+    attempts: u32,
+    trace_seq: Option<u64>,
+    response_bytes: u64,
+    outcome: ResponsesDiagnosisOutcome,
+    details: Option<ReasoningOnlyDetails>,
+}
+
+/// Read one upstream response body to completion and diagnose it — the body
+/// of `handle_responses_upstream` for any `200..300` status, factored out so
+/// `retry_reasoning_only_buffered` can run the exact same diagnosis on a
+/// second, retried upstream call.
+async fn single_responses_upstream_attempt(
+    mut upstream: UpstreamProxyResponse,
+    request_json: &Value,
+) -> anyhow::Result<ResponsesUpstreamAttempt> {
+    let status_code = upstream.status_code;
+    let upstream_content_type = upstream.content_type;
+    let is_stream = upstream.is_stream;
+    let wire_api = upstream.wire_api;
+    let attempts = upstream.attempts;
+    let trace_seq = upstream.trace_seq;
+    let upstream_body = read_upstream_body_with_idle_timeout(&mut upstream.response).await?;
+    let response_bytes = upstream_body.len() as u64;
 
     if wire_api == UpstreamWireApi::Responses {
         // `is_stream` here reflects whether the upstream *actually* replied
@@ -2155,16 +2214,23 @@ pub async fn handle_responses_upstream(
                 .map(|parsed| diagnose_response_object(&parsed))
                 .unwrap_or((ResponsesDiagnosisOutcome::NoCompletedEvent, None))
         };
-        warn_if_reasoning_only(&details);
-        record_trace(outcome);
-        return Ok(ProxyHttpResponse {
-            status: "200 OK".to_string(),
-            content_type: if upstream_content_type.is_empty() {
-                "application/json; charset=utf-8".to_string()
-            } else {
-                upstream_content_type
+        return Ok(ResponsesUpstreamAttempt {
+            response: ProxyHttpResponse {
+                status: "200 OK".to_string(),
+                content_type: if upstream_content_type.is_empty() {
+                    "application/json; charset=utf-8".to_string()
+                } else {
+                    upstream_content_type
+                },
+                body: upstream_body.to_vec(),
             },
-            body: upstream_body.to_vec(),
+            status_code,
+            is_stream,
+            attempts,
+            trace_seq,
+            response_bytes,
+            outcome,
+            details,
         });
     }
 
@@ -2172,25 +2238,127 @@ pub async fn handle_responses_upstream(
         let text = String::from_utf8_lossy(&upstream_body);
         let converted = chat_sse_to_responses_sse_with_request(&text, request_json);
         let (outcome, details) = diagnose_responses_sse_text(&converted);
-        warn_if_reasoning_only(&details);
-        record_trace(outcome);
-        return Ok(ProxyHttpResponse {
-            status: "200 OK".to_string(),
-            content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: converted.into_bytes(),
+        return Ok(ResponsesUpstreamAttempt {
+            response: ProxyHttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "text/event-stream; charset=utf-8".to_string(),
+                body: converted.into_bytes(),
+            },
+            status_code,
+            is_stream,
+            attempts,
+            trace_seq,
+            response_bytes,
+            outcome,
+            details,
         });
     }
 
     let chat_json: Value = serde_json::from_slice(&upstream_body)?;
     let response_json = chat_completion_to_response_with_request(chat_json, request_json)?;
     let (outcome, details) = diagnose_response_object(&response_json);
-    warn_if_reasoning_only(&details);
-    record_trace(outcome);
-    Ok(ProxyHttpResponse {
-        status: "200 OK".to_string(),
-        content_type: "application/json; charset=utf-8".to_string(),
-        body: serde_json::to_vec(&response_json)?,
+    Ok(ResponsesUpstreamAttempt {
+        response: ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&response_json)?,
+        },
+        status_code,
+        is_stream,
+        attempts,
+        trace_seq,
+        response_bytes,
+        outcome,
+        details,
     })
+}
+
+/// Grok-only, buffered-path counterpart to the streaming path's
+/// `ReasoningOnlyRetryGate` retry: `first` was already diagnosed as
+/// `ReasoningOnly`, so re-send the same request once and use whichever
+/// attempt actually has a non-reasoning-only output. No id rewriting is
+/// needed here (unlike the streaming path) — the buffered path never
+/// streams partial events to Codex before the full response is diagnosed,
+/// so there is nothing that has already seen the first attempt's id.
+async fn retry_reasoning_only_buffered(
+    first: ResponsesUpstreamAttempt,
+    request_json: &Value,
+    relay: &ProtocolProxyUpstream,
+    original_user_agent: Option<&str>,
+) -> ResponsesUpstreamAttempt {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let response_id = first
+        .details
+        .as_ref()
+        .map(|details| details.response_id.as_str())
+        .unwrap_or("");
+
+    // `force_fresh_connection: true` — a reasoning-only completion can be
+    // caused by a poisoned pooled connection, so the retry must never reuse
+    // the one the first attempt just used (see `open_responses_proxy_request`'s
+    // doc comment).
+    let retry_upstream =
+        match open_responses_proxy_request(request_json, relay, original_user_agent, true).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                log_upstream_event_deduped(
+                    "responses_reasoning_only_retry_failed",
+                    LogLevel::Error,
+                    format!(
+                        "model={model} response_id={response_id} reasoning-only 重试请求失败: {error:#}，放行第一次的原始响应"
+                    ),
+                );
+                return ResponsesUpstreamAttempt {
+                    outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                    ..first
+                };
+            }
+        };
+
+    match single_responses_upstream_attempt(retry_upstream, request_json).await {
+        Ok(retry_attempt) if retry_attempt.outcome != ResponsesDiagnosisOutcome::ReasoningOnly => {
+            log_upstream_event_deduped(
+                "responses_reasoning_only_retry_succeeded",
+                LogLevel::Warn,
+                format!(
+                    "model={model} response_id={response_id} reasoning-only 重试成功，已改用第二次响应"
+                ),
+            );
+            ResponsesUpstreamAttempt {
+                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetried,
+                ..retry_attempt
+            }
+        }
+        Ok(_) => {
+            log_upstream_event_deduped(
+                "responses_reasoning_only_retry_failed",
+                LogLevel::Error,
+                format!(
+                    "model={model} response_id={response_id} reasoning-only 重试仍失败（重试响应仍然只有 reasoning），放行第一次的原始响应"
+                ),
+            );
+            ResponsesUpstreamAttempt {
+                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                ..first
+            }
+        }
+        Err(error) => {
+            log_upstream_event_deduped(
+                "responses_reasoning_only_retry_failed",
+                LogLevel::Error,
+                format!(
+                    "model={model} response_id={response_id} reasoning-only 重试响应处理失败: {error:#}，放行第一次的原始响应"
+                ),
+            );
+            ResponsesUpstreamAttempt {
+                outcome: ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                ..first
+            }
+        }
+    }
 }
 
 pub fn chat_completions_url(base_url: &str) -> String {
@@ -2407,6 +2575,28 @@ pub enum ResponsesDiagnosisOutcome {
     /// read-error handling in the streaming loop), so this variant
     /// deliberately never triggers its own warning.
     NoCompletedEvent,
+    /// Grok-only (see `request_targets_grok`): the first attempt was
+    /// `ReasoningOnly`, a one-shot retry against the same upstream was
+    /// issued, and the retry's own `response.completed` was *not*
+    /// reasoning-only — its response was relayed to Codex in place of the
+    /// withheld first attempt.
+    ReasoningOnlyRetried,
+    /// Grok-only: the first attempt was `ReasoningOnly` and the retry
+    /// either also came back reasoning-only, or failed outright (upstream
+    /// error, stream interruption, id-extraction failure, ...) — the
+    /// original first-attempt response was relayed unchanged, same as if no
+    /// retry had ever been attempted.
+    ReasoningOnlyRetryFailed,
+    /// The `output` was reasoning-only, but `response.status ==
+    /// "incomplete"` (truncated by `max_output_tokens`, or stopped by
+    /// content filtering) explains why — the model was deterministically
+    /// cut off before it could ever emit a message, not silently stuck. A
+    /// byte-identical retry of the same request would hit the same limit
+    /// and reasoning-only-shaped output again, so this is deliberately kept
+    /// distinct from `ReasoningOnly` and never triggers the grok retry (see
+    /// `deterministic_incomplete_reason`, mirroring the same exclusion
+    /// xAI's own `grok-build` CLI applies before its retry).
+    ReasoningOnlyTruncated,
 }
 
 impl ResponsesDiagnosisOutcome {
@@ -2418,6 +2608,9 @@ impl ResponsesDiagnosisOutcome {
             Self::ReasoningOnly => "reasoning_only",
             Self::SkippedTooLarge => "skipped_too_large",
             Self::NoCompletedEvent => "no_completed_event",
+            Self::ReasoningOnlyRetried => "reasoning_only_retried",
+            Self::ReasoningOnlyRetryFailed => "reasoning_only_retry_failed",
+            Self::ReasoningOnlyTruncated => "reasoning_only_truncated",
         }
     }
 }
@@ -2435,6 +2628,12 @@ pub struct ReasoningOnlyDetails {
     /// `summary`/`content` fields, already truncated to
     /// `REASONING_SNIPPET_MAX_CHARS`.
     pub reasoning_snippet: String,
+    /// `Some(reason)` (e.g. `"max_output_tokens"`, `"content_filter"`) when
+    /// this reasoning-only completion is explained by a deterministic
+    /// truncation/content-filter stop rather than the reasoning-only bug —
+    /// see `ResponsesDiagnosisOutcome::ReasoningOnlyTruncated`. `None` for a
+    /// genuine (retry-eligible) reasoning-only completion.
+    pub truncated_reason: Option<String>,
 }
 
 /// Per-stream diagnosis state for the Responses passthrough path (raw bytes
@@ -2552,6 +2751,36 @@ fn find_responses_completed_event(text: &str) -> Option<Value> {
     found
 }
 
+/// If `response` (a `response.completed` event's `response` object) reports
+/// `status == "incomplete"`, returns the `incomplete_details.reason` string
+/// (falling back to `"incomplete"` if the reason itself is missing).
+/// `status: "incomplete"` is how this codebase's own Chat-Completions→
+/// Responses conversion represents both `finish_reason == "length"`
+/// (`reason: "max_output_tokens"`, see `incomplete_details_reason`) and
+/// content-filter stops (`reason: "content_filter"`), and native
+/// Responses-protocol upstreams use the same shape — so checking `status`
+/// alone (regardless of the exact reason string) catches both, plus any
+/// other deterministic incomplete reason an upstream might report.
+///
+/// A reasoning-only `output` explained by either case is a deterministic,
+/// same-request-same-result stop, not the silent reasoning-only bug the
+/// grok retry exists to work around — retrying would just reproduce the
+/// same truncation/refusal and waste an upstream call. xAI's own
+/// `grok-build` CLI applies this same exclusion before its own
+/// reasoning-only retry.
+fn deterministic_incomplete_reason(response: &Value) -> Option<String> {
+    if response.get("status").and_then(Value::as_str) != Some("incomplete") {
+        return None;
+    }
+    Some(
+        response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("incomplete")
+            .to_string(),
+    )
+}
+
 /// Given the `response` object from a `response.completed` event, decide
 /// whether its `output` array is reasoning-only.
 fn diagnose_response_object(
@@ -2597,15 +2826,22 @@ fn diagnose_response_object(
         .chars()
         .take(REASONING_SNIPPET_MAX_CHARS)
         .collect();
+    let truncated_reason = deterministic_incomplete_reason(response);
+    let outcome = if truncated_reason.is_some() {
+        ResponsesDiagnosisOutcome::ReasoningOnlyTruncated
+    } else {
+        ResponsesDiagnosisOutcome::ReasoningOnly
+    };
 
     (
-        ResponsesDiagnosisOutcome::ReasoningOnly,
+        outcome,
         Some(ReasoningOnlyDetails {
             response_id,
             model,
             output_tokens,
             reasoning_tokens,
             reasoning_snippet,
+            truncated_reason,
         }),
     )
 }
@@ -2623,6 +2859,17 @@ fn format_reasoning_only_message(details: &ReasoningOnlyDetails) -> String {
         .reasoning_tokens
         .map(|value| value.to_string())
         .unwrap_or_else(|| "未知".to_string());
+    if let Some(reason) = &details.truncated_reason {
+        return format!(
+            "Responses 上游流因截断/内容审查提前结束，output 恰好只有 reasoning（不是 reasoning-only 故障，不会触发重试）：model={}, response_id={}, reason={}, output_tokens={}, reasoning_tokens={}, reasoning 片段={}",
+            details.model,
+            details.response_id,
+            reason,
+            output_tokens,
+            reasoning_tokens,
+            details.reasoning_snippet
+        );
+    }
     format!(
         "Responses 上游流正常结束但输出只有 reasoning（模型只思考没答复）：model={}, response_id={}, output_tokens={}, reasoning_tokens={}, reasoning 片段={}",
         details.model,
@@ -2638,13 +2885,247 @@ fn format_reasoning_only_message(details: &ReasoningOnlyDetails) -> String {
 /// the same way other upstream diagnostics do. `pub` because the streaming
 /// passthrough loop in main.rs runs its own `ResponsesPassthroughDiagnosis`
 /// and needs to trigger this same warning directly (see
-/// `handle_streaming_responses_proxy`).
+/// `handle_streaming_responses_proxy`). A deterministic truncation/
+/// content-filter case (`details.truncated_reason.is_some()`) logs under a
+/// different key and at `Warn` instead of `Error` — it's an informational
+/// note, not a sign of the reasoning-only bug.
 pub fn log_reasoning_only_warning(details: &ReasoningOnlyDetails) {
+    if details.truncated_reason.is_some() {
+        log_upstream_event_deduped(
+            "responses_reasoning_only_truncated",
+            LogLevel::Warn,
+            format_reasoning_only_message(details),
+        );
+        return;
+    }
     log_upstream_event_deduped(
         "responses_reasoning_only_completion",
         LogLevel::Error,
         format_reasoning_only_message(details),
     );
+}
+
+/// Whether `model` (a request's raw `model` field) identifies one of xAI's
+/// grok models — case-insensitively, and ignoring any `provider/` routing
+/// prefix a config might prepend (e.g. `"xai/grok-4.3"`). Gates the
+/// reasoning-only-completion auto-retry (`ReasoningOnlyRetryGate` below, and
+/// the equivalent one-shot retry in `handle_responses_upstream`'s buffered
+/// path): that failure mode and its retry are grok-specific, so every other
+/// model must see zero behavior change.
+pub(crate) fn is_grok_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    name.contains("grok")
+}
+
+/// Same check, applied to a full Responses request body's `model` field.
+pub(crate) fn request_targets_grok(request_json: &Value) -> bool {
+    request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(is_grok_model)
+}
+
+/// A `response.completed` SSE event block withheld by `ReasoningOnlyRetryGate`
+/// pending diagnosis, plus that diagnosis's result.
+pub struct HeldCompletedEvent {
+    pub outcome: ResponsesDiagnosisOutcome,
+    pub details: Option<ReasoningOnlyDetails>,
+    /// The event block's raw bytes, terminated with a trailing blank line —
+    /// ready to forward exactly as received. For a retry gate
+    /// (`ReasoningOnlyRetryGate::for_retry`) this has already had the retry
+    /// stream's own `response_id` (and every id derived from it, e.g. the
+    /// `rs_<id>` reasoning-item id — see `ChatSseState::push_reasoning_delta_into`)
+    /// replaced with the target id, so forwarding it is indistinguishable
+    /// from a same-turn continuation.
+    pub bytes: Vec<u8>,
+}
+
+/// Parse a single SSE event block's `data:` line as JSON, mirroring the
+/// per-line scan `find_responses_completed_event` runs over a whole buffer,
+/// just narrowed to one already-isolated block.
+fn sse_block_data_json(block: &str) -> Option<Value> {
+    block
+        .lines()
+        .find_map(|line| strip_sse_field(line, "data").and_then(|data| serde_json::from_str::<Value>(data).ok()))
+}
+
+/// Event-level SSE gate for the Responses passthrough streaming path (see
+/// `handle_streaming_responses_proxy` in main.rs), used only for grok
+/// requests (see `request_targets_grok`). Splits incoming bytes into
+/// complete SSE event blocks — same chunk-boundary-safe splitting
+/// (`append_utf8_safe` + `take_sse_block`) `ChatSseToResponsesConverter`
+/// already uses — and forwards every block immediately *except*
+/// `response.completed`, which is withheld (`HeldCompletedEvent`) so the
+/// caller can diagnose it before deciding whether to relay it or retry the
+/// upstream request.
+///
+/// Two modes, selected at construction:
+/// - `new()`: the turn's first attempt. Every event, including the opening
+///   `response.created`/`response.in_progress`, is forwarded verbatim
+///   (nothing to rewrite yet).
+/// - `for_retry(target_id)`: a grok reasoning-only retry. The retry
+///   stream's own opening `response.created`/`response.in_progress` events
+///   are *not* forwarded — Codex already saw this turn's `response.created`
+///   from the first attempt — but their `response.id` is captured so every
+///   later event can have that id string-replaced with `target_id` before
+///   forwarding (see `HeldCompletedEvent`'s doc comment on why a plain
+///   substring replace is sufficient). If a forward-eligible event arrives
+///   before that id is ever captured, id rewriting can't be trusted for
+///   anything else in the stream — `push_chunk` sets `id_extraction_failed`
+///   and stops forwarding; callers must treat that as a failed retry and
+///   fall back to the original withheld completion instead of relaying
+///   anything from this stream.
+pub struct ReasoningOnlyRetryGate {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    rewrite_target_id: Option<String>,
+    retry_source_id: Option<String>,
+    id_extraction_failed: bool,
+    held: Option<HeldCompletedEvent>,
+}
+
+impl ReasoningOnlyRetryGate {
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            utf8_remainder: Vec::new(),
+            rewrite_target_id: None,
+            retry_source_id: None,
+            id_extraction_failed: false,
+            held: None,
+        }
+    }
+
+    pub fn for_retry(target_id: impl Into<String>) -> Self {
+        Self {
+            rewrite_target_id: Some(target_id.into()),
+            ..Self::new()
+        }
+    }
+
+    /// Set once id extraction has failed for a retry gate (see the struct
+    /// doc comment). Once true, `push_chunk` stops forwarding anything —
+    /// callers must abandon this stream and fall back to the original
+    /// withheld completion.
+    pub fn id_extraction_failed(&self) -> bool {
+        self.id_extraction_failed
+    }
+
+    /// Feed one more chunk (already Responses-shaped SSE bytes — the raw
+    /// upstream bytes for a native Responses upstream, or already converted
+    /// via `ChatSseToResponsesConverter` for a Chat Completions one).
+    /// Returns the bytes that should be forwarded to Codex immediately.
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.id_extraction_failed {
+            return Vec::new();
+        }
+        append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, chunk);
+        let mut forward = String::new();
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            let event = sse_block_data_json(&block);
+            let event_type = event
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str);
+            let is_opening = matches!(
+                event_type,
+                Some("response.created") | Some("response.in_progress")
+            );
+
+            if is_opening {
+                if self.rewrite_target_id.is_some() {
+                    // Retry gate: use the *first* opening event to learn
+                    // this stream's own id, then drop every opening event —
+                    // `response.created`/`response.in_progress` included,
+                    // not just the first one seen. Codex already saw the
+                    // first attempt's own opening events; forwarding the
+                    // retry's second one (`response.in_progress` after
+                    // `response.created` already captured the id) would
+                    // resend an opening event mid-turn.
+                    if self.retry_source_id.is_none() {
+                        self.retry_source_id = event
+                            .as_ref()
+                            .and_then(|value| value.pointer("/response/id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        if self.retry_source_id.is_none() {
+                            self.id_extraction_failed = true;
+                            return Vec::new();
+                        }
+                    }
+                    continue;
+                }
+                // First-attempt gates forward these normally — Codex hasn't
+                // seen them yet.
+                forward.push_str(&self.rewrite_block(&block));
+                forward.push_str("\n\n");
+                continue;
+            }
+
+            if self.rewrite_target_id.is_some() && self.retry_source_id.is_none() {
+                // A forward-eligible (non-opening) event — including a
+                // premature `response.completed` — arrived before the retry
+                // stream's own id was ever captured — id rewriting can't be
+                // trusted for anything in this stream from here on.
+                self.id_extraction_failed = true;
+                return Vec::new();
+            }
+
+            if event_type == Some("response.completed") {
+                if let Some(response) = event.as_ref().and_then(|value| value.get("response")) {
+                    let (outcome, details) = diagnose_response_object(response);
+                    let mut bytes = self.rewrite_block(&block).into_bytes();
+                    bytes.extend_from_slice(b"\n\n");
+                    self.held = Some(HeldCompletedEvent {
+                        outcome,
+                        details,
+                        bytes,
+                    });
+                }
+                // A `response.completed` block with no parseable `response`
+                // payload is dropped rather than forwarded or held — there
+                // is nothing sensible to diagnose or relay.
+                continue;
+            }
+
+            forward.push_str(&self.rewrite_block(&block));
+            forward.push_str("\n\n");
+        }
+        forward.into_bytes()
+    }
+
+    fn rewrite_block(&self, block: &str) -> String {
+        match (&self.rewrite_target_id, &self.retry_source_id) {
+            (Some(target), Some(source)) if !source.is_empty() => {
+                block.replace(source.as_str(), target.as_str())
+            }
+            _ => block.to_string(),
+        }
+    }
+
+    /// Call once the upstream stream has ended. Returns any trailing bytes
+    /// that never formed a complete event block (rare — e.g. a stray
+    /// comment line with no following blank line) and the withheld
+    /// `response.completed` block, if one was ever seen.
+    pub fn finish(mut self) -> (Vec<u8>, Option<HeldCompletedEvent>) {
+        if !self.utf8_remainder.is_empty() {
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.utf8_remainder.clear();
+        }
+        let trailing = std::mem::take(&mut self.buffer).into_bytes();
+        (trailing, self.held.take())
+    }
+}
+
+impl Default for ReasoningOnlyRetryGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -2708,8 +3189,57 @@ mod responses_diagnosis_tests {
                 output_tokens: Some(42),
                 reasoning_tokens: Some(40),
                 reasoning_snippet: "thinking hard about the problem".to_string(),
+                truncated_reason: None,
             }
         );
+    }
+
+    #[test]
+    fn finish_flags_truncated_reasoning_only_as_excluded_from_retry() {
+        // `status: "incomplete"` + `incomplete_details.reason:
+        // "max_output_tokens"` is exactly how this codebase's own
+        // Chat-Completions→Responses conversion represents a
+        // `finish_reason == "length"` truncation (see
+        // `incomplete_details_reason`) — a byte-identical retry would hit
+        // the same limit and produce reasoning-only output again, so this
+        // must be `ReasoningOnlyTruncated`, not the retry-eligible
+        // `ReasoningOnly`.
+        let response = json!({
+            "id": "resp_trunc",
+            "model": "grok-4.5",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [reasoning_item("still thinking when it got cut off")],
+            "usage": { "output_tokens": 999, "output_tokens_details": { "reasoning_tokens": 999 } }
+        });
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        diagnosis.push_chunk(completed_event_sse(&response).as_bytes());
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::ReasoningOnlyTruncated);
+        assert_eq!(outcome.trace_label(), "reasoning_only_truncated");
+        let details = details.expect("truncated reasoning-only outcome still carries details");
+        assert_eq!(details.truncated_reason.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn finish_flags_content_filtered_reasoning_only_as_excluded_from_retry() {
+        let response = json!({
+            "id": "resp_filtered",
+            "model": "grok-4.5",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "output": [reasoning_item("about to say something risky")],
+            "usage": { "output_tokens": 12, "output_tokens_details": { "reasoning_tokens": 12 } }
+        });
+        let mut diagnosis = ResponsesPassthroughDiagnosis::new();
+        diagnosis.push_chunk(completed_event_sse(&response).as_bytes());
+
+        let (outcome, details) = diagnosis.finish();
+        assert_eq!(outcome, ResponsesDiagnosisOutcome::ReasoningOnlyTruncated);
+        let details =
+            details.expect("content-filtered reasoning-only outcome still carries details");
+        assert_eq!(details.truncated_reason.as_deref(), Some("content_filter"));
     }
 
     #[test]
@@ -2809,6 +3339,7 @@ mod responses_diagnosis_tests {
             output_tokens: Some(42),
             reasoning_tokens: Some(40),
             reasoning_snippet: "thinking hard about the problem".to_string(),
+            truncated_reason: None,
         };
         assert_eq!(
             format_reasoning_only_message(&details),
@@ -2824,11 +3355,220 @@ mod responses_diagnosis_tests {
             output_tokens: None,
             reasoning_tokens: None,
             reasoning_snippet: String::new(),
+            truncated_reason: None,
         };
         assert_eq!(
             format_reasoning_only_message(&details),
             "Responses 上游流正常结束但输出只有 reasoning（模型只思考没答复）：model=custom-model, response_id=resp_xyz, output_tokens=未知, reasoning_tokens=未知, reasoning 片段="
         );
+    }
+
+    #[test]
+    fn format_reasoning_only_message_uses_distinct_wording_for_truncated_case() {
+        let details = ReasoningOnlyDetails {
+            response_id: "resp_trunc".to_string(),
+            model: "grok-4.5".to_string(),
+            output_tokens: Some(999),
+            reasoning_tokens: Some(999),
+            reasoning_snippet: "still thinking".to_string(),
+            truncated_reason: Some("max_output_tokens".to_string()),
+        };
+        let message = format_reasoning_only_message(&details);
+        assert!(message.contains("不是 reasoning-only 故障"));
+        assert!(message.contains("reason=max_output_tokens"));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_only_retry_gate_tests {
+    use super::*;
+
+    #[test]
+    fn is_grok_model_matches_grok_family_regardless_of_case_or_provider_prefix() {
+        assert!(is_grok_model("grok-4.5"));
+        assert!(is_grok_model("xai/grok-4.3"));
+        assert!(is_grok_model("GROK-4.5"));
+        assert!(is_grok_model("  grok-3-mini  "));
+        assert!(!is_grok_model("gpt-5.6-sol"));
+        assert!(!is_grok_model("claude-fable-5"));
+    }
+
+    #[test]
+    fn request_targets_grok_reads_the_model_field() {
+        assert!(request_targets_grok(&json!({ "model": "xai/grok-4.3" })));
+        assert!(!request_targets_grok(&json!({ "model": "gpt-5.6-sol" })));
+        assert!(!request_targets_grok(&json!({})));
+    }
+
+    fn created_event_sse(id: &str) -> String {
+        let envelope = json!({
+            "type": "response.created",
+            "response": { "id": id, "object": "response", "status": "in_progress" }
+        });
+        format!(
+            "event: response.created\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+    }
+
+    fn in_progress_event_sse(id: &str) -> String {
+        let envelope = json!({
+            "type": "response.in_progress",
+            "response": { "id": id, "object": "response", "status": "in_progress" }
+        });
+        format!(
+            "event: response.in_progress\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+    }
+
+    fn reasoning_delta_event_sse(id: &str) -> String {
+        let envelope = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": format!("rs_{id}"),
+            "delta": "thinking..."
+        });
+        format!(
+            "event: response.reasoning_summary_text.delta\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+    }
+
+    fn completed_event_sse(id: &str, output: Vec<Value>) -> String {
+        let envelope = json!({
+            "type": "response.completed",
+            "response": {
+                "id": id,
+                "object": "response",
+                "model": "grok-4.5",
+                "output": output,
+                "usage": { "output_tokens": 5, "output_tokens_details": { "reasoning_tokens": 5 } }
+            }
+        });
+        format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+    }
+
+    fn reasoning_only_output() -> Vec<Value> {
+        vec![json!({
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "hmm" }]
+        })]
+    }
+
+    fn message_output() -> Vec<Value> {
+        vec![json!({
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "here you go" }]
+        })]
+    }
+
+    #[test]
+    fn push_chunk_forwards_events_immediately_and_withholds_only_completed_across_chunk_boundaries()
+    {
+        let created = created_event_sse("resp_a");
+        let delta = reasoning_delta_event_sse("resp_a");
+        let completed = completed_event_sse("resp_a", reasoning_only_output());
+        let full = format!("{created}{delta}{completed}");
+
+        // Split the whole stream at a byte offset that lands inside the
+        // `response.completed` block, so the gate must buffer across the
+        // boundary rather than assuming chunk == event.
+        let split_at = created.len() + delta.len() + completed.len() / 2;
+        let (first_chunk, second_chunk) = full.split_at(split_at);
+
+        let mut gate = ReasoningOnlyRetryGate::new();
+        let forwarded_first = gate.push_chunk(first_chunk.as_bytes());
+        // The created + delta events are already complete blocks inside the
+        // first chunk and must be forwarded right away, untouched.
+        assert_eq!(
+            String::from_utf8(forwarded_first).unwrap(),
+            format!("{created}{delta}")
+        );
+
+        let forwarded_second = gate.push_chunk(second_chunk.as_bytes());
+        // Nothing else to forward — the completed block is withheld.
+        assert!(forwarded_second.is_empty());
+
+        let (trailing, held) = gate.finish();
+        assert!(trailing.is_empty());
+        let held = held.expect("response.completed must have been captured");
+        assert_eq!(held.outcome, ResponsesDiagnosisOutcome::ReasoningOnly);
+        assert_eq!(String::from_utf8(held.bytes).unwrap(), completed);
+    }
+
+    #[test]
+    fn retry_gate_rewrites_ids_and_drops_the_retry_streams_own_opening_events() {
+        let mut gate = ReasoningOnlyRetryGate::for_retry("resp_original");
+        let stream = format!(
+            "{}{}{}{}",
+            created_event_sse("resp_retry"),
+            in_progress_event_sse("resp_retry"),
+            reasoning_delta_event_sse("resp_retry"),
+            completed_event_sse("resp_retry", message_output())
+        );
+
+        let forwarded = gate.push_chunk(stream.as_bytes());
+        let forwarded = String::from_utf8(forwarded).unwrap();
+
+        // Opening events must never reach Codex a second time...
+        assert!(!forwarded.contains("response.created"));
+        assert!(!forwarded.contains("response.in_progress"));
+        // ...but the reasoning delta must, with every occurrence of the
+        // retry stream's own id rewritten to the original id (including the
+        // derived `rs_<id>` item id).
+        assert!(forwarded.contains("response.reasoning_summary_text.delta"));
+        assert!(!forwarded.contains("resp_retry"));
+        assert!(forwarded.contains("rs_resp_original"));
+
+        let (_, held) = gate.finish();
+        let held = held.expect("retry completed must have been captured");
+        assert_eq!(held.outcome, ResponsesDiagnosisOutcome::Normal);
+        let completed_text = String::from_utf8(held.bytes).unwrap();
+        assert!(completed_text.contains("\"id\":\"resp_original\""));
+        assert!(!completed_text.contains("resp_retry"));
+    }
+
+    #[test]
+    fn retry_gate_still_reasoning_only_reports_reasoning_only_for_its_own_completed() {
+        let mut gate = ReasoningOnlyRetryGate::for_retry("resp_original");
+        let stream = format!(
+            "{}{}",
+            created_event_sse("resp_retry_2"),
+            completed_event_sse("resp_retry_2", reasoning_only_output())
+        );
+        let forwarded = gate.push_chunk(stream.as_bytes());
+        assert!(forwarded.is_empty());
+
+        let (_, held) = gate.finish();
+        let held = held.expect("retry completed must have been captured");
+        // Callers (main.rs's retry orchestration) treat this outcome as a
+        // failed retry and fall back to forwarding the *first* attempt's
+        // original withheld `response.completed` instead of this one.
+        assert_eq!(held.outcome, ResponsesDiagnosisOutcome::ReasoningOnly);
+    }
+
+    #[test]
+    fn retry_gate_flags_id_extraction_failure_when_first_event_is_not_an_opening_event() {
+        let mut gate = ReasoningOnlyRetryGate::for_retry("resp_original");
+        let forwarded = gate.push_chunk(reasoning_delta_event_sse("resp_retry").as_bytes());
+        assert!(forwarded.is_empty());
+        assert!(gate.id_extraction_failed());
+
+        // Once flagged, further chunks are refused too — callers must
+        // abandon the retry stream entirely rather than trust anything from
+        // it.
+        let mut gate = gate;
+        assert!(gate.push_chunk(b"anything").is_empty());
+    }
+
+    #[test]
+    fn first_attempt_gate_forwards_opening_events_and_needs_no_id_rewrite() {
+        let mut gate = ReasoningOnlyRetryGate::new();
+        let forwarded = gate.push_chunk(created_event_sse("resp_a").as_bytes());
+        assert_eq!(String::from_utf8(forwarded).unwrap(), created_event_sse("resp_a"));
     }
 }
 

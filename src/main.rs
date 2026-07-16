@@ -6323,6 +6323,10 @@ async fn handle_streaming_responses_proxy(
             }
         };
     let request_model = request_json.get("model").and_then(Value::as_str);
+    // Gates the grok-only reasoning-only-completion auto-retry below (see
+    // `protocol_proxy::ReasoningOnlyRetryGate`) — every other model's
+    // streaming path is untouched.
+    let is_grok = protocol_proxy::request_targets_grok(&request_json);
     let upstream_config = protocol_proxy_upstream_from_config(&config, request_model)?;
     // Captured before `request` is moved into the task-local scope below —
     // everything past this point only ever needs the byte length, not the
@@ -6341,8 +6345,12 @@ async fn handle_streaming_responses_proxy(
     // 120s for streams) and its own idle timeout tears the turn down with
     // "idle timeout waiting for SSE".
     let mut sse_header_sent = false;
-    let open_fut =
-        protocol_proxy::open_responses_proxy_request(&request_json, &upstream_config, user_agent);
+    let open_fut = protocol_proxy::open_responses_proxy_request(
+        &request_json,
+        &upstream_config,
+        user_agent,
+        false,
+    );
     tokio::pin!(open_fut);
     let open_result = match tokio::time::timeout(UPSTREAM_HEADER_SOFT_WAIT, open_fut.as_mut()).await
     {
@@ -6407,6 +6415,7 @@ async fn handle_streaming_responses_proxy(
                 &retry_json,
                 &upstream_config,
                 user_agent,
+                false,
             );
             tokio::pin!(retry_fut);
             let retry_result = if sse_header_sent {
@@ -6456,22 +6465,89 @@ async fn handle_streaming_responses_proxy(
         let attempts = upstream.attempts;
         let trace_seq = upstream.trace_seq;
         let mut response = upstream.response;
-        // Reasoning-only-completion diagnosis (see
-        // `ResponsesPassthroughDiagnosis`) and the opt-in full trace dump
-        // both watch the exact bytes relayed to Codex, without altering
-        // what gets forwarded.
-        let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
         let mut trace_dump = trace::ResponseDumpWriter::new(trace_seq);
-        loop {
-            match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
-                Ok(UpstreamChunkPoll::Chunk(chunk)) => {
-                    protocol_proxy::scan_responses_passthrough_chunk_for_upstream_failure(&chunk);
-                    diagnosis.push_chunk(&chunk);
-                    trace_dump.append(&chunk);
-                    write_http_chunk(&mut stream, &chunk).await?
+
+        if is_grok {
+            // grok reasoning-only-completion auto-retry (see
+            // `protocol_proxy::ReasoningOnlyRetryGate`): withhold
+            // `response.completed` until diagnosed, retry once upstream on
+            // genuine reasoning-only, otherwise forward it unchanged.
+            let mut gate = protocol_proxy::ReasoningOnlyRetryGate::new();
+            let mut response_bytes = 0u64;
+            let mut final_status_code = status_code;
+            let mut final_attempts = attempts;
+            let mut final_trace_seq = trace_seq;
+            let outcome;
+            let details;
+
+            let relay_end = relay_into_reasoning_only_gate(
+                &mut response,
+                &mut stream,
+                &mut gate,
+                None,
+                &mut trace_dump,
+                &mut response_bytes,
+            )
+            .await;
+
+            match relay_end {
+                GrokRelayEnd::Clean => {
+                    let (trailing, held) = gate.finish();
+                    if !trailing.is_empty() {
+                        response_bytes += trailing.len() as u64;
+                        trace_dump.append(&trailing);
+                        write_http_chunk(&mut stream, &trailing).await.ok();
+                    }
+                    match held {
+                        Some(held)
+                            if held.outcome
+                                == protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnly =>
+                        {
+                            match attempt_grok_reasoning_retry(
+                                &mut stream,
+                                &request_json,
+                                &upstream_config,
+                                user_agent,
+                                false,
+                                held,
+                                &mut trace_dump,
+                            )
+                            .await
+                            {
+                                GrokRetryResolution::Retried {
+                                    status_code: rs,
+                                    attempts: ra,
+                                    trace_seq: rt,
+                                    response_bytes: rb,
+                                } => {
+                                    final_status_code = rs;
+                                    final_attempts = ra;
+                                    final_trace_seq = rt;
+                                    response_bytes += rb;
+                                    outcome =
+                                        protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetried;
+                                    details = None;
+                                }
+                                GrokRetryResolution::FellBack { outcome: o, details: d } => {
+                                    outcome = o;
+                                    details = d;
+                                }
+                            }
+                        }
+                        Some(held) => {
+                            response_bytes += held.bytes.len() as u64;
+                            trace_dump.append(&held.bytes);
+                            write_http_chunk(&mut stream, &held.bytes).await.ok();
+                            outcome = held.outcome;
+                            details = held.details;
+                        }
+                        None => {
+                            outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                            details = None;
+                        }
+                    }
                 }
-                Ok(UpstreamChunkPoll::End) => break,
-                Ok(UpstreamChunkPoll::ReadError(error)) => {
+                GrokRelayEnd::ReadError(error) => {
                     let message = format!("Responses 上游流中断: {error}");
                     protocol_proxy::log_upstream_event_deduped(
                         "responses_stream_interrupted",
@@ -6483,9 +6559,10 @@ async fn handle_streaming_responses_proxy(
                         "upstream_error",
                     );
                     write_http_chunk(&mut stream, &error_frame).await.ok();
-                    break;
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
                 }
-                Ok(UpstreamChunkPoll::IdleTimeout) => {
+                GrokRelayEnd::IdleTimeout => {
                     let message = format!(
                         "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
                         protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
@@ -6500,29 +6577,98 @@ async fn handle_streaming_responses_proxy(
                         "upstream_timeout",
                     );
                     write_http_chunk(&mut stream, &error_frame).await.ok();
-                    break;
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
                 }
-                // Writing the keepalive failed: Codex hung up mid-wait.
-                Err(_) => break,
+                GrokRelayEnd::ClientGone => {
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
+                }
             }
+
+            stream.write_all(b"0\r\n\r\n").await?;
+            if let Some(details) = &details {
+                protocol_proxy::log_reasoning_only_warning(details);
+            }
+            protocol_proxy::record_responses_trace(
+                &upstream_config,
+                &request_json,
+                final_trace_seq,
+                request_body_len,
+                true,
+                final_status_code,
+                final_attempts,
+                response_bytes,
+                outcome.trace_label(),
+            );
+        } else {
+            // Reasoning-only-completion diagnosis (see
+            // `ResponsesPassthroughDiagnosis`) and the opt-in full trace
+            // dump both watch the exact bytes relayed to Codex, without
+            // altering what gets forwarded.
+            let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
+            loop {
+                match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
+                    Ok(UpstreamChunkPoll::Chunk(chunk)) => {
+                        protocol_proxy::scan_responses_passthrough_chunk_for_upstream_failure(&chunk);
+                        diagnosis.push_chunk(&chunk);
+                        trace_dump.append(&chunk);
+                        write_http_chunk(&mut stream, &chunk).await?
+                    }
+                    Ok(UpstreamChunkPoll::End) => break,
+                    Ok(UpstreamChunkPoll::ReadError(error)) => {
+                        let message = format!("Responses 上游流中断: {error}");
+                        protocol_proxy::log_upstream_event_deduped(
+                            "responses_stream_interrupted",
+                            protocol_proxy::LogLevel::Error,
+                            message.clone(),
+                        );
+                        let error_frame = protocol_proxy::responses_passthrough_failure_sse(
+                            &message,
+                            "upstream_error",
+                        );
+                        write_http_chunk(&mut stream, &error_frame).await.ok();
+                        break;
+                    }
+                    Ok(UpstreamChunkPoll::IdleTimeout) => {
+                        let message = format!(
+                            "Responses 上游流超过 {} 秒没有新数据，主动断开，避免 Codex 侧长时间挂起后被动终止会话",
+                            protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                        );
+                        protocol_proxy::log_upstream_event_deduped(
+                            "responses_stream_idle_timeout",
+                            protocol_proxy::LogLevel::Error,
+                            message.clone(),
+                        );
+                        let error_frame = protocol_proxy::responses_passthrough_failure_sse(
+                            &message,
+                            "upstream_timeout",
+                        );
+                        write_http_chunk(&mut stream, &error_frame).await.ok();
+                        break;
+                    }
+                    // Writing the keepalive failed: Codex hung up mid-wait.
+                    Err(_) => break,
+                }
+            }
+            stream.write_all(b"0\r\n\r\n").await?;
+            let response_bytes = diagnosis.total_bytes();
+            let (outcome, details) = diagnosis.finish();
+            if let Some(details) = &details {
+                protocol_proxy::log_reasoning_only_warning(details);
+            }
+            protocol_proxy::record_responses_trace(
+                &upstream_config,
+                &request_json,
+                trace_seq,
+                request_body_len,
+                true,
+                status_code,
+                attempts,
+                response_bytes,
+                outcome.trace_label(),
+            );
         }
-        stream.write_all(b"0\r\n\r\n").await?;
-        let response_bytes = diagnosis.total_bytes();
-        let (outcome, details) = diagnosis.finish();
-        if let Some(details) = &details {
-            protocol_proxy::log_reasoning_only_warning(details);
-        }
-        protocol_proxy::record_responses_trace(
-            &upstream_config,
-            &request_json,
-            trace_seq,
-            request_body_len,
-            true,
-            status_code,
-            attempts,
-            response_bytes,
-            outcome.trace_label(),
-        );
     } else if can_stream {
         if !sse_header_sent {
             stream.write_all(sse_response_header_bytes()).await?;
@@ -6531,42 +6677,123 @@ async fn handle_streaming_responses_proxy(
         let status_code = upstream.status_code;
         let attempts = upstream.attempts;
         let trace_seq = upstream.trace_seq;
-        let mut converter =
-            protocol_proxy::ChatSseToResponsesConverter::with_request(&request_json);
         let mut response = upstream.response;
-        // Same reasoning-only-completion diagnosis and full trace dump as
-        // the passthrough branch above, but fed the *converted*
-        // Responses-shaped SSE bytes (exactly what gets forwarded to Codex)
-        // rather than the raw Chat Completions bytes coming from upstream —
-        // `diagnose_responses_sse_text` looks for a `response.completed`
-        // event, which only exists after conversion.
-        let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
         let mut trace_dump = trace::ResponseDumpWriter::new(trace_seq);
 
-        loop {
-            match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
-                Ok(UpstreamChunkPoll::Chunk(chunk)) => {
-                    let converted = converter.push_bytes(&chunk);
-                    if !converted.is_empty() {
-                        diagnosis.push_chunk(&converted);
-                        trace_dump.append(&converted);
-                        write_http_chunk(&mut stream, &converted).await?;
+        if is_grok {
+            // Same grok reasoning-only-completion auto-retry as the
+            // passthrough branch above, but fed through a
+            // `ChatSseToResponsesConverter` first — this upstream speaks
+            // Chat Completions, so `response.completed` only exists after
+            // conversion.
+            let mut converter =
+                protocol_proxy::ChatSseToResponsesConverter::with_request(&request_json);
+            let mut gate = protocol_proxy::ReasoningOnlyRetryGate::new();
+            let mut response_bytes = 0u64;
+            let mut final_status_code = status_code;
+            let mut final_attempts = attempts;
+            let mut final_trace_seq = trace_seq;
+            let outcome;
+            let details;
+
+            let relay_end = relay_into_reasoning_only_gate(
+                &mut response,
+                &mut stream,
+                &mut gate,
+                Some(&mut converter),
+                &mut trace_dump,
+                &mut response_bytes,
+            )
+            .await;
+
+            match relay_end {
+                GrokRelayEnd::Clean => {
+                    if flush_converter_through_gate(
+                        &mut stream,
+                        Some(&mut converter),
+                        &mut gate,
+                        &mut trace_dump,
+                        &mut response_bytes,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        // Codex hung up while the converter's own
+                        // finalize output was being flushed — nothing left
+                        // to retry into either way.
+                    }
+                    let (trailing, held) = gate.finish();
+                    if !trailing.is_empty() {
+                        response_bytes += trailing.len() as u64;
+                        trace_dump.append(&trailing);
+                        write_http_chunk(&mut stream, &trailing).await.ok();
+                    }
+                    match held {
+                        Some(held)
+                            if held.outcome
+                                == protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnly =>
+                        {
+                            match attempt_grok_reasoning_retry(
+                                &mut stream,
+                                &request_json,
+                                &upstream_config,
+                                user_agent,
+                                true,
+                                held,
+                                &mut trace_dump,
+                            )
+                            .await
+                            {
+                                GrokRetryResolution::Retried {
+                                    status_code: rs,
+                                    attempts: ra,
+                                    trace_seq: rt,
+                                    response_bytes: rb,
+                                } => {
+                                    final_status_code = rs;
+                                    final_attempts = ra;
+                                    final_trace_seq = rt;
+                                    response_bytes += rb;
+                                    outcome =
+                                        protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetried;
+                                    details = None;
+                                }
+                                GrokRetryResolution::FellBack { outcome: o, details: d } => {
+                                    outcome = o;
+                                    details = d;
+                                }
+                            }
+                        }
+                        Some(held) => {
+                            response_bytes += held.bytes.len() as u64;
+                            trace_dump.append(&held.bytes);
+                            write_http_chunk(&mut stream, &held.bytes).await.ok();
+                            outcome = held.outcome;
+                            details = held.details;
+                        }
+                        None => {
+                            outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                            details = None;
+                        }
                     }
                 }
-                Ok(UpstreamChunkPoll::End) => break,
-                Ok(UpstreamChunkPoll::ReadError(error)) => {
+                GrokRelayEnd::ReadError(error) => {
                     let error_data = converter.fail(
                         format!("上游流中断: {error}"),
                         Some("upstream_error".to_string()),
                     );
                     if !error_data.is_empty() {
-                        diagnosis.push_chunk(&error_data);
-                        trace_dump.append(&error_data);
-                        write_http_chunk(&mut stream, &error_data).await.ok();
+                        let forwarded = gate.push_chunk(&error_data);
+                        if !forwarded.is_empty() {
+                            response_bytes += forwarded.len() as u64;
+                            trace_dump.append(&forwarded);
+                            write_http_chunk(&mut stream, &forwarded).await.ok();
+                        }
                     }
-                    break;
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
                 }
-                Ok(UpstreamChunkPoll::IdleTimeout) => {
+                GrokRelayEnd::IdleTimeout => {
                     let error_data = converter.fail(
                         format!(
                             "上游流超过 {} 秒没有新数据，主动断开",
@@ -6575,46 +6802,126 @@ async fn handle_streaming_responses_proxy(
                         Some("upstream_timeout".to_string()),
                     );
                     if !error_data.is_empty() {
-                        diagnosis.push_chunk(&error_data);
-                        trace_dump.append(&error_data);
-                        write_http_chunk(&mut stream, &error_data).await.ok();
+                        let forwarded = gate.push_chunk(&error_data);
+                        if !forwarded.is_empty() {
+                            response_bytes += forwarded.len() as u64;
+                            trace_dump.append(&forwarded);
+                            write_http_chunk(&mut stream, &forwarded).await.ok();
+                        }
                     }
-                    break;
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
                 }
-                // Writing the keepalive failed: Codex hung up mid-wait.
-                Err(_) => break,
+                GrokRelayEnd::ClientGone => {
+                    outcome = protocol_proxy::ResponsesDiagnosisOutcome::NoCompletedEvent;
+                    details = None;
+                }
             }
-        }
 
-        let final_data = converter.finish();
-        if !final_data.is_empty() {
-            diagnosis.push_chunk(&final_data);
-            trace_dump.append(&final_data);
-            write_http_chunk(&mut stream, &final_data).await?;
+            stream.write_all(b"0\r\n\r\n").await?;
+            if let Some(details) = &details {
+                protocol_proxy::log_reasoning_only_warning(details);
+            }
+            protocol_proxy::record_responses_trace(
+                &upstream_config,
+                &request_json,
+                final_trace_seq,
+                request_body_len,
+                true,
+                final_status_code,
+                final_attempts,
+                response_bytes,
+                outcome.trace_label(),
+            );
+        } else {
+            let mut converter =
+                protocol_proxy::ChatSseToResponsesConverter::with_request(&request_json);
+            // Same reasoning-only-completion diagnosis and full trace dump
+            // as the passthrough branch above, but fed the *converted*
+            // Responses-shaped SSE bytes (exactly what gets forwarded to
+            // Codex) rather than the raw Chat Completions bytes coming from
+            // upstream — `diagnose_responses_sse_text` looks for a
+            // `response.completed` event, which only exists after
+            // conversion.
+            let mut diagnosis = protocol_proxy::ResponsesPassthroughDiagnosis::new();
+
+            loop {
+                match poll_upstream_chunk_with_keepalive(&mut response, &mut stream).await {
+                    Ok(UpstreamChunkPoll::Chunk(chunk)) => {
+                        let converted = converter.push_bytes(&chunk);
+                        if !converted.is_empty() {
+                            diagnosis.push_chunk(&converted);
+                            trace_dump.append(&converted);
+                            write_http_chunk(&mut stream, &converted).await?;
+                        }
+                    }
+                    Ok(UpstreamChunkPoll::End) => break,
+                    Ok(UpstreamChunkPoll::ReadError(error)) => {
+                        let error_data = converter.fail(
+                            format!("上游流中断: {error}"),
+                            Some("upstream_error".to_string()),
+                        );
+                        if !error_data.is_empty() {
+                            diagnosis.push_chunk(&error_data);
+                            trace_dump.append(&error_data);
+                            write_http_chunk(&mut stream, &error_data).await.ok();
+                        }
+                        break;
+                    }
+                    Ok(UpstreamChunkPoll::IdleTimeout) => {
+                        let error_data = converter.fail(
+                            format!(
+                                "上游流超过 {} 秒没有新数据，主动断开",
+                                protocol_proxy::UPSTREAM_STREAM_IDLE_TIMEOUT.as_secs()
+                            ),
+                            Some("upstream_timeout".to_string()),
+                        );
+                        if !error_data.is_empty() {
+                            diagnosis.push_chunk(&error_data);
+                            trace_dump.append(&error_data);
+                            write_http_chunk(&mut stream, &error_data).await.ok();
+                        }
+                        break;
+                    }
+                    // Writing the keepalive failed: Codex hung up mid-wait.
+                    Err(_) => break,
+                }
+            }
+
+            let final_data = converter.finish();
+            if !final_data.is_empty() {
+                diagnosis.push_chunk(&final_data);
+                trace_dump.append(&final_data);
+                write_http_chunk(&mut stream, &final_data).await?;
+            }
+            stream.write_all(b"0\r\n\r\n").await?;
+            let response_bytes = diagnosis.total_bytes();
+            let (outcome, details) = diagnosis.finish();
+            if let Some(details) = &details {
+                protocol_proxy::log_reasoning_only_warning(details);
+            }
+            protocol_proxy::record_responses_trace(
+                &upstream_config,
+                &request_json,
+                trace_seq,
+                request_body_len,
+                true,
+                status_code,
+                attempts,
+                response_bytes,
+                outcome.trace_label(),
+            );
         }
-        stream.write_all(b"0\r\n\r\n").await?;
-        let response_bytes = diagnosis.total_bytes();
-        let (outcome, details) = diagnosis.finish();
-        if let Some(details) = &details {
-            protocol_proxy::log_reasoning_only_warning(details);
-        }
-        protocol_proxy::record_responses_trace(
-            &upstream_config,
-            &request_json,
-            trace_seq,
-            request_body_len,
-            true,
-            status_code,
-            attempts,
-            response_bytes,
-            outcome.trace_label(),
-        );
     } else {
         let status_code = upstream.status_code;
-        let response =
-            protocol_proxy::handle_responses_upstream(upstream, &request_json, &upstream_config)
-                .await
-                .unwrap_or_else(|error| protocol_proxy_error_response(&error));
+        let response = protocol_proxy::handle_responses_upstream(
+            upstream,
+            &request_json,
+            &upstream_config,
+            user_agent,
+        )
+        .await
+        .unwrap_or_else(|error| protocol_proxy_error_response(&error));
         if sse_header_sent {
             // The SSE response was already committed during the slow-open
             // wait; deliver whatever the upstream ultimately said in-band.
@@ -6729,6 +7036,284 @@ async fn poll_upstream_chunk_with_keepalive(
                 write_http_chunk(stream, SSE_KEEPALIVE_FRAME).await?;
             }
         }
+    }
+}
+
+/// Outcome of relaying one upstream SSE stream (either the first attempt or
+/// a grok retry) through a `ReasoningOnlyRetryGate` into the Codex-facing
+/// connection. Mirrors `UpstreamChunkPoll`'s terminal cases, but folds
+/// "stream ended normally" into a single `Clean` variant since it's the
+/// gate's withheld `response.completed` — not this function — that decides
+/// what happens next.
+enum GrokRelayEnd {
+    Clean,
+    ReadError(reqwest::Error),
+    IdleTimeout,
+    /// Writing to the Codex-facing stream failed — Codex hung up.
+    ClientGone,
+}
+
+/// Drive `response` through `gate` (through `converter` first, for a
+/// Chat-Completions-shaped upstream), forwarding every event live except the
+/// `response.completed` block the gate withholds, until the upstream stream
+/// ends. Every forwarded byte is appended to `trace_dump` and tallied into
+/// `response_bytes`, so both the raw-passthrough and converted-stream
+/// callers end up with the exact bytes actually sent to Codex — mirroring
+/// what `ResponsesPassthroughDiagnosis::total_bytes` tracks for the non-grok
+/// path.
+async fn relay_into_reasoning_only_gate(
+    response: &mut reqwest::Response,
+    stream: &mut TcpStream,
+    gate: &mut protocol_proxy::ReasoningOnlyRetryGate,
+    mut converter: Option<&mut protocol_proxy::ChatSseToResponsesConverter>,
+    trace_dump: &mut trace::ResponseDumpWriter,
+    response_bytes: &mut u64,
+) -> GrokRelayEnd {
+    loop {
+        match poll_upstream_chunk_with_keepalive(response, stream).await {
+            Ok(UpstreamChunkPoll::Chunk(chunk)) => {
+                let gate_input = if let Some(converter) = converter.as_deref_mut() {
+                    converter.push_bytes(&chunk)
+                } else {
+                    protocol_proxy::scan_responses_passthrough_chunk_for_upstream_failure(&chunk);
+                    chunk
+                };
+                if gate_input.is_empty() {
+                    continue;
+                }
+                let forwarded = gate.push_chunk(&gate_input);
+                if forwarded.is_empty() {
+                    continue;
+                }
+                *response_bytes += forwarded.len() as u64;
+                trace_dump.append(&forwarded);
+                if write_http_chunk(stream, &forwarded).await.is_err() {
+                    return GrokRelayEnd::ClientGone;
+                }
+            }
+            Ok(UpstreamChunkPoll::End) => return GrokRelayEnd::Clean,
+            Ok(UpstreamChunkPoll::ReadError(error)) => return GrokRelayEnd::ReadError(error),
+            Ok(UpstreamChunkPoll::IdleTimeout) => return GrokRelayEnd::IdleTimeout,
+            Err(_) => return GrokRelayEnd::ClientGone,
+        }
+    }
+}
+
+/// Push any buffered converter output (from the `[DONE]`-triggered
+/// finalize, or — idempotently — a no-op if that already happened mid-loop,
+/// see `ChatSseState::finalize_into`) through `gate` and forward the result.
+/// No-op when `converter` is `None` (raw Responses passthrough). `Err(())`
+/// means the write to Codex failed (client gone); the actual reason doesn't
+/// matter to callers, which all just fall back on any error here.
+async fn flush_converter_through_gate(
+    stream: &mut TcpStream,
+    converter: Option<&mut protocol_proxy::ChatSseToResponsesConverter>,
+    gate: &mut protocol_proxy::ReasoningOnlyRetryGate,
+    trace_dump: &mut trace::ResponseDumpWriter,
+    response_bytes: &mut u64,
+) -> Result<(), ()> {
+    let Some(converter) = converter else {
+        return Ok(());
+    };
+    let final_data = converter.finish();
+    if final_data.is_empty() {
+        return Ok(());
+    }
+    let forwarded = gate.push_chunk(&final_data);
+    if forwarded.is_empty() {
+        return Ok(());
+    }
+    *response_bytes += forwarded.len() as u64;
+    trace_dump.append(&forwarded);
+    write_http_chunk(stream, &forwarded).await.map_err(|_| ())
+}
+
+/// One grok retry's outcome, once the first attempt's stream ended cleanly
+/// with a `response.completed` that diagnosed as `ReasoningOnly` (see
+/// `ResponsesDiagnosisOutcome`). Lets the caller pick which attempt's
+/// metadata feeds the final `record_responses_trace` call: the retry's own
+/// on success, or the first attempt's (already in hand) on any fallback —
+/// mirroring the struct-update pattern `retry_reasoning_only_buffered` uses
+/// for the buffered path, without inventing fake metadata.
+enum GrokRetryResolution {
+    Retried {
+        status_code: u16,
+        attempts: u32,
+        trace_seq: Option<u64>,
+        response_bytes: u64,
+    },
+    /// The original withheld `response.completed` has already been
+    /// forwarded unmodified to Codex — keep using the first attempt's
+    /// metadata.
+    FellBack {
+        outcome: protocol_proxy::ResponsesDiagnosisOutcome,
+        details: Option<protocol_proxy::ReasoningOnlyDetails>,
+    },
+}
+
+/// Resend `request_json` to upstream exactly once (pure resend — no
+/// injected continuation, no `reasoning_effort`/`tool_choice` changes) after
+/// a grok request's first attempt came back reasoning-only, and relay the
+/// retry's stream into the same Codex-facing connection with id rewriting
+/// (see `ReasoningOnlyRetryGate::for_retry`). On any failure along the way —
+/// retry request/connection error, non-2xx retry status, id-extraction
+/// failure, retry stream error, or the retry itself still being
+/// reasoning-only — forwards `original`'s withheld `response.completed`
+/// unmodified instead: 宁可回到现状的静默断，也不能让 Codex 收到残缺流.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_grok_reasoning_retry(
+    stream: &mut TcpStream,
+    request_json: &Value,
+    upstream_config: &protocol_proxy::ProtocolProxyUpstream,
+    user_agent: Option<&str>,
+    needs_conversion: bool,
+    original: protocol_proxy::HeldCompletedEvent,
+    trace_dump: &mut trace::ResponseDumpWriter,
+) -> GrokRetryResolution {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let response_id = original
+        .details
+        .as_ref()
+        .map(|details| details.response_id.clone())
+        .unwrap_or_default();
+
+    macro_rules! fall_back {
+        ($message:expr) => {{
+            protocol_proxy::log_upstream_event_deduped(
+                "responses_reasoning_only_retry_failed",
+                protocol_proxy::LogLevel::Error,
+                format!(
+                    "model={model} response_id={response_id} {}，放行第一次的原始响应",
+                    $message
+                ),
+            );
+            trace_dump.append(&original.bytes);
+            write_http_chunk(stream, &original.bytes).await.ok();
+            return GrokRetryResolution::FellBack {
+                outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                details: original.details,
+            };
+        }};
+    }
+
+    if response_id.is_empty() {
+        fall_back!("reasoning-only 重试缺少 response_id，无法安全改写重试流的 id");
+    }
+
+    let retry_upstream = match protocol_proxy::open_responses_proxy_request(
+        request_json,
+        upstream_config,
+        user_agent,
+        true,
+    )
+    .await
+    {
+        Ok(upstream) if upstream.is_success() => upstream,
+        Ok(upstream) => {
+            fall_back!(format!(
+                "reasoning-only 重试请求返回 HTTP {}",
+                upstream.status_code
+            ))
+        }
+        Err(error) => fall_back!(format!("reasoning-only 重试请求失败: {error:#}")),
+    };
+
+    let status_code = retry_upstream.status_code;
+    let attempts = retry_upstream.attempts;
+    let trace_seq = retry_upstream.trace_seq;
+    let mut response = retry_upstream.response;
+    let mut gate = protocol_proxy::ReasoningOnlyRetryGate::for_retry(response_id.clone());
+    let mut converter = needs_conversion
+        .then(|| protocol_proxy::ChatSseToResponsesConverter::with_request(request_json));
+    let mut response_bytes = 0u64;
+
+    let relay_end = relay_into_reasoning_only_gate(
+        &mut response,
+        stream,
+        &mut gate,
+        converter.as_mut(),
+        trace_dump,
+        &mut response_bytes,
+    )
+    .await;
+
+    match relay_end {
+        GrokRelayEnd::Clean => {}
+        GrokRelayEnd::ReadError(error) => {
+            fall_back!(format!("reasoning-only 重试流中断: {error}"))
+        }
+        GrokRelayEnd::IdleTimeout => fall_back!("reasoning-only 重试流空闲超时"),
+        GrokRelayEnd::ClientGone => {
+            // Codex already hung up: nothing left to forward either way,
+            // but still report a real fallback rather than a fabricated
+            // retry success.
+            return GrokRetryResolution::FellBack {
+                outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                details: original.details,
+            };
+        }
+    }
+
+    if flush_converter_through_gate(
+        stream,
+        converter.as_mut(),
+        &mut gate,
+        trace_dump,
+        &mut response_bytes,
+    )
+    .await
+    .is_err()
+    {
+        return GrokRetryResolution::FellBack {
+            outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+            details: original.details,
+        };
+    }
+
+    // Must read before `gate.finish()`, which consumes `gate` by value.
+    let id_extraction_failed = gate.id_extraction_failed();
+    let (trailing, held) = gate.finish();
+    if !trailing.is_empty() {
+        response_bytes += trailing.len() as u64;
+        trace_dump.append(&trailing);
+        write_http_chunk(stream, &trailing).await.ok();
+    }
+
+    if id_extraction_failed {
+        fall_back!("reasoning-only 重试流未能提取 response_id，无法安全改写");
+    }
+
+    match held {
+        Some(held) if held.outcome != protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnly => {
+            protocol_proxy::log_upstream_event_deduped(
+                "responses_reasoning_only_retry_succeeded",
+                protocol_proxy::LogLevel::Warn,
+                format!(
+                    "model={model} response_id={response_id} reasoning-only 重试成功，已改用第二次响应"
+                ),
+            );
+            response_bytes += held.bytes.len() as u64;
+            trace_dump.append(&held.bytes);
+            if write_http_chunk(stream, &held.bytes).await.is_err() {
+                return GrokRetryResolution::FellBack {
+                    outcome: protocol_proxy::ResponsesDiagnosisOutcome::ReasoningOnlyRetryFailed,
+                    details: original.details,
+                };
+            }
+            GrokRetryResolution::Retried {
+                status_code,
+                attempts,
+                trace_seq,
+                response_bytes,
+            }
+        }
+        _ => fall_back!(
+            "reasoning-only 重试仍失败（重试响应仍然只有 reasoning，或未正常收到 completed 事件）"
+        ),
     }
 }
 
